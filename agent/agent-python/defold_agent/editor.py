@@ -1,0 +1,152 @@
+"""Client for the Defold editor HTTP server used to build and find the engine."""
+
+import re
+import time
+from pathlib import Path
+from typing import Optional, Union
+
+from .client import DefoldAgentError, request_json
+from .waits import wait_until
+
+
+_AGENT_ENDPOINT_TEXT = "Defold Agent endpoint registered"
+_ENGINE_SERVICE_PORT_PATTERNS = (
+    re.compile(r"Engine service started on port (\d+)"),
+    re.compile(r"Log server started on port (\d+)"),
+)
+
+
+class EditorClient:
+    """Small wrapper around the Defold editor HTTP API for one project."""
+
+    def __init__(self, root: Union[str, Path], port: Optional[int] = None):
+        self.root = Path(root).resolve()
+        if port is None:
+            port_path = self.root / ".internal" / "editor.port"
+            if not port_path.exists():
+                raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
+            port = int(port_path.read_text(encoding="utf-8").strip())
+        self.port = int(port)
+        self.base_url = f"http://localhost:{self.port}"
+        self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
+        self._last_build_had_engine_service_port: Optional[bool] = None
+
+    @classmethod
+    def from_project(cls, root: Union[str, Path] = ".") -> "EditorClient":
+        """Create a client by reading `.internal/editor.port` from `root`."""
+        return cls(root)
+
+    def build(self, timeout: float = 60.0) -> None:
+        """Build/run the project and wait until the agent HTTP endpoint registers."""
+        previous_port = self.engine_service_port()
+        if previous_port is not None:
+            self._engine_service_port = previous_port
+        _, response = request_json(f"{self.base_url}/command/build", method="POST", timeout=timeout)
+        if not response.get("success"):
+            issues = response.get("issues", [])
+            raise DefoldAgentError(f"Defold build failed: {issues}")
+
+        try:
+            wait_until(
+                self._has_agent_endpoint_registration,
+                timeout=timeout,
+                interval=0.1,
+                message="Defold build completed, but agent endpoint did not register",
+            )
+        except AssertionError as exc:
+            raise DefoldAgentError(str(exc)) from exc
+        self._last_build_had_engine_service_port = self.latest_registration_has_engine_service_port()
+        time.sleep(0.2)
+
+    def console_lines(self) -> list:
+        """Return current editor console lines."""
+        _, response = request_json(f"{self.base_url}/console", timeout=10.0)
+        return response.get("lines", [])
+
+    def engine_service_port(self) -> Optional[int]:
+        """Return the service port before endpoint registration, or the cached reused port."""
+        ports = self.engine_service_ports()
+        return ports[0] if ports else None
+
+    def engine_service_ports(self) -> list:
+        """Return candidate engine service ports from current logs, then the cached port."""
+        candidates = self.latest_registration_engine_service_ports()
+
+        if self._engine_service_port is not None:
+            self._append_port_candidate(candidates, self._engine_service_port)
+        return candidates
+
+    def latest_registration_engine_service_ports(self) -> list:
+        """Return ports logged before the latest agent endpoint registration only."""
+        lines = self.console_lines()
+        search_lines = self._latest_registration_window(lines)
+        if search_lines is None:
+            search_lines = lines
+        candidates = []
+        for line in reversed(search_lines):
+            for candidate_pattern in _ENGINE_SERVICE_PORT_PATTERNS:
+                match = candidate_pattern.search(line)
+                if match:
+                    self._append_port_candidate(candidates, int(match.group(1)))
+        return candidates
+
+    def latest_registration_has_engine_service_port(self) -> bool:
+        """Return whether the latest endpoint registration had a fresh port nearby."""
+        return bool(self.latest_registration_engine_service_ports())
+
+    def last_build_had_engine_service_port(self) -> Optional[bool]:
+        """Return whether the last `build()` saw a fresh port before registration."""
+        return self._last_build_had_engine_service_port
+
+    @staticmethod
+    def _endpoint_registered_count(lines: list) -> int:
+        return sum(1 for line in lines if _AGENT_ENDPOINT_TEXT in line)
+
+    def _has_agent_endpoint_registration(self) -> bool:
+        return self._endpoint_registered_count(self.console_lines()) > 0
+
+    @staticmethod
+    def _latest_registration_window(lines: list) -> Optional[list]:
+        endpoint_index: Optional[int] = None
+        previous_endpoint_index: Optional[int] = None
+        for index, line in enumerate(lines):
+            if _AGENT_ENDPOINT_TEXT in line:
+                previous_endpoint_index = endpoint_index
+                endpoint_index = index
+
+        if endpoint_index is None:
+            return None
+        start_index = previous_endpoint_index + 1 if previous_endpoint_index is not None else 0
+        return lines[start_index:endpoint_index]
+
+    def remember_engine_service_port(self, port: int) -> None:
+        """Remember a validated agent API port for reused-engine builds."""
+        self._engine_service_port = int(port)
+        self._write_cached_engine_service_port(self._engine_service_port)
+
+    @staticmethod
+    def _append_port_candidate(candidates: list, port: int) -> None:
+        if port not in candidates:
+            candidates.append(port)
+
+    @property
+    def _engine_service_port_cache_path(self) -> Path:
+        return self.root / ".internal" / "agent.engine.port"
+
+    def _read_cached_engine_service_port(self) -> Optional[int]:
+        path = self._engine_service_port_cache_path
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    def _write_cached_engine_service_port(self, port: int) -> None:
+        path = self._engine_service_port_cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{port}\n", encoding="utf-8")

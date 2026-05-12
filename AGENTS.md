@@ -1,3 +1,6 @@
-- Editor server port: `.internal/editor.port`
-- Discover endpoints: `curl -fsSL "http://localhost:$(cat .internal/editor.port)/openapi.json"`
-- Build/run: `curl -fsSL -X POST "http://localhost:$(cat .internal/editor.port)/command/build"`
+- Use the Python wrapper for scripts and tests: add `agent/agent-python` to `PYTHONPATH` or `sys.path`, then import `defold_agent`.
+- Python wrapper agent notes: `agent/agent-python/AGENTS.md`
+- Python wrapper user/API docs: `agent/agent-python/README.md`
+- Public APIs have Python docstrings; use `help(AgentClient)` or `help(AgentClient.drag)` for quick in-code reference.
+- Typical bootstrap: `AgentClient.from_project(".", build=True)`
+- Raw native endpoint docs: `agent/README.md`
