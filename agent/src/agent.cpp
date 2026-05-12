@@ -4,11 +4,14 @@
 #endif
 
 #include <dmsdk/sdk.h>
-#include <dmsdk/engine/extension.hpp>
-#include <dmsdk/gameobject/gameobject.h>
-#include <dmsdk/graphics/graphics.h>
-#include <dmsdk/hid/hid.h>
-#include <dmsdk/dlib/time.h>
+
+#define MODULE_NAME Agent
+#define LIB_NAME "agent"
+
+#if defined(DM_DEBUG)
+
+#include <dmsdk/dlib/utf8.h>
+#include <dmsdk/dlib/uri.h>
 
 #include <algorithm>
 #include <ctype.h>
@@ -26,14 +29,13 @@
 #include <direct.h>
 #endif
 
-#define MODULE_NAME Agent
-#define LIB_NAME "agent"
-
 namespace dmAgent
 {
 
 static const char* API_PREFIX = "/agent/v1";
 static const char* API_VERSION = "1";
+static const uint32_t MAX_INPUT_EVENTS = 64;
+static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
 
 struct QueryParam
 {
@@ -305,44 +307,17 @@ static std::string ToHex64(uint64_t value)
     return buffer;
 }
 
-static char HexToChar(char c)
-{
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 static std::string UrlDecode(const char* value, size_t length)
 {
-    std::string out;
-    for (size_t i = 0; i < length; ++i)
+    if (!value || length == 0)
     {
-        char c = value[i];
-        if (c == '+')
-        {
-            out += ' ';
-        }
-        else if (c == '%' && i + 2 < length)
-        {
-            char hi = HexToChar(value[i + 1]);
-            char lo = HexToChar(value[i + 2]);
-            if (hi >= 0 && lo >= 0)
-            {
-                out += (char)((hi << 4) | lo);
-                i += 2;
-            }
-            else
-            {
-                out += c;
-            }
-        }
-        else
-        {
-            out += c;
-        }
+        return "";
     }
-    return out;
+
+    std::string encoded(value, length);
+    std::vector<char> decoded(encoded.size() + 1);
+    dmURI::Decode(encoded.c_str(), decoded.data());
+    return decoded.data();
 }
 
 static void ParseResource(const char* resource, std::string& path, std::vector<QueryParam>& query)
@@ -769,8 +744,8 @@ static void ComputeBounds(Node& node, uint32_t screen_w, uint32_t screen_h, uint
         node.m_Bounds.m_CY = (source_h - y) * scale_y;
         node.m_Bounds.m_W = width * scale_x;
         node.m_Bounds.m_H = height * scale_y;
-        node.m_Bounds.m_X = node.m_Bounds.m_CX - width * 0.5f;
-        node.m_Bounds.m_Y = node.m_Bounds.m_CY - height * 0.5f;
+        node.m_Bounds.m_X = node.m_Bounds.m_CX - node.m_Bounds.m_W * 0.5f;
+        node.m_Bounds.m_Y = node.m_Bounds.m_CY - node.m_Bounds.m_H * 0.5f;
     }
 
     node.m_Bounds.m_NX = node.m_Bounds.m_CX / (float)screen_w;
@@ -1030,6 +1005,19 @@ static void AppendScreenJson(std::string& out, const Snapshot& snapshot)
     out += "},\"coordinates\":{\"origin\":\"top-left\",\"units\":\"screen_pixels\"}}";
 }
 
+static bool IsScreenshotSupported()
+{
+    if (!g_Agent.m_GraphicsContext)
+    {
+        return false;
+    }
+
+    dmGraphics::AdapterFamily family = dmGraphics::GetInstalledAdapterFamily();
+    return family == dmGraphics::ADAPTER_FAMILY_OPENGL ||
+           family == dmGraphics::ADAPTER_FAMILY_OPENGLES ||
+           family == dmGraphics::ADAPTER_FAMILY_VULKAN;
+}
+
 static void HandleHealth(dmWebServer::Request* request)
 {
     std::string response = "{\"ok\":true,\"data\":{\"version\":";
@@ -1048,7 +1036,12 @@ static void HandleHealth(dmWebServer::Request* request)
 #else
     AppendJsonString(response, "unknown");
 #endif
-    response += ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"input.click\",\"input.drag\",\"input.key\",\"screenshot\"],\"screen\":";
+    response += ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"input.click\",\"input.drag\",\"input.key\"";
+    if (IsScreenshotSupported())
+    {
+        response += ",\"screenshot\"";
+    }
+    response += "],\"screen\":";
     AppendScreenJson(response, g_Agent.m_Snapshot);
     response += ",\"scene_sequence\":";
     AppendNumber(response, (double)g_Agent.m_Snapshot.m_Sequence);
@@ -1183,8 +1176,18 @@ static void HandleNode(dmWebServer::Request* request, const std::vector<QueryPar
     SendJson(request, 200, response);
 }
 
-static void AddMouseInput(float x1, float y1, float x2, float y2, float duration)
+static bool CanQueueInputEvent()
 {
+    return g_Agent.m_InputEvents.size() < MAX_INPUT_EVENTS;
+}
+
+static bool AddMouseInput(float x1, float y1, float x2, float y2, float duration)
+{
+    if (!CanQueueInputEvent())
+    {
+        return false;
+    }
+
     InputEvent event;
     event.m_Type = INPUT_EVENT_MOUSE;
     event.m_X1 = x1;
@@ -1194,18 +1197,21 @@ static void AddMouseInput(float x1, float y1, float x2, float y2, float duration
     event.m_Duration = std::max(0.0f, duration);
     event.m_MouseButton = dmHID::MOUSE_BUTTON_LEFT;
     g_Agent.m_InputEvents.push_back(event);
+    return true;
 }
 
-static void AddKeyInput(const std::string& keys)
+static bool AddKeyInput(const std::string& keys)
 {
-    if (keys.empty())
+    if (keys.empty() || !CanQueueInputEvent())
     {
-        return;
+        return false;
     }
+
     InputEvent event;
     event.m_Type = INPUT_EVENT_KEYS;
     event.m_Keys = keys;
     g_Agent.m_InputEvents.push_back(event);
+    return true;
 }
 
 static bool GetNodeCenter(const std::string& id, float& x, float& y, std::string& error)
@@ -1246,7 +1252,11 @@ static void HandleClick(dmWebServer::Request* request, const std::vector<QueryPa
         return;
     }
 
-    AddMouseInput(x, y, x, y, 0.0f);
+    if (!AddMouseInput(x, y, x, y, 0.0f))
+    {
+        SendError(request, 429, "input_queue_full", "too many input events are already queued");
+        return;
+    }
 
     std::string response = "{\"ok\":true,\"data\":{\"queued\":\"click\",\"x\":";
     AppendNumber(response, x);
@@ -1287,7 +1297,11 @@ static void HandleDrag(dmWebServer::Request* request, const std::vector<QueryPar
         return;
     }
 
-    AddMouseInput(x1, y1, x2, y2, std::max(0.0f, duration));
+    if (!AddMouseInput(x1, y1, x2, y2, std::max(0.0f, duration)))
+    {
+        SendError(request, 429, "input_queue_full", "too many input events are already queued");
+        return;
+    }
 
     std::string response = "{\"ok\":true,\"data\":{\"queued\":\"drag\",\"from\":{\"x\":";
     AppendNumber(response, x1);
@@ -1315,8 +1329,18 @@ static void HandleKey(dmWebServer::Request* request, const std::vector<QueryPara
         SendError(request, 400, "bad_request", "provide text or keys");
         return;
     }
+    if (value.size() > MAX_KEY_INPUT_BYTES)
+    {
+        SendError(request, 413, "input_too_large", "text or keys parameter is too large");
+        return;
+    }
 
-    AddKeyInput(value);
+    if (!AddKeyInput(value))
+    {
+        SendError(request, 429, "input_queue_full", "too many input events are already queued");
+        return;
+    }
+
     std::string response = "{\"ok\":true,\"data\":{\"queued\":\"key\",\"length\":";
     AppendNumber(response, (double)value.size());
     response += "}}\n";
@@ -1521,7 +1545,7 @@ static bool EncodePngRgba(const std::vector<uint8_t>& rgba, uint32_t width, uint
 
 static bool CaptureScreenshotPng(std::vector<uint8_t>& png)
 {
-    if (!g_Agent.m_GraphicsContext)
+    if (!IsScreenshotSupported())
     {
         return false;
     }
@@ -1594,6 +1618,12 @@ static void ProcessPendingScreenshot()
 
 static void HandleScreenshot(dmWebServer::Request* request)
 {
+    if (!IsScreenshotSupported())
+    {
+        SendError(request, 501, "screenshot_unsupported", "screenshot capture is not supported by the current graphics adapter");
+        return;
+    }
+
     char path[1024];
     if (!BuildScreenshotPath(path, sizeof(path)))
     {
@@ -1763,8 +1793,13 @@ static bool UpdateKeyEvent(dmHID::HContext context, dmHID::HKeyboard keyboard, I
         return event.m_KeyIndex >= event.m_Keys.size();
     }
 
-    unsigned char c = (unsigned char)event.m_Keys[event.m_KeyIndex++];
-    dmHID::AddKeyboardChar(context, c);
+    const char* cursor = event.m_Keys.c_str() + event.m_KeyIndex;
+    uint32_t codepoint = dmUtf8::NextChar(&cursor);
+    event.m_KeyIndex = (uint32_t)(cursor - event.m_Keys.c_str());
+    if (codepoint != 0)
+    {
+        dmHID::AddKeyboardChar(context, (int)codepoint);
+    }
     return event.m_KeyIndex >= event.m_Keys.size();
 }
 
@@ -1886,7 +1921,6 @@ static void AgentHandler(void* user_data, dmWebServer::Request* request)
 
 static void RegisterWebEndpoint(dmExtension::AppParams* params)
 {
-#if defined(DM_DEBUG) && !defined(DM_HEADLESS)
     g_Agent.m_WebServer = dmEngine::GetWebServer(params);
     if (!g_Agent.m_WebServer)
     {
@@ -1908,14 +1942,10 @@ static void RegisterWebEndpoint(dmExtension::AppParams* params)
     {
         dmLogWarning("Unable to register Defold Agent endpoint '%s' (%d)", API_PREFIX, result);
     }
-#else
-    (void)params;
-#endif
 }
 
 static void UnregisterWebEndpoint()
 {
-#if defined(DM_DEBUG) && !defined(DM_HEADLESS)
     if (!g_Agent.m_WebServer || !g_Agent.m_WebHandlerRegistered)
     {
         g_Agent.m_WebServer = 0;
@@ -1929,15 +1959,12 @@ static void UnregisterWebEndpoint()
     }
     g_Agent.m_WebServer = 0;
     g_Agent.m_WebHandlerRegistered = false;
-#endif
 }
 
 static ExtensionResult PostRender(ExtensionParams* params)
 {
     (void)params;
-#if defined(DM_DEBUG) && !defined(DM_HEADLESS)
     ProcessPendingScreenshot();
-#endif
     return EXTENSION_RESULT_OK;
 }
 
@@ -1949,9 +1976,7 @@ static dmExtension::Result AppInitialize(dmExtension::AppParams* params)
     g_Agent.m_LastTime = dmTime::GetTime();
     g_Agent.m_Initialized = true;
     RegisterWebEndpoint(params);
-#if defined(DM_DEBUG) && !defined(DM_HEADLESS)
     dmExtension::RegisterCallback(dmExtension::CALLBACK_POST_RENDER, PostRender);
-#endif
     return dmExtension::RESULT_OK;
 }
 
@@ -1987,9 +2012,7 @@ static dmExtension::Result OnUpdate(dmExtension::Params* params)
     float dt = (float)((time - g_Agent.m_LastTime) / 1000000.0);
     g_Agent.m_LastTime = time;
 
-#if defined(DM_DEBUG) && !defined(DM_HEADLESS)
     UpdateSnapshot();
-#endif
     UpdateInput(dt);
 
     return dmExtension::RESULT_OK;
@@ -1998,5 +2021,24 @@ static dmExtension::Result OnUpdate(dmExtension::Params* params)
 }
 
 DM_DECLARE_EXTENSION(MODULE_NAME, LIB_NAME, dmAgent::AppInitialize, dmAgent::AppFinalize, dmAgent::Initialize, dmAgent::OnUpdate, 0, dmAgent::Finalize)
+
+#else
+
+static dmExtension::Result InitializeAgent(dmExtension::Params* params)
+{
+    (void)params;
+    dmLogInfo("Registered %s extension (null)", LIB_NAME);
+    return dmExtension::RESULT_OK;
+}
+
+static dmExtension::Result FinalizeAgent(dmExtension::Params* params)
+{
+    (void)params;
+    return dmExtension::RESULT_OK;
+}
+
+DM_DECLARE_EXTENSION(MODULE_NAME, LIB_NAME, 0, 0, InitializeAgent, 0, 0, FinalizeAgent)
+
+#endif
 
 #undef LIB_NAME
