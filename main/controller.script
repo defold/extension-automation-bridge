@@ -6,6 +6,8 @@ local BOARD_MAX_X = 860
 local BOARD_MIN_Y = 90
 local BOARD_MAX_Y = 500
 local MAX_LEVEL = 4
+local ITEM_MIN_SPEED = 50
+local ITEM_MAX_SPEED = 150
 
 local items = {}
 local serial = 0
@@ -33,6 +35,12 @@ local function item_at(pos, except_id, level)
 	return best_id, best_item
 end
 
+local function random_velocity()
+	local angle = math.random() * math.pi * 2
+	local speed = math.random(ITEM_MIN_SPEED, ITEM_MAX_SPEED)
+	return vmath.vector3(math.cos(angle) * speed, math.sin(angle) * speed, 0)
+end
+
 local function configure_item(id, level)
 	msg.post(id, "setup", { level = level })
 end
@@ -47,6 +55,7 @@ local function spawn_item(self, level, pos)
 	items[id] = {
 		level = level,
 		pos = vmath.vector3(pos.x, pos.y, z),
+		velocity = random_velocity(),
 	}
 	configure_item(id, level)
 	return id
@@ -109,6 +118,38 @@ end
 
 function final(self)
 	msg.post(".", "release_input_focus")
+end
+
+function update(self, dt)
+	local min_x = BOARD_MIN_X + ITEM_RADIUS
+	local max_x = BOARD_MAX_X - ITEM_RADIUS
+	local min_y = BOARD_MIN_Y + ITEM_RADIUS
+	local max_y = BOARD_MAX_Y - ITEM_RADIUS
+
+	for id, item in pairs(items) do
+		if id ~= self.dragging then
+			local pos = item.pos + item.velocity * dt
+
+			if pos.x < min_x then
+				pos.x = min_x
+				item.velocity.x = math.abs(item.velocity.x)
+			elseif pos.x > max_x then
+				pos.x = max_x
+				item.velocity.x = -math.abs(item.velocity.x)
+			end
+
+			if pos.y < min_y then
+				pos.y = min_y
+				item.velocity.y = math.abs(item.velocity.y)
+			elseif pos.y > max_y then
+				pos.y = max_y
+				item.velocity.y = -math.abs(item.velocity.y)
+			end
+
+			item.pos = pos
+			go.set(id, "position", pos)
+		end
+	end
 end
 
 function on_input(self, action_id, action)

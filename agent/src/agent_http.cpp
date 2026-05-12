@@ -365,13 +365,13 @@ namespace dmAgent
 
     static void HandleClick(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         float x = 0.0f;
         float y = 0.0f;
         const char* id = RequestGetParam(ctx, "id");
         if (!IsEmpty(id))
         {
-            RefreshSnapshotForRequest();
-
             const char* error = 0;
             if (!GetNodeCenter(id, &x, &y, &error))
             {
@@ -403,6 +403,8 @@ namespace dmAgent
 
     static void HandleDrag(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         float x1 = 0.0f;
         float y1 = 0.0f;
         float x2 = 0.0f;
@@ -414,8 +416,6 @@ namespace dmAgent
         const char* to_id = RequestGetParam(ctx, "to_id");
         if (!IsEmpty(from_id) && !IsEmpty(to_id))
         {
-            RefreshSnapshotForRequest();
-
             const char* error = 0;
             if (!GetNodeCenter(from_id, &x1, &y1, &error))
             {
