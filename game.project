@@ -22,3 +22,7 @@ scale_mode = stretch
 [project]
 title = extension-defold-agent
 
+[library]
+include_dirs = agent
+defold_min_version = 1.13.0
+
