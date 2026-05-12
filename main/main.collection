@@ -1,2 +1,51 @@
 name: "main"
+instances {
+  id: "controller"
+  prototype: "/main/controller.go"
+  position {
+    x: 0.0
+    y: 0.0
+    z: 0.0
+  }
+  rotation {
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0
+  }
+}
+instances {
+  id: "spawner"
+  prototype: "/main/spawner.go"
+  position {
+    x: 120.0
+    y: 540.0
+    z: 0.0
+  }
+  rotation {
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0
+  }
+}
 scale_along_z: 0
+embedded_instances {
+  id: "ui"
+  data: "components {\n"
+  "  id: \"popup\"\n"
+  "  component: \"/main/win_popup.gui\"\n"
+  "}\n"
+  ""
+  position {
+    x: 0.0
+    y: 0.0
+    z: 1.0
+  }
+  rotation {
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    w: 1.0
+  }
+}

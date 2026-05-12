@@ -1,0 +1,42 @@
+local function set_popup_enabled(enabled)
+	gui.set_enabled(gui.get_node("overlay"), enabled)
+	gui.set_enabled(gui.get_node("panel"), enabled)
+	gui.set_enabled(gui.get_node("title"), enabled)
+	gui.set_enabled(gui.get_node("restart"), enabled)
+	gui.set_enabled(gui.get_node("restart_text"), enabled)
+end
+
+function init(self)
+	msg.post(".", "acquire_input_focus")
+	set_popup_enabled(false)
+end
+
+function final(self)
+	msg.post(".", "release_input_focus")
+end
+
+function on_message(self, message_id)
+	if message_id == hash("show_win") then
+		set_popup_enabled(true)
+	elseif message_id == hash("hide_win") then
+		set_popup_enabled(false)
+	end
+end
+
+function on_input(self, action_id, action)
+	if action_id ~= hash("touch") or not action.released then
+		return false
+	end
+
+	local panel = gui.get_node("panel")
+	if not gui.is_enabled(panel) then
+		return false
+	end
+
+	if gui.pick_node(gui.get_node("restart"), action.x, action.y) then
+		msg.post("main:/controller#script", "restart")
+		return true
+	end
+
+	return gui.pick_node(panel, action.x, action.y)
+end

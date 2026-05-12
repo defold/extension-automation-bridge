@@ -1,0 +1,3 @@
+- Editor server port: `.internal/editor.port`
+- Discover endpoints: `curl -fsSL "http://localhost:$(cat .internal/editor.port)/openapi.json"`
+- Build/run: `curl -fsSL -X POST "http://localhost:$(cat .internal/editor.port)/command/build"`

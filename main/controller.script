@@ -1,0 +1,167 @@
+local ITEM_RADIUS = 42
+local SPAWNER_POS = vmath.vector3(120, 540, 0)
+local SPAWNER_RADIUS = 58
+local BOARD_MIN_X = 220
+local BOARD_MAX_X = 860
+local BOARD_MIN_Y = 90
+local BOARD_MAX_Y = 500
+local MAX_LEVEL = 4
+
+local items = {}
+local serial = 0
+
+local function distance_sq(a, b)
+	local dx = a.x - b.x
+	local dy = a.y - b.y
+	return dx * dx + dy * dy
+end
+
+local function item_at(pos, except_id, level)
+	local best_id = nil
+	local best_item = nil
+	local best_distance = ITEM_RADIUS * ITEM_RADIUS
+	for id, item in pairs(items) do
+		if id ~= except_id and (not level or item.level == level) then
+			local item_distance = distance_sq(pos, item.pos)
+			if item_distance <= best_distance then
+				best_id = id
+				best_item = item
+				best_distance = item_distance
+			end
+		end
+	end
+	return best_id, best_item
+end
+
+local function configure_item(id, level)
+	msg.post(id, "setup", { level = level })
+end
+
+local function spawn_item(self, level, pos)
+	serial = serial + 1
+	local z = 0.1 + serial * 0.001
+	local id = factory.create("#item_factory", vmath.vector3(pos.x, pos.y, z))
+	if not id then
+		return nil
+	end
+	items[id] = {
+		level = level,
+		pos = vmath.vector3(pos.x, pos.y, z),
+	}
+	configure_item(id, level)
+	return id
+end
+
+local function spawn_random_item(self)
+	local pos = vmath.vector3(math.random(BOARD_MIN_X, BOARD_MAX_X), math.random(BOARD_MIN_Y, BOARD_MAX_Y), 0)
+	spawn_item(self, 1, pos)
+end
+
+local function remove_item(id)
+	items[id] = nil
+	go.delete(id)
+end
+
+local function show_win()
+	msg.post(msg.url("main", "/ui", "popup"), "show_win")
+end
+
+local function merge_items(self, dragged_id, target_id)
+	local dragged = items[dragged_id]
+	local target = items[target_id]
+	if not dragged or not target or dragged.level ~= target.level then
+		return false
+	end
+
+	local level = math.min(dragged.level + 1, MAX_LEVEL)
+	local pos = target.pos
+	remove_item(dragged_id)
+	remove_item(target_id)
+	spawn_item(self, level, pos)
+
+	if level >= MAX_LEVEL then
+		show_win()
+	end
+	return true
+end
+
+local function clear_items()
+	for id in pairs(items) do
+		go.delete(id)
+	end
+	items = {}
+end
+
+local function reset_game(self)
+	clear_items()
+	self.dragging = nil
+	self.pointer_down = false
+	msg.post(msg.url("main", "/ui", "popup"), "hide_win")
+end
+
+function init(self)
+	msg.post(".", "acquire_input_focus")
+	math.randomseed(os.time())
+	self.dragging = nil
+	self.pointer_down = false
+	reset_game(self)
+end
+
+function final(self)
+	msg.post(".", "release_input_focus")
+end
+
+function on_input(self, action_id, action)
+	if action_id ~= hash("touch") then
+		return false
+	end
+
+	local pos = vmath.vector3(action.x, action.y, 0)
+
+	if action.pressed then
+		if self.pointer_down then
+			return true
+		end
+		self.pointer_down = true
+
+		if distance_sq(pos, SPAWNER_POS) <= SPAWNER_RADIUS * SPAWNER_RADIUS then
+			spawn_random_item(self)
+			return true
+		end
+
+		local id = item_at(pos)
+		if id then
+			self.dragging = id
+			return true
+		end
+	elseif action.released then
+		self.pointer_down = false
+		if self.dragging then
+			local dragged_id = self.dragging
+			self.dragging = nil
+			local dragged = items[dragged_id]
+			if dragged then
+				dragged.pos = vmath.vector3(pos.x, pos.y, dragged.pos.z)
+				go.set(dragged_id, "position", dragged.pos)
+				local target_id = item_at(pos, dragged_id, dragged.level)
+				if target_id then
+					merge_items(self, dragged_id, target_id)
+				end
+			end
+			return true
+		end
+	elseif self.dragging and items[self.dragging] then
+		local item = items[self.dragging]
+		item.pos = vmath.vector3(pos.x, pos.y, item.pos.z)
+		go.set(self.dragging, "position", item.pos)
+		return true
+	end
+
+	return false
+end
+
+function on_message(self, message_id)
+	if message_id == hash("restart") then
+		reset_game(self)
+	end
+end

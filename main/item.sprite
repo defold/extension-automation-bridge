@@ -1,0 +1,3 @@
+tile_set: "/main/item.atlas"
+default_animation: "particle_blob"
+material: "/builtins/materials/sprite.material"

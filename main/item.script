@@ -1,0 +1,24 @@
+local colors = {
+	[1] = vmath.vector4(0.22, 0.58, 1.0, 1.0),
+	[2] = vmath.vector4(0.28, 0.78, 0.42, 1.0),
+	[3] = vmath.vector4(1.0, 0.62, 0.18, 1.0),
+	[4] = vmath.vector4(0.94, 0.28, 0.52, 1.0),
+}
+
+local function apply_level(self)
+	local level = self.level or 1
+	go.set("#sprite", "tint", colors[level] or colors[1])
+	label.set_text("#label", "L" .. level)
+end
+
+function init(self)
+	self.level = 1
+	apply_level(self)
+end
+
+function on_message(self, message_id, message)
+	if message_id == hash("setup") then
+		self.level = message.level or 1
+		apply_level(self)
+	end
+end
