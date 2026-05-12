@@ -85,7 +85,6 @@ namespace dmAgent
         float dt = (float)((time - g_Agent.m_LastTime) / 1000000.0);
         g_Agent.m_LastTime = time;
 
-        UpdateSnapshot();
         UpdateInput(dt);
 
         return dmExtension::RESULT_OK;

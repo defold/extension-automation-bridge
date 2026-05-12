@@ -175,8 +175,15 @@ namespace dmAgent
         return options;
     }
 
+    static void RefreshSnapshotForRequest()
+    {
+        UpdateSnapshot();
+    }
+
     static void HandleHealth(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"version\":");
@@ -210,6 +217,8 @@ namespace dmAgent
 
     static void HandleScreen(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
@@ -220,6 +229,8 @@ namespace dmAgent
 
     static void HandleScene(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         IncludeOptions include = ParseInclude(ctx, false, true);
         bool visible_only = false;
         RequestGetBoolParam(ctx, "visible", &visible_only);
@@ -282,6 +293,8 @@ namespace dmAgent
 
     static void HandleNodes(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         IncludeOptions include = ParseInclude(ctx, false, false);
         float limit_f = 50.0f;
         RequestGetFloatParam(ctx, "limit", &limit_f);
@@ -325,6 +338,8 @@ namespace dmAgent
 
     static void HandleNode(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+
         const char* id = RequestGetParam(ctx, "id");
         if (IsEmpty(id))
         {
@@ -355,6 +370,8 @@ namespace dmAgent
         const char* id = RequestGetParam(ctx, "id");
         if (!IsEmpty(id))
         {
+            RefreshSnapshotForRequest();
+
             const char* error = 0;
             if (!GetNodeCenter(id, &x, &y, &error))
             {
@@ -397,6 +414,8 @@ namespace dmAgent
         const char* to_id = RequestGetParam(ctx, "to_id");
         if (!IsEmpty(from_id) && !IsEmpty(to_id))
         {
+            RefreshSnapshotForRequest();
+
             const char* error = 0;
             if (!GetNodeCenter(from_id, &x1, &y1, &error))
             {
