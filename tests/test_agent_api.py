@@ -11,9 +11,20 @@ sys.path.insert(0, str(ROOT / "agent" / "agent-python"))
 from defold_agent import AgentApiError, AgentClient, EditorClient, wait_until  # noqa: E402
 
 
+class AgentClientUnitTest(unittest.TestCase):
+    def test_wait_for_count_accepts_zero(self):
+        class FakeAgent:
+            def count(self, **selector):
+                return 0
+
+        self.assertEqual(0, AgentClient.wait_for_count(FakeAgent(), 0, timeout=0.1, interval=0.01))
+
+
 class AgentApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.editor = None
+        cls.agent = None
         port = os.environ.get("AGENT_ENGINE_PORT")
         if port:
             cls.agent = AgentClient(int(port))
@@ -21,15 +32,31 @@ class AgentApiTest(unittest.TestCase):
             return
 
         try:
-            editor = EditorClient.from_project(ROOT)
+            cls.editor = EditorClient.from_project(ROOT)
         except FileNotFoundError as exc:
             raise unittest.SkipTest(str(exc)) from exc
-        cls.agent = AgentClient.from_editor(editor, build=True, timeout=20)
 
     def setUp(self):
-        self.reset_if_popup_is_visible()
+        if self.agent:
+            self.reset_if_popup_is_visible()
 
     def test_agent_api_end_to_end(self):
+        previous_port = None
+        run_count = 1 if self.editor is None else 2
+
+        for run_index in range(run_count):
+            if self.editor is not None:
+                self.agent = AgentClient.from_editor(self.editor, build=True, timeout=20)
+                self.agent.wait_ready()
+                if previous_port is not None:
+                    self.assertNotEqual(previous_port, self.agent.port)
+                previous_port = self.agent.port
+
+            with self.subTest(run=run_index + 1):
+                self.reset_if_popup_is_visible()
+                self.run_agent_api_end_to_end()
+
+    def run_agent_api_end_to_end(self):
         health = self.agent.health()
         self.assertEqual("1", health["version"])
         self.assertIn("scene", health["capabilities"])

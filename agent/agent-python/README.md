@@ -34,7 +34,7 @@ PYTHONPATH=agent/agent-python python3 tests/test_agent_api.py
 
 ## Bootstrap
 
-Use the editor client when you want explicit control over the Defold editor server. `build()` waits until the runtime logs `Defold Agent endpoint registered`, then waits another 0.2 seconds before returning.
+Use the editor client when you want explicit control over the Defold editor server. `AgentClient.from_editor(..., build=True)` closes known candidate engine ports before building so repeated runs start from a fresh engine process. `build()` waits until the runtime logs `Defold Agent endpoint registered`, then waits another 0.2 seconds before returning.
 When the editor reuses the same running engine process, it may not print a fresh engine service port before `Defold Agent endpoint registered`; `EditorClient` reuses the last port it saw and stores it in `.internal/agent.engine.port`.
 If the latest build logs `Defold Agent endpoint registered` without a fresh engine service port before it, `AgentClient.from_editor(..., build=True)` immediately tries to close candidate engine ports with `@system/exit`, rebuilds once, and retries. It uses the same recovery path if discovered ports do not serve `/agent/v1/health`.
 
@@ -94,7 +94,7 @@ agent.type_text("hello")
 agent.key("KEY_ENTER")
 ```
 
-Drag calls block for the requested `duration` by default. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
+Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
 
 `Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `agent.by_id(node.id)` or query again.
 
@@ -121,7 +121,7 @@ png = agent.screenshot(wait=True, timeout=5)
 
 ## Engine Control
 
-`agent.close_engine()` posts Defold's built-in `@system/exit` message to the same engine service port used by the agent API. It is equivalent to:
+`agent.close_engine()` posts Defold's built-in `@system/exit` message to the same engine service port used by the agent API. If the process stays alive on macOS/Linux, the helper falls back to terminating the local process listening on that port. The graceful request is equivalent to:
 
 ```sh
 printf '\010\000' | curl -sS -X POST --data-binary @- \

@@ -1,6 +1,10 @@
 """Dependency-free Python client for the Defold Agent runtime API."""
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -14,6 +18,7 @@ from .waits import wait_until
 
 JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
+_INPUT_SETTLE_SECONDS = 0.1
 
 
 class DefoldAgentError(RuntimeError):
@@ -124,6 +129,8 @@ class AgentClient:
     def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AgentClient":
         """Build through `editor`, discover the engine port, and wait for health."""
         if build:
+            cls._close_candidate_engine_ports(editor)
+            time.sleep(0.5)
             editor.build()
 
         def agent_after_build() -> Optional["AgentClient"]:
@@ -297,7 +304,7 @@ class AgentClient:
         duration: float = 0.35,
         wait: Optional[float] = None,
     ) -> JsonDict:
-        """Queue a drag between nodes or coordinates and block for its duration."""
+        """Queue a drag between nodes or coordinates and block until it finishes."""
         if self._is_node_ref(from_target) and self._is_node_ref(to_target):
             params: Dict[str, Any] = {
                 "from_id": self._node_id(from_target),
@@ -310,7 +317,7 @@ class AgentClient:
             params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
 
         response = self.post("/input/drag", params)
-        block_for = max(0.0, duration) if wait is None else wait
+        block_for = max(0.0, duration) + _INPUT_SETTLE_SECONDS if wait is None else wait
         if block_for:
             time.sleep(block_for)
         return response
@@ -338,12 +345,23 @@ class AgentClient:
         return path
 
     def close_engine(self, timeout: float = 2.0) -> None:
-        """Ask the running Defold engine to exit via its built-in message endpoint."""
+        """Ask the running Defold engine to exit, falling back to the local listener PID."""
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
-        status, body = request_bytes(url, b"\010\000", timeout=timeout)
-        if status < 200 or status >= 300:
-            preview = body[:200].decode("utf-8", "replace")
-            raise HttpError("POST", url, f"unexpected status {status}: {preview}", status=status)
+        try:
+            status, body = request_bytes(url, b"\010\000", timeout=timeout)
+            if status < 200 or status >= 300:
+                preview = body[:200].decode("utf-8", "replace")
+                raise HttpError("POST", url, f"unexpected status {status}: {preview}", status=status)
+        except DefoldAgentError:
+            if self._terminate_process_on_port(timeout):
+                return
+            raise
+
+        if self._wait_until_unavailable(timeout):
+            return
+        if self._terminate_process_on_port(timeout):
+            return
+        raise HttpError("POST", url, "engine did not stop after exit request")
 
     @classmethod
     def _close_candidate_engine_ports(cls, editor: Any) -> None:
@@ -355,6 +373,50 @@ class AgentClient:
                 cls(service_port, timeout=1.0).close_engine(timeout=1.0)
             except DefoldAgentError:
                 continue
+
+    def _wait_until_unavailable(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                self.health()
+            except DefoldAgentError:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _terminate_process_on_port(self, timeout: float) -> bool:
+        for pid in self._listening_pids(self.port):
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+        return self._wait_until_unavailable(timeout)
+
+    @staticmethod
+    def _listening_pids(port: int) -> List[int]:
+        if sys.platform.startswith("win"):
+            return []
+        try:
+            output = subprocess.check_output(
+                ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.0,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+        pids: List[int] = []
+        for line in output.splitlines():
+            try:
+                pid = int(line.strip())
+            except ValueError:
+                continue
+            if pid not in pids:
+                pids.append(pid)
+        return pids
 
     def dump_scene(
         self,
@@ -392,16 +454,17 @@ class AgentClient:
         **selector: Any,
     ) -> int:
         """Wait until `count(**selector)` equals `expected`."""
-        def count_if_expected() -> Optional[int]:
+        def count_if_expected() -> Optional[bool]:
             count = self.count(**selector)
-            return count if count == expected else None
+            return True if count == expected else None
 
-        return wait_until(
+        wait_until(
             count_if_expected,
             timeout=timeout,
             interval=interval,
             message=f"node count did not become {expected}: {selector}",
         )
+        return expected
 
     def _request(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
         url = self.base_url + path

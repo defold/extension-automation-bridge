@@ -38,6 +38,9 @@ class EditorClient:
 
     def build(self, timeout: float = 60.0) -> None:
         """Build/run the project and wait until the agent HTTP endpoint registers."""
+        previous_lines = self.console_lines()
+        previous_registration_count = self._endpoint_registered_count(previous_lines)
+        previous_registration_ports = self._latest_registration_engine_service_ports(previous_lines)
         previous_port = self.engine_service_port()
         if previous_port is not None:
             self._engine_service_port = previous_port
@@ -48,7 +51,10 @@ class EditorClient:
 
         try:
             wait_until(
-                self._has_agent_endpoint_registration,
+                lambda: self._has_fresh_agent_endpoint_registration(
+                    previous_registration_count,
+                    previous_registration_ports,
+                ),
                 timeout=timeout,
                 interval=0.1,
                 message="Defold build completed, but agent endpoint did not register",
@@ -78,8 +84,11 @@ class EditorClient:
 
     def latest_registration_engine_service_ports(self) -> list:
         """Return ports logged before the latest agent endpoint registration only."""
-        lines = self.console_lines()
-        search_lines = self._latest_registration_window(lines)
+        return self._latest_registration_engine_service_ports(self.console_lines())
+
+    @classmethod
+    def _latest_registration_engine_service_ports(cls, lines: list) -> list:
+        search_lines = cls._latest_registration_window(lines)
         if search_lines is None:
             search_lines = lines
         candidates = []
@@ -87,7 +96,7 @@ class EditorClient:
             for candidate_pattern in _ENGINE_SERVICE_PORT_PATTERNS:
                 match = candidate_pattern.search(line)
                 if match:
-                    self._append_port_candidate(candidates, int(match.group(1)))
+                    cls._append_port_candidate(candidates, int(match.group(1)))
         return candidates
 
     def latest_registration_has_engine_service_port(self) -> bool:
@@ -102,8 +111,17 @@ class EditorClient:
     def _endpoint_registered_count(lines: list) -> int:
         return sum(1 for line in lines if _AGENT_ENDPOINT_TEXT in line)
 
-    def _has_agent_endpoint_registration(self) -> bool:
-        return self._endpoint_registered_count(self.console_lines()) > 0
+    def endpoint_registered_count(self) -> int:
+        """Return the number of agent endpoint registrations in the editor console."""
+        return self._endpoint_registered_count(self.console_lines())
+
+    def _has_fresh_agent_endpoint_registration(self, previous_count: int, previous_ports: list) -> bool:
+        lines = self.console_lines()
+        current_count = self._endpoint_registered_count(lines)
+        if current_count > previous_count:
+            return True
+        current_ports = self._latest_registration_engine_service_ports(lines)
+        return bool(current_count and current_ports and current_ports != previous_ports)
 
     @staticmethod
     def _latest_registration_window(lines: list) -> Optional[list]:
