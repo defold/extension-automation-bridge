@@ -138,6 +138,8 @@ namespace dmAgent
         dmGraphics::HContext    m_GraphicsContext;
         bool                    m_WebHandlerRegistered;
         uint64_t                m_LastTime;
+        uint64_t                m_Frame;
+        uint64_t                m_SnapshotFrame;
         Snapshot                m_Snapshot;
         AgentArray<InputEvent>  m_InputEvents;
         bool                    m_ScreenshotPending;

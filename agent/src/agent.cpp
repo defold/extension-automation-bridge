@@ -84,6 +84,7 @@ namespace dmAgent
         uint64_t time = dmTime::GetTime();
         float dt = (float)((time - g_Agent.m_LastTime) / 1000000.0);
         g_Agent.m_LastTime = time;
+        ++g_Agent.m_Frame;
 
         UpdateInput(dt);
 

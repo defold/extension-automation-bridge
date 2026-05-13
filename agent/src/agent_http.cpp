@@ -177,7 +177,11 @@ namespace dmAgent
 
     static void RefreshSnapshotForRequest()
     {
-        UpdateSnapshot();
+        if (g_Agent.m_Snapshot.m_Sequence == 0 || g_Agent.m_SnapshotFrame != g_Agent.m_Frame)
+        {
+            UpdateSnapshot();
+            g_Agent.m_SnapshotFrame = g_Agent.m_Frame;
+        }
     }
 
     static void HandleHealth(RequestContext* ctx)
