@@ -1,6 +1,6 @@
 # Native API Automation Bridge Notes
 
-- Use this raw HTTP API when you need curl-level access or are implementing a wrapper; otherwise prefer `automation_bridge/python`.
+- Use this raw HTTP API when you need curl-level access or are implementing a wrapper; otherwise prefer `automation_bridge/automation-bridge-python`.
 - Discover the engine service port from the editor console line `Engine service started on port <port>`.
 - Base URL: `http://127.0.0.1:<engine_service_port>/automation-bridge/v1`.
 - Call `/health` first and require `ok: true` before scene queries or input.

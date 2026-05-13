@@ -1,6 +1,6 @@
 # Automation Bridge Python Wrapper Notes
 
-- Add `automation_bridge/python` to `PYTHONPATH` or `sys.path` before importing `automation_bridge`.
+- Add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path` before importing `automation_bridge`.
 - Public APIs have docstrings. Use `help(AutomationBridgeClient)`, `help(AutomationBridgeClient.drag)`, or `.__doc__` for quick reference.
 - Prefer `AutomationBridgeClient.from_project(".", build=True)` for normal scripts; it closes known candidate engine ports, builds, waits for `Automation Bridge endpoint registered`, discovers the engine service port, and waits for `/automation-bridge/v1/health`.
 - The editor may reuse the same engine process and omit a fresh service-port log line before `Automation Bridge endpoint registered`; `EditorClient` caches the last seen engine service port in `.internal/automation_bridge.engine.port`.

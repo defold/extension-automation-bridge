@@ -26,10 +26,10 @@ Close the running engine when a script needs to clean up after itself:
 bridge.close_engine()
 ```
 
-When running from this repository without installing anything, add `automation_bridge/python` to `PYTHONPATH`:
+When running from this repository without installing anything, add `automation_bridge/automation-bridge-python` to `PYTHONPATH`:
 
 ```sh
-PYTHONPATH=automation_bridge/python python3 tests/test_automation_bridge_api.py
+PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automation_bridge_api.py
 ```
 
 ## Bootstrap

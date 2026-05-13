@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "automation_bridge" / "python"))
+sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
 from automation_bridge import AutomationBridgeApiError, AutomationBridgeClient, EditorClient, wait_until  # noqa: E402
 
@@ -36,6 +36,14 @@ class AutomationBridgeApiTest(unittest.TestCase):
         except FileNotFoundError as exc:
             raise unittest.SkipTest(str(exc)) from exc
 
+    @classmethod
+    def close_bridge(cls):
+        if cls.bridge is None:
+            return
+        bridge = cls.bridge
+        cls.bridge = None
+        bridge.close_engine()
+
     def setUp(self):
         if self.bridge:
             self.reset_if_popup_is_visible()
@@ -47,6 +55,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         for run_index in range(run_count):
             if self.editor is not None:
                 self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+                self.__class__.bridge = self.bridge
                 self.bridge.wait_ready()
                 if previous_port is not None:
                     self.assertNotEqual(previous_port, self.bridge.port)
@@ -206,5 +215,33 @@ class AutomationBridgeApiTest(unittest.TestCase):
         return parents
 
 
+class _ClientCloseFailure:
+    failureException = AssertionError
+
+    def id(self):
+        return "close Automation Bridge client"
+
+    def shortDescription(self):
+        return "close Automation Bridge client"
+
+    def __str__(self):
+        return self.id()
+
+
+class ClosingTextTestResult(unittest.TextTestResult):
+    def stopTestRun(self):
+        super().stopTestRun()
+        if not self.wasSuccessful():
+            return
+        try:
+            AutomationBridgeApiTest.close_bridge()
+        except Exception:  # noqa: BLE001 - surface cleanup failures as unittest errors.
+            self.addError(_ClientCloseFailure(), sys.exc_info())
+
+
+class ClosingTextTestRunner(unittest.TextTestRunner):
+    resultclass = ClosingTextTestResult
+
+
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(testRunner=ClosingTextTestRunner)
