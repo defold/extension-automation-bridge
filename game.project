@@ -24,4 +24,4 @@ title = extension-automation-bridge
 
 [library]
 include_dirs = automation_bridge
-defold_min_version = 1.13.0
+defold_min_version = 1.12.4
