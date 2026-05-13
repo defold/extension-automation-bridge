@@ -1,4 +1,4 @@
-#include "agent_private.h"
+#include "automation_bridge_private.h"
 
 #if defined(DM_DEBUG)
 
@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
     char* DuplicateStringN(const char* value, uint32_t length)
     {
@@ -236,7 +236,7 @@ namespace dmAgent
         FreeString(&param->m_Value);
     }
 
-    void FreeQueryParams(AgentArray<QueryParam>* query)
+    void FreeQueryParams(Array<QueryParam>* query)
     {
         for (uint32_t i = 0; i < query->m_Count; ++i)
         {
@@ -245,7 +245,7 @@ namespace dmAgent
         ArrayFree(query);
     }
 
-    void ParseResource(const char* resource, char** path, AgentArray<QueryParam>* query)
+    void ParseResource(const char* resource, char** path, Array<QueryParam>* query)
     {
         SetString(path, "");
         if (!resource)
@@ -302,7 +302,7 @@ namespace dmAgent
         }
     }
 
-    const char* GetParam(const AgentArray<QueryParam>* query, const char* key)
+    const char* GetParam(const Array<QueryParam>* query, const char* key)
     {
         for (uint32_t i = 0; i < query->m_Count; ++i)
         {
@@ -314,7 +314,7 @@ namespace dmAgent
         return 0;
     }
 
-    bool GetFloatParam(const AgentArray<QueryParam>* query, const char* key, float* value)
+    bool GetFloatParam(const Array<QueryParam>* query, const char* key, float* value)
     {
         const char* text = GetParam(query, key);
         if (IsEmpty(text))
@@ -333,7 +333,7 @@ namespace dmAgent
         return true;
     }
 
-    bool GetBoolParam(const AgentArray<QueryParam>* query, const char* key, bool* value)
+    bool GetBoolParam(const Array<QueryParam>* query, const char* key, bool* value)
     {
         const char* text = GetParam(query, key);
         if (!text)

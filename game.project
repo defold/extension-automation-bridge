@@ -20,9 +20,8 @@ scale = 0.01
 scale_mode = stretch
 
 [project]
-title = extension-defold-agent
+title = extension-automation-bridge
 
 [library]
-include_dirs = agent
+include_dirs = automation_bridge
 defold_min_version = 1.13.0
-

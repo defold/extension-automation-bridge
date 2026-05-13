@@ -13,15 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
-    static const char* API_PREFIX = "/agent/v1";
+    static const char* API_PREFIX = "/automation-bridge/v1";
     static const char* API_VERSION = "1";
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
 
     template <typename T>
-    struct AgentArray
+    struct Array
     {
         T*       m_Data;
         uint32_t m_Count;
@@ -81,8 +81,8 @@ namespace dmAgent
         bool                 m_Visible;
         bool                 m_Enabled;
         Bounds               m_Bounds;
-        AgentArray<Property> m_Properties;
-        AgentArray<uint32_t> m_Children;
+        Array<Property>       m_Properties;
+        Array<uint32_t>       m_Children;
 
         bool  m_HasPosition;
         bool  m_HasSize;
@@ -94,7 +94,7 @@ namespace dmAgent
 
     struct Snapshot
     {
-        AgentArray<Node> m_Nodes;
+        Array<Node>      m_Nodes;
         int32_t          m_Root;
         uint32_t         m_WindowWidth;
         uint32_t         m_WindowHeight;
@@ -129,7 +129,7 @@ namespace dmAgent
         dmHID::Key m_ActiveKey;
     };
 
-    struct AgentContext
+    struct AutomationBridgeContext
     {
         bool                    m_Initialized;
         dmGameObject::HRegister m_Register;
@@ -141,7 +141,7 @@ namespace dmAgent
         uint64_t                m_Frame;
         uint64_t                m_SnapshotFrame;
         Snapshot                m_Snapshot;
-        AgentArray<InputEvent>  m_InputEvents;
+        Array<InputEvent>      m_InputEvents;
         bool                    m_ScreenshotPending;
         uint32_t                m_ScreenshotCounter;
         char                    m_ScreenshotPath[1024];
@@ -154,25 +154,25 @@ namespace dmAgent
         bool m_Children;
     };
 
-    typedef AgentArray<uint8_t> ByteArray;
+    typedef Array<uint8_t> ByteArray;
 
-    extern AgentContext g_Agent;
+    extern AutomationBridgeContext g_AutomationBridge;
 
     template <typename T>
-    static void ArrayInit(AgentArray<T>* array)
+    static void ArrayInit(Array<T>* array)
     {
         memset(array, 0, sizeof(*array));
     }
 
     template <typename T>
-    static void ArrayFree(AgentArray<T>* array)
+    static void ArrayFree(Array<T>* array)
     {
         free(array->m_Data);
         memset(array, 0, sizeof(*array));
     }
 
     template <typename T>
-    static bool ArrayReserve(AgentArray<T>* array, uint32_t capacity)
+    static bool ArrayReserve(Array<T>* array, uint32_t capacity)
     {
         if (capacity <= array->m_Capacity)
         {
@@ -207,7 +207,7 @@ namespace dmAgent
     }
 
     template <typename T>
-    static bool ArraySetCount(AgentArray<T>* array, uint32_t count)
+    static bool ArraySetCount(Array<T>* array, uint32_t count)
     {
         if (!ArrayReserve(array, count))
         {
@@ -218,7 +218,7 @@ namespace dmAgent
     }
 
     template <typename T>
-    static bool ArrayPush(AgentArray<T>* array, const T* value)
+    static bool ArrayPush(Array<T>* array, const T* value)
     {
         if (!ArrayReserve(array, array->m_Count + 1))
         {
@@ -229,7 +229,7 @@ namespace dmAgent
     }
 
     template <typename T>
-    static void ArrayErase(AgentArray<T>* array, uint32_t index)
+    static void ArrayErase(Array<T>* array, uint32_t index)
     {
         if (index + 1 < array->m_Count)
         {
@@ -305,11 +305,11 @@ namespace dmAgent
     void AppendNumber(StringBuffer* out, double value);
     void AppendJsonString(StringBuffer* out, const char* value);
     bool SetHashString(char** out, dmhash_t hash);
-    void FreeQueryParams(AgentArray<QueryParam>* query);
-    void ParseResource(const char* resource, char** path, AgentArray<QueryParam>* query);
-    const char* GetParam(const AgentArray<QueryParam>* query, const char* key);
-    bool GetFloatParam(const AgentArray<QueryParam>* query, const char* key, float* value);
-    bool GetBoolParam(const AgentArray<QueryParam>* query, const char* key, bool* value);
+    void FreeQueryParams(Array<QueryParam>* query);
+    void ParseResource(const char* resource, char** path, Array<QueryParam>* query);
+    const char* GetParam(const Array<QueryParam>* query, const char* key);
+    bool GetFloatParam(const Array<QueryParam>* query, const char* key, float* value);
+    bool GetBoolParam(const Array<QueryParam>* query, const char* key, bool* value);
     bool ContainsCaseInsensitive(const char* haystack, const char* needle);
 
     void InitSnapshot(Snapshot* snapshot);
@@ -332,7 +332,7 @@ namespace dmAgent
 
     void RegisterWebEndpoint(dmExtension::AppParams* params);
     void UnregisterWebEndpoint();
-    void AgentHandler(void* user_data, dmWebServer::Request* request);
+    void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request);
 }
 
 #endif

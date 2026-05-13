@@ -1,18 +1,18 @@
-#include "agent_private.h"
+#include "automation_bridge_private.h"
 
 #if defined(DM_DEBUG)
 
 #include <ctype.h>
 #include <string.h>
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
     struct RequestContext
     {
         dmWebServer::Request*    m_Request;
         char*                    m_Path;
         char*                    m_Route;
-        AgentArray<QueryParam>   m_Query;
+        Array<QueryParam>      m_Query;
     };
 
     typedef void (*RouteHandler)(RequestContext* ctx);
@@ -177,10 +177,10 @@ namespace dmAgent
 
     static void RefreshSnapshotForRequest()
     {
-        if (g_Agent.m_Snapshot.m_Sequence == 0 || g_Agent.m_SnapshotFrame != g_Agent.m_Frame)
+        if (g_AutomationBridge.m_Snapshot.m_Sequence == 0 || g_AutomationBridge.m_SnapshotFrame != g_AutomationBridge.m_Frame)
         {
             UpdateSnapshot();
-            g_Agent.m_SnapshotFrame = g_Agent.m_Frame;
+            g_AutomationBridge.m_SnapshotFrame = g_AutomationBridge.m_Frame;
         }
     }
 
@@ -212,9 +212,9 @@ namespace dmAgent
             StringBufferAppend(&response, ",\"screenshot\"");
         }
         StringBufferAppend(&response, "],\"screen\":");
-        AppendScreenJson(&response, &g_Agent.m_Snapshot);
+        AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
         StringBufferAppend(&response, ",\"scene_sequence\":");
-        AppendNumber(&response, (double)g_Agent.m_Snapshot.m_Sequence);
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -226,7 +226,7 @@ namespace dmAgent
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
-        AppendScreenJson(&response, &g_Agent.m_Snapshot);
+        AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
         StringBufferAppend(&response, "}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -239,7 +239,7 @@ namespace dmAgent
         bool visible_only = false;
         RequestGetBoolParam(ctx, "visible", &visible_only);
 
-        const Snapshot* snapshot = &g_Agent.m_Snapshot;
+        const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
         if (snapshot->m_Root < 0 || (uint32_t)snapshot->m_Root >= snapshot->m_Nodes.m_Count)
         {
             RequestSendError(ctx, 404, "scene_unavailable", "scene graph is not available");
@@ -304,7 +304,7 @@ namespace dmAgent
         RequestGetFloatParam(ctx, "limit", &limit_f);
         uint32_t limit = (uint32_t)ClampFloat(limit_f, 0.0f, 500.0f);
 
-        const Snapshot* snapshot = &g_Agent.m_Snapshot;
+        const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
         uint32_t matched = 0;
         uint32_t emitted = 0;
 
@@ -362,7 +362,7 @@ namespace dmAgent
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"node\":");
-        AppendNodeJson(&response, &g_Agent.m_Snapshot, node, &include, include.m_Children, false);
+        AppendNodeJson(&response, &g_AutomationBridge.m_Snapshot, node, &include, include.m_Children, false);
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -546,7 +546,7 @@ namespace dmAgent
         {"/screenshot", "GET", HandleScreenshot}
     };
 
-    void AgentHandler(void* user_data, dmWebServer::Request* request)
+    void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request)
     {
         (void)user_data;
 
@@ -592,44 +592,44 @@ namespace dmAgent
 
     void RegisterWebEndpoint(dmExtension::AppParams* params)
     {
-        g_Agent.m_WebServer = dmEngine::GetWebServer(params);
-        if (!g_Agent.m_WebServer)
+        g_AutomationBridge.m_WebServer = dmEngine::GetWebServer(params);
+        if (!g_AutomationBridge.m_WebServer)
         {
-            dmLogWarning("Defold Agent extension: debug web server is unavailable");
+            dmLogWarning("Automation Bridge extension: debug web server is unavailable");
             return;
         }
 
         dmWebServer::HandlerParams handler_params;
         handler_params.m_Userdata = 0;
-        handler_params.m_Handler = AgentHandler;
+        handler_params.m_Handler = AutomationBridgeHandler;
 
-        dmWebServer::Result result = dmWebServer::AddHandler(g_Agent.m_WebServer, API_PREFIX, &handler_params);
+        dmWebServer::Result result = dmWebServer::AddHandler(g_AutomationBridge.m_WebServer, API_PREFIX, &handler_params);
         if (result == dmWebServer::RESULT_OK || result == dmWebServer::RESULT_HANDLER_ALREADY_REGISTRED)
         {
-            g_Agent.m_WebHandlerRegistered = true;
-            dmLogInfo("Defold Agent endpoint registered at `%s`", API_PREFIX);
+            g_AutomationBridge.m_WebHandlerRegistered = true;
+            dmLogInfo("Automation Bridge endpoint registered at `%s`", API_PREFIX);
         }
         else
         {
-            dmLogWarning("Unable to register Defold Agent endpoint '%s' (%d)", API_PREFIX, result);
+            dmLogWarning("Unable to register Automation Bridge endpoint '%s' (%d)", API_PREFIX, result);
         }
     }
 
     void UnregisterWebEndpoint()
     {
-        if (!g_Agent.m_WebServer || !g_Agent.m_WebHandlerRegistered)
+        if (!g_AutomationBridge.m_WebServer || !g_AutomationBridge.m_WebHandlerRegistered)
         {
-            g_Agent.m_WebServer = 0;
-            g_Agent.m_WebHandlerRegistered = false;
+            g_AutomationBridge.m_WebServer = 0;
+            g_AutomationBridge.m_WebHandlerRegistered = false;
             return;
         }
-        dmWebServer::Result result = dmWebServer::RemoveHandler(g_Agent.m_WebServer, API_PREFIX);
+        dmWebServer::Result result = dmWebServer::RemoveHandler(g_AutomationBridge.m_WebServer, API_PREFIX);
         if (result != dmWebServer::RESULT_OK && result != dmWebServer::RESULT_HANDLER_NOT_REGISTRED)
         {
-            dmLogWarning("Unable to remove Defold Agent endpoint '%s' (%d)", API_PREFIX, result);
+            dmLogWarning("Unable to remove Automation Bridge endpoint '%s' (%d)", API_PREFIX, result);
         }
-        g_Agent.m_WebServer = 0;
-        g_Agent.m_WebHandlerRegistered = false;
+        g_AutomationBridge.m_WebServer = 0;
+        g_AutomationBridge.m_WebHandlerRegistered = false;
     }
 
 

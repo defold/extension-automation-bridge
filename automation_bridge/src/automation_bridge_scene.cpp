@@ -1,4 +1,4 @@
-#include "agent_private.h"
+#include "automation_bridge_private.h"
 
 #if defined(DM_DEBUG)
 
@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
     static const char* SceneNodeTypeToString(dmGameObject::SceneNodeType type)
     {
@@ -416,16 +416,16 @@ namespace dmAgent
 
     static void RefreshScreenInfo(Snapshot* snapshot)
     {
-        if (!g_Agent.m_GraphicsContext)
+        if (!g_AutomationBridge.m_GraphicsContext)
         {
             return;
         }
 
-        snapshot->m_WindowWidth = dmGraphics::GetWindowWidth(g_Agent.m_GraphicsContext);
-        snapshot->m_WindowHeight = dmGraphics::GetWindowHeight(g_Agent.m_GraphicsContext);
-        snapshot->m_BackbufferWidth = dmGraphics::GetWidth(g_Agent.m_GraphicsContext);
-        snapshot->m_BackbufferHeight = dmGraphics::GetHeight(g_Agent.m_GraphicsContext);
-        dmGraphics::GetViewport(g_Agent.m_GraphicsContext, &snapshot->m_ViewportX, &snapshot->m_ViewportY, &snapshot->m_ViewportWidth, &snapshot->m_ViewportHeight);
+        snapshot->m_WindowWidth = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
+        snapshot->m_WindowHeight = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
+        snapshot->m_BackbufferWidth = dmGraphics::GetWidth(g_AutomationBridge.m_GraphicsContext);
+        snapshot->m_BackbufferHeight = dmGraphics::GetHeight(g_AutomationBridge.m_GraphicsContext);
+        dmGraphics::GetViewport(g_AutomationBridge.m_GraphicsContext, &snapshot->m_ViewportX, &snapshot->m_ViewportY, &snapshot->m_ViewportWidth, &snapshot->m_ViewportHeight);
 
         if (snapshot->m_WindowWidth == 0)
         {
@@ -441,25 +441,25 @@ namespace dmAgent
     {
         Snapshot snapshot;
         InitSnapshot(&snapshot);
-        snapshot.m_Sequence = g_Agent.m_Snapshot.m_Sequence + 1;
+        snapshot.m_Sequence = g_AutomationBridge.m_Snapshot.m_Sequence + 1;
         RefreshScreenInfo(&snapshot);
 
-        if (g_Agent.m_Register)
+        if (g_AutomationBridge.m_Register)
         {
             dmGameObject::SceneNode root;
-            if (dmGameObject::TraverseGetRoot(g_Agent.m_Register, &root))
+            if (dmGameObject::TraverseGetRoot(g_AutomationBridge.m_Register, &root))
             {
                 snapshot.m_Root = BuildNode(&snapshot, &root, -1, "", 0);
             }
         }
 
-        FreeSnapshot(&g_Agent.m_Snapshot);
-        g_Agent.m_Snapshot = snapshot;
+        FreeSnapshot(&g_AutomationBridge.m_Snapshot);
+        g_AutomationBridge.m_Snapshot = snapshot;
     }
 
     const Node* FindNodeById(const char* id)
     {
-        const Snapshot* snapshot = &g_Agent.m_Snapshot;
+        const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
         for (uint32_t i = 0; i < snapshot->m_Nodes.m_Count; ++i)
         {
             if (StringsEqual(snapshot->m_Nodes.m_Data[i].m_Id, id))

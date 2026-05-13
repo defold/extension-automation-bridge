@@ -1,4 +1,4 @@
-#include "agent_private.h"
+#include "automation_bridge_private.h"
 
 #if defined(DM_DEBUG)
 
@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
     void FreeInputEvent(InputEvent* event)
     {
@@ -16,7 +16,7 @@ namespace dmAgent
 
     static bool CanQueueInputEvent()
     {
-        return g_Agent.m_InputEvents.m_Count < MAX_INPUT_EVENTS;
+        return g_AutomationBridge.m_InputEvents.m_Count < MAX_INPUT_EVENTS;
     }
 
     bool AddMouseInput(float x1, float y1, float x2, float y2, float duration)
@@ -36,7 +36,7 @@ namespace dmAgent
         event.m_Duration = MaxFloat(0.0f, duration);
         event.m_MouseButton = dmHID::MOUSE_BUTTON_LEFT;
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
-        return ArrayPush(&g_Agent.m_InputEvents, &event);
+        return ArrayPush(&g_AutomationBridge.m_InputEvents, &event);
     }
 
     bool AddKeyInput(const char* keys)
@@ -51,7 +51,7 @@ namespace dmAgent
         event.m_Type = INPUT_EVENT_KEYS;
         event.m_Keys = DuplicateString(keys);
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
-        if (!event.m_Keys || !ArrayPush(&g_Agent.m_InputEvents, &event))
+        if (!event.m_Keys || !ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
             FreeInputEvent(&event);
             return false;
@@ -256,35 +256,35 @@ namespace dmAgent
 
     void UpdateInput(float dt)
     {
-        if (!g_Agent.m_HidContext)
+        if (!g_AutomationBridge.m_HidContext)
         {
             return;
         }
 
-        dmHID::HMouse mouse = dmHID::GetMouse(g_Agent.m_HidContext, 0);
-        dmHID::HKeyboard keyboard = dmHID::GetKeyboard(g_Agent.m_HidContext, 0);
+        dmHID::HMouse mouse = dmHID::GetMouse(g_AutomationBridge.m_HidContext, 0);
+        dmHID::HKeyboard keyboard = dmHID::GetKeyboard(g_AutomationBridge.m_HidContext, 0);
         dmHID::HTouchDevice touch_device = dmHID::INVALID_TOUCH_DEVICE_HANDLE;
 #if defined(DM_PLATFORM_IOS) || defined(DM_PLATFORM_ANDROID) || defined(DM_PLATFORM_SWITCH)
-        touch_device = dmHID::GetTouchDevice(g_Agent.m_HidContext, 0);
+        touch_device = dmHID::GetTouchDevice(g_AutomationBridge.m_HidContext, 0);
 #endif
 
-        for (uint32_t i = 0; i < g_Agent.m_InputEvents.m_Count;)
+        for (uint32_t i = 0; i < g_AutomationBridge.m_InputEvents.m_Count;)
         {
             bool done = false;
-            InputEvent* event = &g_Agent.m_InputEvents.m_Data[i];
+            InputEvent* event = &g_AutomationBridge.m_InputEvents.m_Data[i];
             if (event->m_Type == INPUT_EVENT_MOUSE)
             {
                 done = UpdateMouseEvent(mouse, touch_device, dt, event);
             }
             else if (event->m_Type == INPUT_EVENT_KEYS)
             {
-                done = UpdateKeyEvent(g_Agent.m_HidContext, keyboard, event);
+                done = UpdateKeyEvent(g_AutomationBridge.m_HidContext, keyboard, event);
             }
 
             if (done)
             {
                 FreeInputEvent(event);
-                ArrayErase(&g_Agent.m_InputEvents, i);
+                ArrayErase(&g_AutomationBridge.m_InputEvents, i);
             }
             else
             {

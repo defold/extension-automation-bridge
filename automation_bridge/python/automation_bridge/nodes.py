@@ -1,4 +1,4 @@
-"""Typed snapshot wrappers for Defold Agent node responses."""
+"""Typed snapshot wrappers for Automation Bridge node responses."""
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
@@ -41,7 +41,7 @@ class Bounds:
 
 @dataclass(frozen=True)
 class Node:
-    """Snapshot wrapper around one node object returned by `/agent/v1`."""
+    """Snapshot wrapper around one node object returned by `/automation-bridge/v1`."""
 
     raw: Dict[str, Any]
 

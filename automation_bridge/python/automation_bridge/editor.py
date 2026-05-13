@@ -5,11 +5,11 @@ import time
 from pathlib import Path
 from typing import Optional, Union
 
-from .client import DefoldAgentError, request_json
+from .client import AutomationBridgeError, request_json
 from .waits import wait_until
 
 
-_AGENT_ENDPOINT_TEXT = "Defold Agent endpoint registered"
+_AUTOMATION_BRIDGE_ENDPOINT_TEXT = "Automation Bridge endpoint registered"
 _ENGINE_SERVICE_PORT_PATTERNS = (
     re.compile(r"Engine service started on port (\d+)"),
     re.compile(r"Log server started on port (\d+)"),
@@ -37,7 +37,7 @@ class EditorClient:
         return cls(root)
 
     def build(self, timeout: float = 60.0) -> None:
-        """Build/run the project and wait until the agent HTTP endpoint registers."""
+        """Build/run the project and wait until the Automation Bridge HTTP endpoint registers."""
         previous_lines = self.console_lines()
         previous_registration_count = self._endpoint_registered_count(previous_lines)
         previous_registration_ports = self._latest_registration_engine_service_ports(previous_lines)
@@ -47,20 +47,20 @@ class EditorClient:
         _, response = request_json(f"{self.base_url}/command/build", method="POST", timeout=timeout)
         if not response.get("success"):
             issues = response.get("issues", [])
-            raise DefoldAgentError(f"Defold build failed: {issues}")
+            raise AutomationBridgeError(f"Defold build failed: {issues}")
 
         try:
             wait_until(
-                lambda: self._has_fresh_agent_endpoint_registration(
+                lambda: self._has_fresh_endpoint_registration(
                     previous_registration_count,
                     previous_registration_ports,
                 ),
                 timeout=timeout,
                 interval=0.1,
-                message="Defold build completed, but agent endpoint did not register",
+                message="Defold build completed, but Automation Bridge endpoint did not register",
             )
         except AssertionError as exc:
-            raise DefoldAgentError(str(exc)) from exc
+            raise AutomationBridgeError(str(exc)) from exc
         self._last_build_had_engine_service_port = self.latest_registration_has_engine_service_port()
         time.sleep(0.2)
 
@@ -83,7 +83,7 @@ class EditorClient:
         return candidates
 
     def latest_registration_engine_service_ports(self) -> list:
-        """Return ports logged before the latest agent endpoint registration only."""
+        """Return ports logged before the latest Automation Bridge endpoint registration only."""
         return self._latest_registration_engine_service_ports(self.console_lines())
 
     @classmethod
@@ -109,13 +109,13 @@ class EditorClient:
 
     @staticmethod
     def _endpoint_registered_count(lines: list) -> int:
-        return sum(1 for line in lines if _AGENT_ENDPOINT_TEXT in line)
+        return sum(1 for line in lines if _AUTOMATION_BRIDGE_ENDPOINT_TEXT in line)
 
     def endpoint_registered_count(self) -> int:
-        """Return the number of agent endpoint registrations in the editor console."""
+        """Return the number of Automation Bridge endpoint registrations in the editor console."""
         return self._endpoint_registered_count(self.console_lines())
 
-    def _has_fresh_agent_endpoint_registration(self, previous_count: int, previous_ports: list) -> bool:
+    def _has_fresh_endpoint_registration(self, previous_count: int, previous_ports: list) -> bool:
         lines = self.console_lines()
         current_count = self._endpoint_registered_count(lines)
         if current_count > previous_count:
@@ -128,7 +128,7 @@ class EditorClient:
         endpoint_index: Optional[int] = None
         previous_endpoint_index: Optional[int] = None
         for index, line in enumerate(lines):
-            if _AGENT_ENDPOINT_TEXT in line:
+            if _AUTOMATION_BRIDGE_ENDPOINT_TEXT in line:
                 previous_endpoint_index = endpoint_index
                 endpoint_index = index
 
@@ -138,7 +138,7 @@ class EditorClient:
         return lines[start_index:endpoint_index]
 
     def remember_engine_service_port(self, port: int) -> None:
-        """Remember a validated agent API port for reused-engine builds."""
+        """Remember a validated Automation Bridge API port for reused-engine builds."""
         self._engine_service_port = int(port)
         self._write_cached_engine_service_port(self._engine_service_port)
 
@@ -149,7 +149,7 @@ class EditorClient:
 
     @property
     def _engine_service_port_cache_path(self) -> Path:
-        return self.root / ".internal" / "agent.engine.port"
+        return self.root / ".internal" / "automation_bridge.engine.port"
 
     def _read_cached_engine_service_port(self) -> Optional[int]:
         path = self._engine_service_port_cache_path

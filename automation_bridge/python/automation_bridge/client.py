@@ -1,4 +1,4 @@
-"""Dependency-free Python client for the Defold Agent runtime API."""
+"""Dependency-free Python client for the Automation Bridge runtime API."""
 
 import json
 import os
@@ -21,13 +21,13 @@ Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _INPUT_SETTLE_SECONDS = 0.1
 
 
-class DefoldAgentError(RuntimeError):
-    """Base class for custom Defold Agent wrapper errors."""
+class AutomationBridgeError(RuntimeError):
+    """Base class for custom Automation Bridge wrapper errors."""
 
     pass
 
 
-class HttpError(DefoldAgentError):
+class HttpError(AutomationBridgeError):
     """Raised for transport failures, invalid JSON, or unexpected raw responses."""
 
     def __init__(self, method: str, url: str, message: str, status: Optional[int] = None):
@@ -37,18 +37,18 @@ class HttpError(DefoldAgentError):
         super().__init__(f"{method} {url} failed: {message}")
 
 
-class AgentApiError(DefoldAgentError):
-    """Raised when the native agent API returns `{ "ok": false }`."""
+class AutomationBridgeApiError(AutomationBridgeError):
+    """Raised when the native Automation Bridge API returns `{ "ok": false }`."""
 
     def __init__(self, code: str, message: str, status: int, response: Mapping[str, Any]):
         self.code = code
         self.message = message
         self.status = status
         self.response = response
-        super().__init__(f"agent API error {status} {code}: {message}")
+        super().__init__(f"Automation Bridge API error {status} {code}: {message}")
 
 
-class SelectorError(DefoldAgentError):
+class SelectorError(AutomationBridgeError):
     """Raised when a node selector finds too many or too few nodes."""
 
     pass
@@ -65,6 +65,8 @@ def request_json(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[
         status = exc.code
         body = exc.read().decode("utf-8", "replace")
     except urllib.error.URLError as exc:
+        raise HttpError(method, url, str(exc)) from exc
+    except OSError as exc:
         raise HttpError(method, url, str(exc)) from exc
 
     try:
@@ -88,6 +90,8 @@ def request_bytes(url: str, data: bytes, method: str = "POST", timeout: float = 
         return exc.code, exc.read()
     except urllib.error.URLError as exc:
         raise HttpError(method, url, str(exc)) from exc
+    except OSError as exc:
+        raise HttpError(method, url, str(exc)) from exc
 
 
 def _normalize_include(include: Optional[Union[str, Iterable[str]]]) -> Optional[str]:
@@ -104,8 +108,8 @@ def _encode_param(value: Any) -> str:
     return str(value)
 
 
-class AgentClient:
-    """High-level client for `/agent/v1` scene inspection and input control."""
+class AutomationBridgeClient:
+    """High-level client for `/automation-bridge/v1` scene inspection and input control."""
 
     _SERVER_FILTERS = {"id", "type", "name", "text", "url", "visible"}
     _CLIENT_FILTERS = {
@@ -123,57 +127,57 @@ class AgentClient:
         """Create a client for an already-known engine service `port`."""
         self.port = int(port)
         self.timeout = timeout
-        self.base_url = f"http://127.0.0.1:{self.port}/agent/v1"
+        self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
 
     @classmethod
-    def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AgentClient":
+    def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
         """Build through `editor`, discover the engine port, and wait for health."""
         if build:
             cls._close_candidate_engine_ports(editor)
             time.sleep(0.5)
             editor.build()
 
-        def agent_after_build() -> Optional["AgentClient"]:
+        def bridge_after_build() -> Optional["AutomationBridgeClient"]:
             service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
             for service_port in service_ports:
                 if not service_port:
                     continue
                 try:
-                    agent = cls(service_port)
-                    agent.health()
+                    bridge = cls(service_port)
+                    bridge.health()
                 except Exception:  # noqa: BLE001 - keep polling other candidate ports.
                     continue
                 if hasattr(editor, "remember_engine_service_port"):
                     editor.remember_engine_service_port(service_port)
-                return agent
+                return bridge
             return None
 
         if build and cls._last_build_missing_engine_service_port(editor):
-            return cls._recover_after_stale_build(editor, agent_after_build, timeout)
+            return cls._recover_after_stale_build(editor, bridge_after_build, timeout)
 
         try:
             return wait_until(
-                agent_after_build,
+                bridge_after_build,
                 timeout=timeout,
                 interval=0.1,
-                message="Defold Agent endpoint did not become ready",
+                message="Automation Bridge endpoint did not become ready",
             )
         except AssertionError:
             if not build:
                 raise
 
-        return cls._recover_after_stale_build(editor, agent_after_build, timeout)
+        return cls._recover_after_stale_build(editor, bridge_after_build, timeout)
 
     @classmethod
-    def _recover_after_stale_build(cls, editor: Any, agent_after_build: Any, timeout: float) -> "AgentClient":
+    def _recover_after_stale_build(cls, editor: Any, bridge_after_build: Any, timeout: float) -> "AutomationBridgeClient":
         cls._close_candidate_engine_ports(editor)
         time.sleep(0.5)
         editor.build()
         return wait_until(
-            agent_after_build,
+            bridge_after_build,
             timeout=timeout,
             interval=0.1,
-            message="Defold Agent endpoint did not become ready after engine restart",
+            message="Automation Bridge endpoint did not become ready after engine restart",
         )
 
     @staticmethod
@@ -183,8 +187,8 @@ class AgentClient:
         return editor.last_build_had_engine_service_port() is False
 
     @classmethod
-    def from_project(cls, root: Union[str, Path] = ".", build: bool = True, timeout: float = 20.0) -> "AgentClient":
-        """Create an editor client from `root`, then connect to the agent API."""
+    def from_project(cls, root: Union[str, Path] = ".", build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
+        """Create an editor client from `root`, then connect to the Automation Bridge API."""
         from .editor import EditorClient
 
         editor = EditorClient.from_project(root)
@@ -196,19 +200,19 @@ class AgentClient:
             self.health,
             timeout=timeout,
             interval=0.1,
-            message="Defold Agent endpoint did not become ready",
+            message="Automation Bridge endpoint did not become ready",
         )
 
     def get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """GET an agent API path and return its `data` object."""
+        """GET an Automation Bridge API path and return its `data` object."""
         return self._request("GET", path, params)
 
     def post(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """POST an agent API path with query parameters and return `data`."""
+        """POST an Automation Bridge API path with query parameters and return `data`."""
         return self._request("POST", path, params)
 
     def health(self) -> JsonDict:
-        """Return agent version, capabilities, platform, and screen data."""
+        """Return API version, capabilities, platform, and screen data."""
         return self.get("/health")
 
     def screen(self) -> JsonDict:
@@ -253,7 +257,7 @@ class AgentClient:
         id: str,
         include: Optional[Union[str, Iterable[str]]] = "basic,bounds,properties,children",
     ) -> Node:
-        """Fetch one node by stable agent node id."""
+        """Fetch one node by stable Automation Bridge node id."""
         params: Dict[str, Any] = {"id": id}
         normalized_include = _normalize_include(include)
         if normalized_include:
@@ -352,7 +356,7 @@ class AgentClient:
             if status < 200 or status >= 300:
                 preview = body[:200].decode("utf-8", "replace")
                 raise HttpError("POST", url, f"unexpected status {status}: {preview}", status=status)
-        except DefoldAgentError:
+        except AutomationBridgeError:
             if self._terminate_process_on_port(timeout):
                 return
             raise
@@ -371,7 +375,7 @@ class AgentClient:
                 continue
             try:
                 cls(service_port, timeout=1.0).close_engine(timeout=1.0)
-            except DefoldAgentError:
+            except AutomationBridgeError:
                 continue
 
     def _wait_until_unavailable(self, timeout: float) -> bool:
@@ -379,7 +383,7 @@ class AgentClient:
         while time.monotonic() < deadline:
             try:
                 self.health()
-            except DefoldAgentError:
+            except AutomationBridgeError:
                 return True
             time.sleep(0.05)
         return False
@@ -477,7 +481,7 @@ class AgentClient:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
-            raise AgentApiError(code, message, status, response)
+            raise AutomationBridgeApiError(code, message, status, response)
         return response.get("data", {})
 
     @staticmethod

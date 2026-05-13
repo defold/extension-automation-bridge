@@ -1,4 +1,4 @@
-#include "agent_private.h"
+#include "automation_bridge_private.h"
 
 #if defined(DM_DEBUG)
 
@@ -12,11 +12,11 @@
 #include <direct.h>
 #endif
 
-namespace dmAgent
+namespace dmAutomationBridge
 {
     bool IsScreenshotSupported()
     {
-        if (!g_Agent.m_GraphicsContext)
+        if (!g_AutomationBridge.m_GraphicsContext)
         {
             return false;
         }
@@ -67,7 +67,7 @@ namespace dmAgent
         const char* temp_dir = GetTempDirectory();
         size_t temp_dir_len = strlen(temp_dir);
         const char* separator = temp_dir_len > 0 && (temp_dir[temp_dir_len - 1] == '/' || temp_dir[temp_dir_len - 1] == '\\') ? "" : "/";
-        int written = dmSnPrintf(directory, directory_size, "%s%sdefold-agent", temp_dir, separator);
+        int written = dmSnPrintf(directory, directory_size, "%s%sautomation-bridge", temp_dir, separator);
         if (written < 0 || (uint32_t)written >= directory_size)
         {
             return false;
@@ -81,7 +81,7 @@ namespace dmAgent
 #endif
         if (result != 0 && errno != EEXIST)
         {
-            dmLogError("Unable to create agent screenshot directory '%s' (%d)", directory, errno);
+            dmLogError("Unable to create Automation Bridge screenshot directory '%s' (%d)", directory, errno);
             return false;
         }
         return true;
@@ -96,7 +96,7 @@ namespace dmAgent
         }
 
         uint32_t timestamp = (uint32_t)(dmTime::GetTime() / 1000000);
-        uint32_t counter = ++g_Agent.m_ScreenshotCounter;
+        uint32_t counter = ++g_AutomationBridge.m_ScreenshotCounter;
         int written = dmSnPrintf(path, path_size, "%s/screenshot-%u-%u.png", directory, timestamp, counter);
         if (written < 0 || (uint32_t)written >= path_size)
         {
@@ -108,17 +108,17 @@ namespace dmAgent
 
     bool ScheduleScreenshot(const char* path)
     {
-        if (g_Agent.m_ScreenshotPending)
+        if (g_AutomationBridge.m_ScreenshotPending)
         {
             return false;
         }
 
-        int written = dmSnPrintf(g_Agent.m_ScreenshotPath, sizeof(g_Agent.m_ScreenshotPath), "%s", path);
-        if (written < 0 || (uint32_t)written >= sizeof(g_Agent.m_ScreenshotPath))
+        int written = dmSnPrintf(g_AutomationBridge.m_ScreenshotPath, sizeof(g_AutomationBridge.m_ScreenshotPath), "%s", path);
+        if (written < 0 || (uint32_t)written >= sizeof(g_AutomationBridge.m_ScreenshotPath))
         {
             return false;
         }
-        g_Agent.m_ScreenshotPending = true;
+        g_AutomationBridge.m_ScreenshotPending = true;
         return true;
     }
 
@@ -278,7 +278,7 @@ namespace dmAgent
         int32_t y = 0;
         uint32_t width = 0;
         uint32_t height = 0;
-        dmGraphics::GetViewport(g_Agent.m_GraphicsContext, &x, &y, &width, &height);
+        dmGraphics::GetViewport(g_AutomationBridge.m_GraphicsContext, &x, &y, &width, &height);
         if (width == 0 || height == 0)
         {
             return false;
@@ -291,7 +291,7 @@ namespace dmAgent
             return false;
         }
 
-        dmGraphics::ReadPixels(g_Agent.m_GraphicsContext, x, y, width, height, pixels.m_Data, pixels.m_Count);
+        dmGraphics::ReadPixels(g_AutomationBridge.m_GraphicsContext, x, y, width, height, pixels.m_Data, pixels.m_Count);
 
         for (uint32_t i = 0; i < pixels.m_Count; i += 4)
         {
@@ -327,26 +327,26 @@ namespace dmAgent
 
     void ProcessPendingScreenshot()
     {
-        if (!g_Agent.m_ScreenshotPending)
+        if (!g_AutomationBridge.m_ScreenshotPending)
         {
             return;
         }
 
         char path[1024];
-        dmSnPrintf(path, sizeof(path), "%s", g_Agent.m_ScreenshotPath);
-        g_Agent.m_ScreenshotPending = false;
+        dmSnPrintf(path, sizeof(path), "%s", g_AutomationBridge.m_ScreenshotPath);
+        g_AutomationBridge.m_ScreenshotPending = false;
 
         ByteArray png;
         ArrayInit(&png);
         if (!CaptureScreenshotPng(&png))
         {
-            dmLogError("Unable to capture agent screenshot");
+            dmLogError("Unable to capture Automation Bridge screenshot");
             ArrayFree(&png);
             return;
         }
         if (!WriteBytesToFile(path, &png))
         {
-            dmLogError("Unable to write agent screenshot '%s'", path);
+            dmLogError("Unable to write Automation Bridge screenshot '%s'", path);
         }
         ArrayFree(&png);
     }

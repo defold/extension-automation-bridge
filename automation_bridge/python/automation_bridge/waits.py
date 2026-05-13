@@ -1,4 +1,4 @@
-"""Polling helpers for Defold Agent scripts."""
+"""Polling helpers for Automation Bridge scripts."""
 
 import time
 from typing import Callable, Optional, TypeVar
