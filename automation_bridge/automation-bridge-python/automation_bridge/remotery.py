@@ -1232,7 +1232,9 @@ def _read_property_values(reader: _Reader, property_type: int) -> Tuple[NumericV
     if property_type == 1:
         return bool(reader.read_f64("bool property value")), bool(reader.read_f64("bool previous property value"))
     if property_type in (2, 3):
-        return int(reader.read_f64("integer property value")), int(reader.read_f64("integer previous property value"))
+        return _read_integer_f64(reader, "integer property value"), _read_integer_f64(
+            reader, "integer previous property value"
+        )
     if property_type in (4, 7):
         return reader.read_f64("float property value"), reader.read_f64("float previous property value")
     if property_type == 5:

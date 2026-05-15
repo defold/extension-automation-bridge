@@ -55,7 +55,7 @@ PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automat
 - Waits and screenshots: client methods `wait_for_node(...)`, `wait_for_count(...)`, and `screenshot(...)`, plus the module-level `wait_until(...)`.
 - Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
 - Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
-- Profiling: `bridge.profiler.resources()`, `remotery(...)`, `capture(...)`, and `start_recording(...)`.
+- Profiling: `bridge.profiler.resources()`, `bridge.profiler.remotery(...)`, `bridge.profiler.capture(...)`, and `bridge.profiler.start_recording(...)`.
 
 `EditorClient` exposes editor-oriented helpers for advanced bootstrap flows: `from_project(...)`, `build(...)`, `console_lines()`, `engine_service_port()`, `engine_service_ports()`, `latest_registration_engine_service_ports()`, `latest_registration_has_engine_service_port()`, `last_build_had_engine_service_port()`, `endpoint_registered_count()`, `remotery_url()`, `remotery_urls()`, `latest_registration_remotery_urls()`, `remember_engine_service_port(...)`, and `remember_remotery_url(...)`.
 
@@ -65,7 +65,7 @@ Typed response wrappers include `Node`, `Bounds`, `ResourceProfileEntry`, `Remot
 
 Use the editor client when you want explicit control over the Defold editor server. `AutomationBridgeClient.from_editor(..., build=True)` closes known candidate engine ports before building so repeated runs start from a fresh engine process. `build()` waits until the runtime logs `Automation Bridge endpoint registered`, then waits another 0.2 seconds before returning.
 When the editor reuses the same running engine process, it may not print a fresh engine service port before `Automation Bridge endpoint registered`; `EditorClient` reuses the last port it saw and stores it in `.internal/automation_bridge.engine.port`.
-The same bootstrap also reads Defold's `Initialized Remotery (ws://.../rmt)` log line and stores it in `.internal/automation_bridge.remotery.url`, so `bridge.profiler.remotery()` can connect without a hard-coded port.
+The same bootstrap reads Defold's `Initialized Remotery (ws://.../rmt)` log line when it is present and stores it in `.internal/automation_bridge.remotery.url`, so `bridge.profiler.remotery()` can connect without a hard-coded port when discovery succeeds. If no fresh Remotery URL is discovered, the helper falls back to Defold's default Remotery port; pass `url=` or `port=` to override it.
 If the latest build logs `Automation Bridge endpoint registered` without a fresh engine service port before it, `AutomationBridgeClient.from_editor(..., build=True)` immediately tries to close candidate engine ports with `@system/exit`, rebuilds once, and retries. It uses the same recovery path if discovered ports do not serve `/automation-bridge/v1/health`.
 
 ```python

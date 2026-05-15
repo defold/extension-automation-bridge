@@ -23,6 +23,7 @@ from automation_bridge import (  # noqa: E402
     ProfilerDataError,
     RemoteryCapture,
     RemoteryClient,
+    RemoteryProtocolError,
     wait_until,
 )
 from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
@@ -295,6 +296,15 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual("u64", frame.properties[1].type)
         self.assertEqual(1234567890123, frame.properties[1].value)
         self.assertEqual(1234567890000, frame.properties[1].previous_value)
+
+    def test_parse_remotery_integer_properties_reject_fractional_values(self):
+        body = (
+            struct.pack("<II", 1, 7)
+            + _remotery_property(202, 2002, 0, 3, 1.5, previous_value=1, previous_value_frame=6)
+        )
+
+        with self.assertRaisesRegex(RemoteryProtocolError, "invalid integer value"):
+            parse_property_frame(body, {202: "Fractional"})
 
     def test_remotery_client_get_frame_resolves_sample_names(self):
         sample_message = build_message("SMPL", _remotery_sample_frame_body())
