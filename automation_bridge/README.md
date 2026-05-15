@@ -37,7 +37,7 @@ Error responses use this envelope and an appropriate HTTP status:
 { "ok": false, "error": { "code": "not_found", "message": "..." } }
 ```
 
-Common error codes include `bad_request`, `not_found`, `method_not_allowed`, `body_not_supported`, `input_queue_full`, `input_too_large`, `screenshot_unsupported`, `screenshot_path_failed`, and `screenshot_pending`.
+Common error codes include `bad_request`, `not_found`, `method_not_allowed`, `body_not_supported`, `input_queue_full`, `input_too_large`, `screen_resize_failed`, `screenshot_unsupported`, `screenshot_path_failed`, and `screenshot_pending`.
 
 ## Coordinates
 
@@ -51,7 +51,7 @@ Input coordinates use top-left screen pixels:
 
 Game object bounds are projected from configured `display.width` and `display.height` space to the current window size. GUI bounds are reported in screen pixels.
 
-`GET /screen` and `GET /health` return:
+`GET /screen`, `PUT /screen`, and `GET /health` return:
 
 ```json
 {
@@ -121,7 +121,7 @@ Response `data` includes:
 - `version`: API version string.
 - `debug`: `true`.
 - `platform`: `macos`, `windows`, `linux`, `android`, `ios`, or `unknown`.
-- `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `input.click`, `input.drag`, `input.key`, and, when supported, `screenshot`.
+- `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `screen.resize`, `input.click`, `input.drag`, `input.key`, and, when supported, `screenshot`.
 - `screen`: current screen metadata.
 - `scene_sequence`: snapshot sequence number.
 
@@ -135,6 +135,18 @@ Returns window, backbuffer, configured display, viewport, and coordinate convent
 
 ```sh
 curl -fsS "$BASE/screen" | python3 -m json.tool
+```
+
+### `PUT /automation-bridge/v1/screen`
+
+Sets the native Defold window size and returns updated screen metadata. This endpoint is available when `GET /health` reports the `screen.resize` capability.
+
+Query parameters:
+
+- `width`, `height`: positive integer window size in screen pixels.
+
+```sh
+curl -fsS -X PUT "$BASE/screen?width=1280&height=720" | python3 -m json.tool
 ```
 
 ### `GET /automation-bridge/v1/scene`
@@ -195,9 +207,11 @@ curl -fsS "$BASE/node?id=n:0123456789abcdef&include=bounds,properties,children" 
 
 Queues a left-click. Use either a node id or absolute screen coordinates.
 
+By default, the last mouse/touch input is drawn for one second: clicks appear as a growing circle, and drags appear as a line. Pass `visualize=0` to disable this for a specific input.
+
 ```sh
 curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef"
-curl -fsS -X POST "$BASE/input/click?x=480&y=320"
+curl -fsS -X POST "$BASE/input/click?x=480&y=320&visualize=0"
 ```
 
 Response `data`:
@@ -215,6 +229,7 @@ Query parameters:
 - `from_id` and `to_id`: drag from the center of one node to the center of another.
 - `x1`, `y1`, `x2`, `y2`: drag between absolute screen positions.
 - `duration`: optional duration in seconds. Default is `0.35`; negative values are clamped to `0`.
+- `visualize`: optional input visualization flag. Defaults to `1`; use `0` to disable.
 
 ```sh
 curl -fsS -X POST "$BASE/input/drag?from_id=n:1111111111111111&to_id=n:2222222222222222&duration=0.35"

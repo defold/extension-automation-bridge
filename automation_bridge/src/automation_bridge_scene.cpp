@@ -1,4 +1,5 @@
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 #if defined(DM_DEBUG)
 
@@ -268,7 +269,7 @@ namespace dmAutomationBridge
         }
     }
 
-    static void ComputeBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t display_w, uint32_t display_h)
+    static void ComputeFallbackBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t display_w, uint32_t display_h)
     {
         if (!node->m_HasPosition || screen_w == 0 || screen_h == 0)
         {
@@ -311,6 +312,36 @@ namespace dmAutomationBridge
         node->m_Bounds.m_NX = node->m_Bounds.m_CX / (float)screen_w;
         node->m_Bounds.m_NY = node->m_Bounds.m_CY / (float)screen_h;
         node->m_Bounds.m_Valid = true;
+    }
+
+    static void DiscoverSnapshotCamera(dmGameObject::SceneNode* scene_node)
+    {
+        Node node;
+        InitNode(&node);
+
+        dmGameObject::SceneNodePropertyIterator pit = dmGameObject::TraverseIterateProperties(scene_node);
+        while (dmGameObject::TraverseIteratePropertiesNext(&pit))
+        {
+            Property property;
+            if (MakeProperty(&property, &pit.m_Property))
+            {
+                ApplyPropertyToNode(&node, &property);
+                FreeProperty(&property);
+            }
+        }
+
+        if (scene_node->m_Type == dmGameObject::SCENE_NODE_TYPE_COMPONENT && node.m_Enabled && StringsEqual(node.m_Type, "camerac"))
+        {
+            DefoldPrivateApiUseSnapshotCamera(scene_node);
+        }
+
+        FreeNode(&node);
+
+        dmGameObject::SceneNodeIterator it = dmGameObject::TraverseIterateChildren(scene_node);
+        while (dmGameObject::TraverseIterateNext(&it))
+        {
+            DiscoverSnapshotCamera(&it.m_Node);
+        }
     }
 
     void InitSnapshot(Snapshot* snapshot)
@@ -390,7 +421,15 @@ namespace dmAutomationBridge
             SetString(&node.m_Parent, snapshot->m_Nodes.m_Data[parent_index].m_Id);
         }
 
-        ComputeBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_DisplayWidth, snapshot->m_DisplayHeight);
+        Bounds private_bounds;
+        if (DefoldPrivateApiComputeBounds(scene_node, &node, snapshot, &private_bounds))
+        {
+            node.m_Bounds = private_bounds;
+        }
+        else
+        {
+            ComputeFallbackBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_DisplayWidth, snapshot->m_DisplayHeight);
+        }
 
         uint32_t index = snapshot->m_Nodes.m_Count;
         if (!ArrayPush(&snapshot->m_Nodes, &node))
@@ -452,6 +491,8 @@ namespace dmAutomationBridge
             dmGameObject::SceneNode root;
             if (dmGameObject::TraverseGetRoot(g_AutomationBridge.m_Register, &root))
             {
+                DefoldPrivateApiResetSnapshotCamera();
+                DiscoverSnapshotCamera(&root);
                 snapshot.m_Root = BuildNode(&snapshot, &root, -1, "", 0);
             }
         }

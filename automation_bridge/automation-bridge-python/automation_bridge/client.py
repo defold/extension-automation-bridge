@@ -20,7 +20,7 @@ from .waits import wait_until
 JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _INPUT_SETTLE_SECONDS = 0.1
-_UINT32_MAX = 0xFFFFFFFF
+_SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 
 
 class AutomationBridgeError(RuntimeError):
@@ -217,14 +217,6 @@ def _protobuf_varint(value: int) -> bytes:
     return bytes(encoded)
 
 
-def _protobuf_uint32(field: int, value: int) -> bytes:
-    if not isinstance(value, int):
-        raise TypeError(f"uint32 field {field} must be int, got {type(value).__name__}")
-    if value < 0 or value > _UINT32_MAX:
-        raise ValueError(f"uint32 field {field} out of range: {value}")
-    return _protobuf_varint(field << 3) + _protobuf_varint(value)
-
-
 def _protobuf_string(field: int, value: str) -> bytes:
     if not isinstance(value, str):
         raise TypeError(f"string field {field} must be str, got {type(value).__name__}")
@@ -232,12 +224,13 @@ def _protobuf_string(field: int, value: str) -> bytes:
     return _protobuf_varint((field << 3) | 2) + _protobuf_varint(len(encoded)) + encoded
 
 
-def _encode_render_resize(width: int, height: int) -> bytes:
+def _validate_screen_size(width: int, height: int) -> None:
     if not isinstance(width, int) or not isinstance(height, int):
         raise TypeError(f"resize dimensions must be ints, got {type(width).__name__}x{type(height).__name__}")
     if width <= 0 or height <= 0:
         raise ValueError(f"resize dimensions must be positive, got {width}x{height}")
-    return _protobuf_uint32(1, width) + _protobuf_uint32(2, height)
+    if width > _SCREEN_DIMENSION_MAX or height > _SCREEN_DIMENSION_MAX:
+        raise ValueError(f"resize dimensions must fit platform window limits, got {width}x{height}")
 
 
 def _encode_system_reboot(args: Sequence[str]) -> bytes:
@@ -367,6 +360,10 @@ class AutomationBridgeClient:
         """POST an Automation Bridge API path with query parameters and return `data`."""
         return self._request("POST", path, params)
 
+    def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
+        """PUT an Automation Bridge API path with query parameters and return `data`."""
+        return self._request("PUT", path, params)
+
     def health(self) -> JsonDict:
         """Return API version, capabilities, platform, and screen data."""
         data = self.get("/health")
@@ -448,7 +445,13 @@ class AutomationBridgeClient:
         params = self._server_params(selector, limit=0)
         return int(self.get("/nodes", params).get("matched", 0))
 
-    def click(self, target: Union[Target, float, int], y: Optional[float] = None, wait: float = 0.25) -> JsonDict:
+    def click(
+        self,
+        target: Union[Target, float, int],
+        y: Optional[float] = None,
+        wait: float = 0.25,
+        visualize: Optional[bool] = None,
+    ) -> JsonDict:
         """Queue a left-click on a Node, node id, mapping, tuple, or x/y pair."""
         if isinstance(target, Node):
             params: Dict[str, Any] = {"id": target.id}
@@ -457,6 +460,9 @@ class AutomationBridgeClient:
         else:
             x_value, y_value = self._point(target, y)
             params = {"x": x_value, "y": y_value}
+
+        if visualize is not None:
+            params["visualize"] = visualize
 
         response = self.post("/input/click", params)
         if wait:
@@ -469,6 +475,7 @@ class AutomationBridgeClient:
         to_target: Target,
         duration: float = 0.35,
         wait: Optional[float] = None,
+        visualize: Optional[bool] = None,
     ) -> JsonDict:
         """Queue a drag between nodes or coordinates and block until it finishes."""
         if self._is_node_ref(from_target) and self._is_node_ref(to_target):
@@ -481,6 +488,9 @@ class AutomationBridgeClient:
             x1, y1 = self._point(from_target)
             x2, y2 = self._point(to_target)
             params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
+
+        if visualize is not None:
+            params["visualize"] = visualize
 
         response = self.post("/input/drag", params)
         block_for = max(0.0, duration) + _INPUT_SETTLE_SECONDS if wait is None else wait
@@ -574,12 +584,24 @@ class AutomationBridgeClient:
         return self._last_window_size
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
-        """Resize the Defold window through `/post/@render/resize` and remember the new size."""
-        payload = _encode_render_resize(width, height)
-        self._post_engine_message("/post/@render/resize", payload)
-        self._last_window_size = (width, height)
+        """Resize the Defold window through `PUT /screen` and remember the new size."""
+        _validate_screen_size(width, height)
+        capabilities = self.health().get("capabilities", [])
+        if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
+            raise AutomationBridgeError("Automation Bridge endpoint does not advertise the screen.resize capability")
+
+        screen = self.put("/screen", {"width": width, "height": height})
+        self._remember_window_size(screen)
         if wait:
             time.sleep(wait)
+            screen = self.screen()
+        window = screen.get("window") if isinstance(screen, Mapping) else None
+        if isinstance(window, Mapping):
+            screen_width = window.get("width")
+            screen_height = window.get("height")
+            if isinstance(screen_width, int) and isinstance(screen_height, int):
+                width = screen_width
+                height = screen_height
         return {"width": width, "height": height}
 
     def set_portrait(self, wait: float = 0.25) -> JsonDict:

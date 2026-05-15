@@ -125,10 +125,24 @@ namespace dmAutomationBridge
         float              m_Duration;
         float              m_Elapsed;
         dmHID::MouseButton m_MouseButton;
+        bool               m_Visualize;
 
         char*      m_Keys;
         uint32_t   m_KeyIndex;
         dmHID::Key m_ActiveKey;
+    };
+
+    struct InputVisualization
+    {
+        bool  m_Active;
+        bool  m_Drag;
+        float m_X1;
+        float m_Y1;
+        float m_X2;
+        float m_Y2;
+        float m_Age;
+        float m_Duration;
+        uint64_t m_LastRenderTime;
     };
 
     struct AutomationBridgeContext
@@ -138,12 +152,14 @@ namespace dmAutomationBridge
         dmHID::HContext         m_HidContext;
         dmWebServer::HServer    m_WebServer;
         dmGraphics::HContext    m_GraphicsContext;
+        void*                   m_RenderContext;
         bool                    m_WebHandlerRegistered;
         uint64_t                m_LastTime;
         uint64_t                m_Frame;
         uint64_t                m_SnapshotFrame;
         Snapshot                m_Snapshot;
         Array<InputEvent>      m_InputEvents;
+        InputVisualization      m_InputVisualization;
         bool                    m_ScreenshotPending;
         uint32_t                m_ScreenshotCounter;
         char                    m_ScreenshotPath[1024];
@@ -325,6 +341,7 @@ namespace dmAutomationBridge
 
     void FreeInputEvent(InputEvent* event);
     bool AddMouseInput(float x1, float y1, float x2, float y2, float duration);
+    bool AddMouseInput(float x1, float y1, float x2, float y2, float duration, bool visualize);
     bool AddKeyInput(const char* keys);
     bool GetNodeCenter(const char* id, float* x, float* y, const char** error);
     void UpdateInput(float dt);

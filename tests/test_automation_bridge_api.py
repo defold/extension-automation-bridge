@@ -6,7 +6,9 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -26,7 +28,7 @@ from automation_bridge import (  # noqa: E402
     RemoteryProtocolError,
     wait_until,
 )
-from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
+from automation_bridge.client import _encode_system_reboot  # noqa: E402
 from automation_bridge.profiler import parse_resources_data  # noqa: E402
 from automation_bridge.remotery import (  # noqa: E402
     build_message,
@@ -36,6 +38,78 @@ from automation_bridge.remotery import (  # noqa: E402
 )
 
 
+def _read_automation_bridge_png(path):
+    data = path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise AssertionError(f"not a png: {path}")
+
+    cursor = 8
+    width = None
+    height = None
+    idat = bytearray()
+    while cursor < len(data):
+        if cursor + 8 > len(data):
+            raise AssertionError(f"truncated png chunk header: {path}")
+        size = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        chunk_type = data[cursor + 4 : cursor + 8]
+        chunk_data = data[cursor + 8 : cursor + 8 + size]
+        cursor += 12 + size
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(">IIBBBBB", chunk_data)
+            if bit_depth != 8 or color_type != 6 or compression != 0 or filter_method != 0 or interlace != 0:
+                raise AssertionError(f"unexpected png format: {path}")
+        elif chunk_type == b"IDAT":
+            idat.extend(chunk_data)
+        elif chunk_type == b"IEND":
+            break
+
+    if not width or not height:
+        raise AssertionError(f"missing png size: {path}")
+
+    raw = zlib.decompress(bytes(idat))
+    stride = width * 4
+    pixels = bytearray()
+    offset = 0
+    for _ in range(height):
+        filter_type = raw[offset]
+        if filter_type != 0:
+            raise AssertionError(f"unexpected png filter {filter_type}: {path}")
+        offset += 1
+        pixels.extend(raw[offset : offset + stride])
+        offset += stride
+    return width, height, bytes(pixels)
+
+
+def _point_segment_distance(px, py, start, end):
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_squared))
+    nearest_x = x1 + t * dx
+    nearest_y = y1 + t * dy
+    return ((px - nearest_x) ** 2 + (py - nearest_y) ** 2) ** 0.5
+
+
+def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
+    width, height, pixels = _read_automation_bridge_png(path)
+    counts = [0, 0]
+    for i in range(0, len(pixels), 4):
+        r, g, b, a = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
+        if not (a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25):
+            continue
+        pixel_index = i // 4
+        x = pixel_index % width
+        row = pixel_index // width
+        for index, y in enumerate((row, height - 1 - row)):
+            if _point_segment_distance(x + 0.5, y + 0.5, start, end) <= max_distance:
+                counts[index] += 1
+    return max(counts)
+
+
 class AutomationBridgeClientUnitTest(unittest.TestCase):
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
@@ -43,9 +117,6 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 return 0
 
         self.assertEqual(0, AutomationBridgeClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
-
-    def test_render_resize_payload(self):
-        self.assertEqual(b"\x08\x80\x08\x10\x80\x06", _encode_render_resize(1024, 768))
 
     def test_system_reboot_payload(self):
         self.assertEqual(b"\x0a\x01a\x12\x02bc", _encode_system_reboot(("a", "bc")))
@@ -62,8 +133,49 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual({"width": 640, "height": 480}, result)
         self.assertEqual((640, 480), bridge.last_window_size)
         self.assertEqual(
-            [("/post/@render/resize", _encode_render_resize(640, 480), None)],
-            bridge.engine_posts,
+            [
+                ("GET", "/health", None),
+                ("PUT", "/screen", {"width": 640, "height": 480}),
+            ],
+            bridge.api_requests,
+        )
+
+    def test_resize_requires_screen_resize_capability(self):
+        bridge = FakeEngineClient(capabilities=["scene", "nodes"])
+
+        with self.assertRaisesRegex(AutomationBridgeError, "screen.resize"):
+            bridge.resize(640, 480, wait=0)
+
+        self.assertEqual([("GET", "/health", None)], bridge.api_requests)
+
+    def test_resize_rejects_oversized_dimensions_before_request(self):
+        bridge = FakeEngineClient()
+
+        with self.assertRaises(ValueError):
+            bridge.resize(0x80000000, 480, wait=0)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_click_visualize_false_is_encoded(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+
+            bridge.click(10, 20, wait=0, visualize=False)
+
+        self.assertEqual(
+            "POST /automation-bridge/v1/input/click?x=10&y=20&visualize=0 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_drag_visualize_false_is_encoded(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"drag"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+
+            bridge.drag((10, 20), (30, 40), duration=0.1, wait=0, visualize=False)
+
+        self.assertEqual(
+            "POST /automation-bridge/v1/input/drag?x1=10&y1=20&x2=30&y2=40&duration=0.1&visualize=0 HTTP/1.1",
+            server.request_line,
         )
 
     def test_orientation_helpers_swap_last_known_size(self):
@@ -77,10 +189,13 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual((320, 568), bridge.last_window_size)
         self.assertEqual(
             [
-                ("/post/@render/resize", _encode_render_resize(568, 320), None),
-                ("/post/@render/resize", _encode_render_resize(320, 568), None),
+                ("GET", "/screen", None),
+                ("GET", "/health", None),
+                ("PUT", "/screen", {"width": 568, "height": 320}),
+                ("GET", "/health", None),
+                ("PUT", "/screen", {"width": 320, "height": 568}),
             ],
-            bridge.engine_posts,
+            bridge.api_requests,
         )
 
     def test_reboot_posts_system_reboot_without_waiting(self):
@@ -344,14 +459,25 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
 
 class FakeEngineClient(AutomationBridgeClient):
-    def __init__(self, screen=None):
+    def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
         self.engine_posts = []
+        self.api_requests = []
         self._screen = screen or {"window": {"width": 800, "height": 600}}
+        self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
 
     def _request(self, method, path, params=None):
+        self.api_requests.append((method, path, dict(params) if params is not None else None))
+        if method == "GET" and path == "/health":
+            return {"version": "1", "capabilities": list(self._capabilities), "screen": self._screen}
         if method == "GET" and path == "/screen":
+            return self._screen
+        if method == "PUT" and path == "/screen":
+            self._screen = {
+                **self._screen,
+                "window": {"width": int(params["width"]), "height": int(params["height"])},
+            }
             return self._screen
         raise AssertionError(f"unexpected request: {method} {path} {params}")
 
@@ -752,9 +878,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
             with self.subTest(run=run_index + 1):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
-                    self.bridge.resize(800, 600, wait=0.3)
-                    portrait = self.bridge.set_portrait(wait=0.3)
-                    self.assertLessEqual(portrait["width"], portrait["height"])
+                    if self.supports_capability("screen.resize"):
+                        resized = self.bridge.resize(1600, 1200, wait=0.3)
+                        self.assertEqual({"width": 1600, "height": 1200}, resized)
+                        portrait = self.bridge.set_portrait(wait=0.3)
+                        self.assertEqual({"width": 1200, "height": 1600}, portrait)
+                    else:
+                        print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
@@ -777,6 +907,42 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("drag", response["queued"])
         self.assertEqual(0, response["duration"])
         self.wait_for_merge("L1", before, "L2")
+
+    def test_drag_visualization_is_visible_in_screenshot(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        screen = self.bridge.screen()
+        window = screen["window"]
+        y = max(4, window["height"] - 16)
+        start = (max(4, window["width"] * 0.15), y)
+        end = (min(window["width"] - 4, window["width"] * 0.85), y)
+        baseline_path = self.bridge.screenshot(wait=True, timeout=5)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end)
+
+        self.bridge.drag(start, end, duration=1.0, wait=0)
+        last_observation = {"path": None, "orange_pixels": 0, "baseline_path": baseline_path, "baseline_orange": baseline_orange}
+
+        def visible_overlay():
+            screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end)
+            last_observation["path"] = screenshot_path
+            last_observation["orange_pixels"] = orange_pixels
+            print(
+                "DRAG_VISUALIZATION_SCREENSHOT "
+                f"{screenshot_path} orange_pixels={orange_pixels} baseline_orange={baseline_orange}"
+            )
+            return orange_pixels if orange_pixels > max(20, baseline_orange + 20) else None
+
+        try:
+            orange_pixels = wait_until(
+                visible_overlay,
+                timeout=1.2,
+                interval=0.05,
+                message=f"drag visualization was not visible: {last_observation}",
+            )
+            self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
+        finally:
+            time.sleep(1.0)
 
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
@@ -861,6 +1027,9 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
         self.__class__.bridge = self.bridge
         self.bridge.wait_ready()
+
+    def supports_capability(self, capability):
+        return capability in self.bridge.health().get("capabilities", [])
 
     def record_sprite_counter(self, observations, label):
         scene_count = self.bridge.count(type="spritec")

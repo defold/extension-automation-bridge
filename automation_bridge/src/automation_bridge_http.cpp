@@ -1,12 +1,16 @@
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 #if defined(DM_DEBUG)
 
 #include <ctype.h>
+#include <limits.h>
 #include <string.h>
 
 namespace dmAutomationBridge
 {
+    static const uint32_t MAX_SCREEN_DIMENSION = (uint32_t)INT_MAX;
+
     struct RequestContext
     {
         dmWebServer::Request*    m_Request;
@@ -23,12 +27,16 @@ namespace dmAutomationBridge
         const char*  m_Method;
         RouteHandler m_Handler;
     };
-    static void SendResponse(dmWebServer::Request* request, int status_code, const char* content_type, const StringBuffer* response)
+    static void SendResponse(dmWebServer::Request* request, int status_code, const char* content_type, const StringBuffer* response, const char* allow = 0)
     {
         const char* data = response->m_Data ? response->m_Data : "";
         dmWebServer::SetStatusCode(request, status_code);
         dmWebServer::SendAttribute(request, "Content-Type", content_type);
         dmWebServer::SendAttribute(request, "Cache-Control", "no-store");
+        if (!IsEmpty(allow))
+        {
+            dmWebServer::SendAttribute(request, "Allow", allow);
+        }
         dmWebServer::Send(request, data, response->m_Size);
     }
 
@@ -105,6 +113,29 @@ namespace dmAutomationBridge
     static bool RequestGetBoolParam(const RequestContext* ctx, const char* key, bool* value)
     {
         return GetBoolParam(&ctx->m_Query, key, value);
+    }
+
+    static bool RequestGetUIntParam(const RequestContext* ctx, const char* key, uint32_t* value, uint32_t max_value = 0xffffffffU)
+    {
+        const char* text = GetParam(&ctx->m_Query, key);
+        if (IsEmpty(text))
+        {
+            return false;
+        }
+        if (!isdigit((unsigned char)text[0]))
+        {
+            return false;
+        }
+
+        char* end = 0;
+        unsigned long parsed = strtoul(text, &end, 10);
+        if (!end || *end != 0 || parsed == 0 || parsed > (unsigned long)max_value)
+        {
+            return false;
+        }
+
+        *value = (uint32_t)parsed;
+        return true;
     }
 
     static const char* RequestGetParam(const RequestContext* ctx, const char* key)
@@ -206,7 +237,12 @@ namespace dmAutomationBridge
 #else
         AppendJsonString(&response, "unknown");
 #endif
-        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"input.click\",\"input.drag\",\"input.key\"");
+        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\"");
+        if (DefoldPrivateApiCanSetWindowSize())
+        {
+            StringBufferAppend(&response, ",\"screen.resize\"");
+        }
+        StringBufferAppend(&response, ",\"input.click\",\"input.drag\",\"input.key\"");
         if (IsScreenshotSupported())
         {
             StringBufferAppend(&response, ",\"screenshot\"");
@@ -222,6 +258,34 @@ namespace dmAutomationBridge
     static void HandleScreen(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleScreenPut(RequestContext* ctx)
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (!RequestGetUIntParam(ctx, "width", &width, MAX_SCREEN_DIMENSION) ||
+            !RequestGetUIntParam(ctx, "height", &height, MAX_SCREEN_DIMENSION))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide positive integer width and height no greater than 2147483647");
+            return;
+        }
+
+        if (!DefoldPrivateApiSetWindowSize(width, height))
+        {
+            RequestSendError(ctx, 500, "screen_resize_failed", "failed to set window size");
+            return;
+        }
+
+        UpdateSnapshot();
+        g_AutomationBridge.m_SnapshotFrame = g_AutomationBridge.m_Frame;
 
         StringBuffer response;
         StringBufferInit(&response);
@@ -389,7 +453,10 @@ namespace dmAutomationBridge
             return;
         }
 
-        if (!AddMouseInput(x, y, x, y, 0.0f))
+        bool visualize = true;
+        RequestGetBoolParam(ctx, "visualize", &visualize);
+
+        if (!AddMouseInput(x, y, x, y, 0.0f, visualize))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
@@ -441,8 +508,10 @@ namespace dmAutomationBridge
             return;
         }
 
+        bool visualize = true;
+        RequestGetBoolParam(ctx, "visualize", &visualize);
         duration = MaxFloat(0.0f, duration);
-        if (!AddMouseInput(x1, y1, x2, y2, duration))
+        if (!AddMouseInput(x1, y1, x2, y2, duration, visualize))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
@@ -524,20 +593,38 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
-    static void SendMethodNotAllowed(RequestContext* ctx, const char* method)
+    static void SendMethodNotAllowed(RequestContext* ctx, const char* methods)
     {
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"code\":");
+        AppendJsonString(&response, "method_not_allowed");
+        StringBufferAppend(&response, ",\"message\":");
         StringBuffer message;
         StringBufferInit(&message);
         StringBufferAppend(&message, "use ");
-        StringBufferAppend(&message, method);
+        StringBufferAppend(&message, methods);
         char* message_string = StringBufferDetach(&message);
-        RequestSendError(ctx, 405, "method_not_allowed", message_string);
+        AppendJsonString(&response, message_string);
         free(message_string);
+        StringBufferAppend(&response, "}}\n");
+        SendResponse(ctx->m_Request, 405, "application/json", &response, methods);
+        StringBufferFree(&response);
+    }
+
+    static void AppendAllowedMethod(StringBuffer* methods, const char* method)
+    {
+        if (methods->m_Size > 0)
+        {
+            StringBufferAppend(methods, ", ");
+        }
+        StringBufferAppend(methods, method);
     }
 
     static const RouteDefinition ROUTES[] = {
         {"/health", "GET", HandleHealth},
         {"/screen", "GET", HandleScreen},
+        {"/screen", "PUT", HandleScreenPut},
         {"/scene", "GET", HandleScene},
         {"/nodes", "GET", HandleNodes},
         {"/node", "GET", HandleNode},
@@ -569,6 +656,8 @@ namespace dmAutomationBridge
             return;
         }
 
+        StringBuffer allowed_methods;
+        StringBufferInit(&allowed_methods);
         for (uint32_t i = 0; i < DM_ARRAY_SIZE(ROUTES); ++i)
         {
             const RouteDefinition* route = &ROUTES[i];
@@ -578,14 +667,24 @@ namespace dmAutomationBridge
             }
             if (!RequestIsMethod(&ctx, route->m_Method))
             {
-                SendMethodNotAllowed(&ctx, route->m_Method);
-                FreeRequestContext(&ctx);
-                return;
+                AppendAllowedMethod(&allowed_methods, route->m_Method);
+                continue;
             }
+            StringBufferFree(&allowed_methods);
             route->m_Handler(&ctx);
             FreeRequestContext(&ctx);
             return;
         }
+
+        if (allowed_methods.m_Size > 0)
+        {
+            char* methods = StringBufferDetach(&allowed_methods);
+            SendMethodNotAllowed(&ctx, methods);
+            free(methods);
+            FreeRequestContext(&ctx);
+            return;
+        }
+        StringBufferFree(&allowed_methods);
 
         RequestSendError(&ctx, 404, "not_found", "endpoint not found");
         FreeRequestContext(&ctx);

@@ -48,7 +48,7 @@ PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automat
 `AutomationBridgeClient` is the main entry point.
 
 - Bootstrap: `AutomationBridgeClient(port)`, `from_project(...)`, `from_editor(...)`, and `wait_ready(...)`.
-- Raw API passthrough: `get(path, params=None)` and `post(path, params=None)`.
+- Raw API passthrough: `get(path, params=None)`, `post(path, params=None)`, and `put(path, params=None)`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
 - Input: `click(...)`, `drag(...)`, `type_text(...)`, and `key(...)`.
@@ -89,18 +89,21 @@ bridge.wait_ready()
 
 ## Raw API and Scene Data
 
-Use the named helpers for normal scripts, or `get()` and `post()` when you need direct access to a new native endpoint shape:
+Use the named helpers for normal scripts:
 
 ```python
 health = bridge.health()
 screen = bridge.screen()
 scene = bridge.scene(visible=True, include=["bounds", "properties"])
 
-raw_count = bridge.get("/nodes", {"type": "labelc", "limit": 0})["matched"]
-bridge.post("/input/click", {"x": 480, "y": 320})
+label_count = bridge.count(type="labelc")
+bridge.click(480, 320)
+bridge.resize(1280, 720)
 ```
 
 `health()` and `screen()` update `bridge.last_window_size` from the engine response. `scene()` returns the full native scene-tree payload with `count`, `visible_filter`, `screen`, and `root`.
+
+Raw `get()`, `post()`, and `put()` are available for curl-level debugging or endpoints that do not have named wrapper methods yet.
 
 ## Selectors
 
@@ -160,15 +163,17 @@ bridge.click(480, 320)
 bridge.click((480, 320))
 bridge.click({"x": 480, "y": 320})
 bridge.click({"center": {"x": 480, "y": 320}})
+bridge.click(node, visualize=False)
 
 bridge.drag(first_node, second_node, duration=0.16)
 bridge.drag(first_node.center, second_node.center, duration=0.16)
+bridge.drag(first_node, second_node, duration=0.16, visualize=False)
 
 bridge.type_text("hello")
 bridge.key("KEY_ENTER")
 ```
 
-Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
+Mouse/touch input visualization is on by default in the native endpoint: clicks draw a growing circle and drags draw a line for one second. Pass `visualize=False` to `click()` or `drag()` to disable it for that input. Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
 
 `Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `bridge.by_id(node.id)` or query again.
 
@@ -197,7 +202,7 @@ png = bridge.screenshot(wait=True, timeout=5)
 
 ## Engine Control
 
-The helper can post a subset of Defold's built-in engine service protobuf messages to the same engine service port used by the Automation Bridge API:
+The helper combines Automation Bridge window control with a small subset of Defold's built-in engine service protobuf messages on the same engine service port:
 
 ```python
 bridge.resize(1280, 720)
@@ -210,7 +215,7 @@ bridge.reboot(
 )
 ```
 
-`bridge.resize(width, height)` posts `com.dynamo.render.proto.Render$Resize` to `/post/@render/resize`, then remembers `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
+`bridge.resize(width, height)` calls Automation Bridge's `PUT /screen` endpoint, which sets the native Defold window size, then remembers the returned `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
 
 `bridge.reboot(*args)` posts `com.dynamo.system.proto.System$Reboot` to `/post/@system/reboot`. Defold accepts up to six string arguments; pass the same command-line style arguments you would pass to `sys.reboot(...)` or the editor reboot helper. For editor-launched projects, a bare `bridge.reboot()` may restart without the project or this extension, so pass explicit project/bootstrap args when you expect Automation Bridge to return. By default the wrapper waits for the Automation Bridge endpoint to become ready again; pass `wait=False` when rebooting into a target that will not load this extension.
 

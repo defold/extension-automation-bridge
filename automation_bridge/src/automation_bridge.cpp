@@ -11,6 +11,7 @@
 #if defined(DM_DEBUG)
 
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 namespace dmAutomationBridge
 {
@@ -33,9 +34,16 @@ namespace dmAutomationBridge
         bridge->m_DisplayHeight = 640;
     }
 
+    static ExtensionResult PreRender(ExtensionParams* params)
+    {
+        DefoldPrivateApiInitialize(params);
+        return EXTENSION_RESULT_OK;
+    }
+
     static ExtensionResult PostRender(ExtensionParams* params)
     {
-        (void)params;
+        DefoldPrivateApiInitialize(params);
+        DefoldPrivateApiDrawInputVisualization(&g_AutomationBridge.m_InputVisualization);
         ProcessPendingScreenshot();
         return EXTENSION_RESULT_OK;
     }
@@ -62,6 +70,7 @@ namespace dmAutomationBridge
         g_AutomationBridge.m_LastTime = dmTime::GetTime();
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);
+        dmExtension::RegisterCallback(dmExtension::CALLBACK_PRE_RENDER, PreRender);
         dmExtension::RegisterCallback(dmExtension::CALLBACK_POST_RENDER, PostRender);
         return dmExtension::RESULT_OK;
     }
@@ -69,6 +78,7 @@ namespace dmAutomationBridge
     static dmExtension::Result Initialize(dmExtension::Params* params)
     {
         g_AutomationBridge.m_GraphicsContext = (dmGraphics::HContext)ExtensionParamsGetContextByName((ExtensionParams*)params, "graphics");
+        DefoldPrivateApiInitialize(params);
         dmLogInfo("Registered %s extension", LIB_NAME);
         return dmExtension::RESULT_OK;
     }
