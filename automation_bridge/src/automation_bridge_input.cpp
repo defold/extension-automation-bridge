@@ -1,4 +1,5 @@
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 #if defined(DM_DEBUG)
 
@@ -9,6 +10,8 @@
 
 namespace dmAutomationBridge
 {
+    static const float INPUT_VISUALIZATION_SECONDS = 1.0f;
+
     void FreeInputEvent(InputEvent* event)
     {
         FreeString(&event->m_Keys);
@@ -19,7 +22,14 @@ namespace dmAutomationBridge
         return g_AutomationBridge.m_InputEvents.m_Count < MAX_INPUT_EVENTS;
     }
 
+    static void RememberInputVisualization(const InputEvent* event);
+
     bool AddMouseInput(float x1, float y1, float x2, float y2, float duration)
+    {
+        return AddMouseInput(x1, y1, x2, y2, duration, true);
+    }
+
+    bool AddMouseInput(float x1, float y1, float x2, float y2, float duration, bool visualize)
     {
         if (!CanQueueInputEvent())
         {
@@ -35,8 +45,14 @@ namespace dmAutomationBridge
         event.m_Y2 = y2;
         event.m_Duration = MaxFloat(0.0f, duration);
         event.m_MouseButton = dmHID::MOUSE_BUTTON_LEFT;
+        event.m_Visualize = visualize;
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
-        return ArrayPush(&g_AutomationBridge.m_InputEvents, &event);
+        if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
+        {
+            return false;
+        }
+        RememberInputVisualization(&event);
+        return true;
     }
 
     bool AddKeyInput(const char* keys)
@@ -57,6 +73,24 @@ namespace dmAutomationBridge
             return false;
         }
         return true;
+    }
+
+    static void RememberInputVisualization(const InputEvent* event)
+    {
+        if (!event->m_Visualize)
+        {
+            return;
+        }
+
+        InputVisualization* visualization = &g_AutomationBridge.m_InputVisualization;
+        memset(visualization, 0, sizeof(*visualization));
+        visualization->m_Active = true;
+        visualization->m_Drag = event->m_Duration > 0.0f || fabsf(event->m_X2 - event->m_X1) > 0.5f || fabsf(event->m_Y2 - event->m_Y1) > 0.5f;
+        visualization->m_X1 = event->m_X1;
+        visualization->m_Y1 = event->m_Y1;
+        visualization->m_X2 = event->m_X2;
+        visualization->m_Y2 = event->m_Y2;
+        visualization->m_Duration = INPUT_VISUALIZATION_SECONDS;
     }
 
     bool GetNodeCenter(const char* id, float* x, float* y, const char** error)
@@ -175,6 +209,11 @@ namespace dmAutomationBridge
         t = ClampFloat(t, 0.0f, 1.0f);
         float x = event->m_X1 + (event->m_X2 - event->m_X1) * t;
         float y = event->m_Y1 + (event->m_Y2 - event->m_Y1) * t;
+
+        if (pressed)
+        {
+            RememberInputVisualization(event);
+        }
 
         if (instant && pressed)
         {

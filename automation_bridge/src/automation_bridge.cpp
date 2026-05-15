@@ -34,9 +34,16 @@ namespace dmAutomationBridge
         bridge->m_DisplayHeight = 640;
     }
 
+    static ExtensionResult PreRender(ExtensionParams* params)
+    {
+        DefoldPrivateApiInitialize(params);
+        DefoldPrivateApiDrawInputVisualization(&g_AutomationBridge.m_InputVisualization);
+        return EXTENSION_RESULT_OK;
+    }
+
     static ExtensionResult PostRender(ExtensionParams* params)
     {
-        (void)params;
+        DefoldPrivateApiInitialize(params);
         ProcessPendingScreenshot();
         return EXTENSION_RESULT_OK;
     }
@@ -63,6 +70,7 @@ namespace dmAutomationBridge
         g_AutomationBridge.m_LastTime = dmTime::GetTime();
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);
+        dmExtension::RegisterCallback(dmExtension::CALLBACK_PRE_RENDER, PreRender);
         dmExtension::RegisterCallback(dmExtension::CALLBACK_POST_RENDER, PostRender);
         return dmExtension::RESULT_OK;
     }

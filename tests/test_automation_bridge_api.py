@@ -6,7 +6,9 @@ import socket
 import struct
 import sys
 import threading
+import time
 import unittest
+import zlib
 from pathlib import Path
 
 
@@ -34,6 +36,58 @@ from automation_bridge.remotery import (  # noqa: E402
     parse_property_frame,
     parse_sample_frame,
 )
+
+
+def _read_automation_bridge_png(path):
+    data = path.read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise AssertionError(f"not a png: {path}")
+
+    cursor = 8
+    width = None
+    height = None
+    idat = bytearray()
+    while cursor < len(data):
+        if cursor + 8 > len(data):
+            raise AssertionError(f"truncated png chunk header: {path}")
+        size = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        chunk_type = data[cursor + 4 : cursor + 8]
+        chunk_data = data[cursor + 8 : cursor + 8 + size]
+        cursor += 12 + size
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, compression, filter_method, interlace = struct.unpack(">IIBBBBB", chunk_data)
+            if bit_depth != 8 or color_type != 6 or compression != 0 or filter_method != 0 or interlace != 0:
+                raise AssertionError(f"unexpected png format: {path}")
+        elif chunk_type == b"IDAT":
+            idat.extend(chunk_data)
+        elif chunk_type == b"IEND":
+            break
+
+    if not width or not height:
+        raise AssertionError(f"missing png size: {path}")
+
+    raw = zlib.decompress(bytes(idat))
+    stride = width * 4
+    pixels = bytearray()
+    offset = 0
+    for _ in range(height):
+        filter_type = raw[offset]
+        if filter_type != 0:
+            raise AssertionError(f"unexpected png filter {filter_type}: {path}")
+        offset += 1
+        pixels.extend(raw[offset : offset + stride])
+        offset += stride
+    return width, height, bytes(pixels)
+
+
+def _count_orange_debug_pixels(path):
+    _, _, pixels = _read_automation_bridge_png(path)
+    count = 0
+    for i in range(0, len(pixels), 4):
+        r, g, b, a = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
+        if a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25:
+            count += 1
+    return count
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
@@ -784,6 +838,25 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("drag", response["queued"])
         self.assertEqual(0, response["duration"])
         self.wait_for_merge("L1", before, "L2")
+
+    def test_drag_visualization_is_visible_in_screenshot(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        screen = self.bridge.screen()
+        window = screen["window"]
+        start = (window["width"] * 0.25, window["height"] * 0.35)
+        end = (window["width"] * 0.75, window["height"] * 0.65)
+
+        self.bridge.drag(start, end, duration=1.0, wait=0)
+        time.sleep(0.15)
+        screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+        orange_pixels = _count_orange_debug_pixels(screenshot_path)
+        print(f"DRAG_VISUALIZATION_SCREENSHOT {screenshot_path} orange_pixels={orange_pixels}")
+
+        try:
+            self.assertGreater(orange_pixels, 20)
+        finally:
+            time.sleep(1.0)
 
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()

@@ -160,15 +160,17 @@ bridge.click(480, 320)
 bridge.click((480, 320))
 bridge.click({"x": 480, "y": 320})
 bridge.click({"center": {"x": 480, "y": 320}})
+bridge.click(node, visualize=False)
 
 bridge.drag(first_node, second_node, duration=0.16)
 bridge.drag(first_node.center, second_node.center, duration=0.16)
+bridge.drag(first_node, second_node, duration=0.16, visualize=False)
 
 bridge.type_text("hello")
 bridge.key("KEY_ENTER")
 ```
 
-Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
+Mouse/touch input visualization is on by default in the native endpoint: clicks draw a growing circle and drags draw a line for one second. Pass `visualize=False` to `click()` or `drag()` to disable it for that input. Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
 
 `Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `bridge.by_id(node.id)` or query again.
 

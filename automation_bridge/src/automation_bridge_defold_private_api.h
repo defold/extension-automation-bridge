@@ -15,6 +15,7 @@ namespace dmAutomationBridge
     void DefoldPrivateApiInitialize(dmExtension::Params* params);
     bool DefoldPrivateApiSetWindowSize(uint32_t width, uint32_t height);
     bool DefoldPrivateApiComputeBounds(const dmGameObject::SceneNode* scene_node, const Node* node, const Snapshot* snapshot, Bounds* out_bounds);
+    void DefoldPrivateApiDrawInputVisualization(InputVisualization* visualization);
 }
 
 #endif

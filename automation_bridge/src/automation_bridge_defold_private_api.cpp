@@ -33,7 +33,7 @@ namespace dmPlatform
 
 namespace dmRender
 {
-    const dmVMath::Matrix4& GetViewProjectionMatrix(HRenderContext render_context);
+    void Line3D(HRenderContext context, dmVMath::Point3 start, dmVMath::Point3 end, dmVMath::Vector4 start_color, dmVMath::Vector4 end_color);
 }
 
 namespace dmAutomationBridge
@@ -97,79 +97,71 @@ namespace dmAutomationBridge
             return true;
         }
 
-        static bool ProjectWithViewProjection(const dmVMath::Matrix4& view_proj, const Snapshot* snapshot, const dmVMath::Vector3& world, float* out_x, float* out_y)
+        static bool ScreenToDebugWorld(float x, float y, dmVMath::Point3* out)
         {
-            dmVMath::Vector4 clip = view_proj * dmVMath::Vector4(world.getX(), world.getY(), world.getZ(), 1.0f);
-            float w = clip.getW();
-            if (w > -0.000001f && w < 0.000001f)
+            if (!g_AutomationBridge.m_GraphicsContext)
             {
                 return false;
             }
 
-            float inv_w = 1.0f / w;
-            float ndc_x = clip.getX() * inv_w;
-            float ndc_y = clip.getY() * inv_w;
-
-            float viewport_x = (float)snapshot->m_ViewportX;
-            float viewport_y = (float)snapshot->m_ViewportY;
-            float viewport_w = (float)snapshot->m_ViewportWidth;
-            float viewport_h = (float)snapshot->m_ViewportHeight;
-            if (viewport_w <= 0.0f || viewport_h <= 0.0f)
+            uint32_t window_width = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
+            uint32_t window_height = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
+            uint32_t render_width = dmGraphics::GetWidth(g_AutomationBridge.m_GraphicsContext);
+            uint32_t render_height = dmGraphics::GetHeight(g_AutomationBridge.m_GraphicsContext);
+            if (window_width == 0 || window_height == 0 || render_width == 0 || render_height == 0)
             {
-                viewport_x = 0.0f;
-                viewport_y = 0.0f;
-                viewport_w = (float)snapshot->m_WindowWidth;
-                viewport_h = (float)snapshot->m_WindowHeight;
+                return false;
             }
 
-            float bottom_left_x = viewport_x + (ndc_x + 1.0f) * 0.5f * viewport_w;
-            float bottom_left_y = viewport_y + (ndc_y + 1.0f) * 0.5f * viewport_h;
-            *out_x = bottom_left_x;
-            *out_y = (float)snapshot->m_WindowHeight - bottom_left_y;
-            return IsUsablePoint(*out_x, *out_y);
+            float world_x = x * ((float)render_width / (float)window_width);
+            float world_y = ((float)window_height - y) * ((float)render_height / (float)window_height);
+            *out = dmVMath::Point3(world_x, world_y, 0.0f);
+            return true;
         }
 
-        static bool ComputeRenderBounds(const Node* node, const Snapshot* snapshot, Bounds* out_bounds)
+        static void DrawDebugLine(dmRender::HRenderContext render_context, float x1, float y1, float x2, float y2, const dmVMath::Vector4& color)
         {
-            if (!g_AutomationBridge.m_RenderContext || !node->m_HasPosition)
+            dmVMath::Point3 start;
+            dmVMath::Point3 end;
+            if (!ScreenToDebugWorld(x1, y1, &start) || !ScreenToDebugWorld(x2, y2, &end))
             {
-                return false;
+                return;
             }
 
-            dmRender::HRenderContext render_context = (dmRender::HRenderContext)g_AutomationBridge.m_RenderContext;
-            const dmVMath::Matrix4& view_proj = dmRender::GetViewProjectionMatrix(render_context);
+            dmRender::Line3D(render_context, start, end, color, color);
+        }
 
-            float half_w = node->m_HasSize ? fabsf(node->m_Size[0]) * 0.5f : 0.0f;
-            float half_h = node->m_HasSize ? fabsf(node->m_Size[1]) * 0.5f : 0.0f;
-            float x = node->m_Position[0];
-            float y = node->m_Position[1];
-            float z = node->m_Position[2];
+        static void DrawDebugCircle(dmRender::HRenderContext render_context, float x, float y, float radius, const dmVMath::Vector4& color)
+        {
+            static const uint32_t SEGMENTS = 32;
+            static const float TAU = 6.28318530717958647692f;
 
-            float min_x;
-            float min_y;
-            float max_x;
-            float max_y;
-            InitAccumulator(&min_x, &min_y, &max_x, &max_y);
-
-            const dmVMath::Vector3 points[] = {
-                dmVMath::Vector3(x - half_w, y - half_h, z),
-                dmVMath::Vector3(x + half_w, y - half_h, z),
-                dmVMath::Vector3(x + half_w, y + half_h, z),
-                dmVMath::Vector3(x - half_w, y + half_h, z),
-            };
-
-            for (uint32_t i = 0; i < DM_ARRAY_SIZE(points); ++i)
+            float previous_x = x + radius;
+            float previous_y = y;
+            for (uint32_t i = 1; i <= SEGMENTS; ++i)
             {
-                float screen_x;
-                float screen_y;
-                if (!ProjectWithViewProjection(view_proj, snapshot, points[i], &screen_x, &screen_y))
+                float angle = ((float)i / (float)SEGMENTS) * TAU;
+                float next_x = x + cosf(angle) * radius;
+                float next_y = y + sinf(angle) * radius;
+                DrawDebugLine(render_context, previous_x, previous_y, next_x, next_y, color);
+                previous_x = next_x;
+                previous_y = next_y;
+            }
+        }
+
+        static void AdvanceInputVisualization(InputVisualization* visualization)
+        {
+            uint64_t now = dmTime::GetTime();
+            if (visualization->m_LastRenderTime != 0)
+            {
+                visualization->m_Age += (float)((now - visualization->m_LastRenderTime) / 1000000.0);
+                if (visualization->m_Age >= visualization->m_Duration)
                 {
-                    return false;
+                    memset(visualization, 0, sizeof(*visualization));
+                    return;
                 }
-                AccumulatePoint(screen_x, screen_y, &min_x, &min_y, &max_x, &max_y);
             }
-
-            return SetBoundsFromAccumulator(min_x, min_y, max_x, max_y, snapshot, out_bounds);
+            visualization->m_LastRenderTime = now;
         }
 
         static bool ComputeGuiBounds(const dmGameObject::SceneNode* scene_node, const Node* node, const Snapshot* snapshot, Bounds* out_bounds)
@@ -273,6 +265,36 @@ namespace dmAutomationBridge
 
         return false;
     }
+
+    void DefoldPrivateApiDrawInputVisualization(InputVisualization* visualization)
+    {
+        if (!visualization || !visualization->m_Active || !g_AutomationBridge.m_RenderContext)
+        {
+            return;
+        }
+
+        float duration = visualization->m_Duration > 0.0f ? visualization->m_Duration : 1.0f;
+        float t = ClampFloat(visualization->m_Age / duration, 0.0f, 1.0f);
+        float alpha = 1.0f - t;
+        dmRender::HRenderContext render_context = (dmRender::HRenderContext)g_AutomationBridge.m_RenderContext;
+
+        if (visualization->m_Drag)
+        {
+            dmVMath::Vector4 color(1.0f, 0.72f, 0.12f, alpha);
+            DrawDebugLine(render_context, visualization->m_X1, visualization->m_Y1, visualization->m_X2, visualization->m_Y2, color);
+            DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, 6.0f, color);
+            DrawDebugCircle(render_context, visualization->m_X2, visualization->m_Y2, 6.0f, color);
+            AdvanceInputVisualization(visualization);
+            return;
+        }
+
+        float radius = 6.0f + 34.0f * t;
+        dmVMath::Vector4 color(0.15f, 0.85f, 1.0f, alpha);
+        DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, radius, color);
+
+        AdvanceInputVisualization(visualization);
+    }
+
 }
 
 #endif

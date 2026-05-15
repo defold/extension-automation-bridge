@@ -11,6 +11,7 @@
 - `Node` objects are snapshots with fields like `id`, `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, `visible`, `enabled`, `bounds`, `center`, `children`, and `raw`. Re-query after clicks, drags, collection changes, or UI updates.
 - Component nodes often expose useful labels/properties while the parent game object receives input. Use `bridge.parent(component_node)` before clicking or dragging when needed.
 - Input accepts nodes, node ids, point mappings, `(x, y)` tuples, or raw `x, y` coordinates. Coordinates are top-left screen pixels. `drag(..., duration=...)` waits for the queued drag to finish by default.
+- Mouse/touch input visualization is enabled by default; pass `visualize=False` to `click()` or `drag()` when needed.
 - Use `bridge.screenshot(wait=True)` for PNG diagnostics; use `bridge.format_nodes(...)` or `bridge.dump_scene(...)` when selector failures need scene context.
 - Engine logs: `bridge.log_stream()` and `bridge.read_logs(duration=..., limit=...)` read future Defold TCP log lines; `EditorClient.console_lines()` reads existing editor console history.
 - Engine control: `resize(width, height)`, `set_portrait()`, `set_landscape()`, `reboot(*args, wait=True)`, and `close_engine()`. Only call `close_engine()` when intentionally shutting down the running engine. For editor-launched reboots that must return to Automation Bridge, pass explicit project/bootstrap args.

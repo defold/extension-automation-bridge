@@ -207,9 +207,11 @@ curl -fsS "$BASE/node?id=n:0123456789abcdef&include=bounds,properties,children" 
 
 Queues a left-click. Use either a node id or absolute screen coordinates.
 
+By default, the last mouse/touch input is drawn for one second: clicks appear as a growing circle, and drags appear as a line. Pass `visualize=0` to disable this for a specific input.
+
 ```sh
 curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef"
-curl -fsS -X POST "$BASE/input/click?x=480&y=320"
+curl -fsS -X POST "$BASE/input/click?x=480&y=320&visualize=0"
 ```
 
 Response `data`:
@@ -227,6 +229,7 @@ Query parameters:
 - `from_id` and `to_id`: drag from the center of one node to the center of another.
 - `x1`, `y1`, `x2`, `y2`: drag between absolute screen positions.
 - `duration`: optional duration in seconds. Default is `0.35`; negative values are clamped to `0`.
+- `visualize`: optional input visualization flag. Defaults to `1`; use `0` to disable.
 
 ```sh
 curl -fsS -X POST "$BASE/input/drag?from_id=n:1111111111111111&to_id=n:2222222222222222&duration=0.35"

@@ -445,7 +445,13 @@ class AutomationBridgeClient:
         params = self._server_params(selector, limit=0)
         return int(self.get("/nodes", params).get("matched", 0))
 
-    def click(self, target: Union[Target, float, int], y: Optional[float] = None, wait: float = 0.25) -> JsonDict:
+    def click(
+        self,
+        target: Union[Target, float, int],
+        y: Optional[float] = None,
+        wait: float = 0.25,
+        visualize: Optional[bool] = None,
+    ) -> JsonDict:
         """Queue a left-click on a Node, node id, mapping, tuple, or x/y pair."""
         if isinstance(target, Node):
             params: Dict[str, Any] = {"id": target.id}
@@ -454,6 +460,9 @@ class AutomationBridgeClient:
         else:
             x_value, y_value = self._point(target, y)
             params = {"x": x_value, "y": y_value}
+
+        if visualize is not None:
+            params["visualize"] = visualize
 
         response = self.post("/input/click", params)
         if wait:
@@ -466,6 +475,7 @@ class AutomationBridgeClient:
         to_target: Target,
         duration: float = 0.35,
         wait: Optional[float] = None,
+        visualize: Optional[bool] = None,
     ) -> JsonDict:
         """Queue a drag between nodes or coordinates and block until it finishes."""
         if self._is_node_ref(from_target) and self._is_node_ref(to_target):
@@ -478,6 +488,9 @@ class AutomationBridgeClient:
             x1, y1 = self._point(from_target)
             x2, y2 = self._point(to_target)
             params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
+
+        if visualize is not None:
+            params["visualize"] = visualize
 
         response = self.post("/input/drag", params)
         block_for = max(0.0, duration) + _INPUT_SETTLE_SECONDS if wait is None else wait

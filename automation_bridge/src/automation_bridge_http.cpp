@@ -440,7 +440,10 @@ namespace dmAutomationBridge
             return;
         }
 
-        if (!AddMouseInput(x, y, x, y, 0.0f))
+        bool visualize = true;
+        RequestGetBoolParam(ctx, "visualize", &visualize);
+
+        if (!AddMouseInput(x, y, x, y, 0.0f, visualize))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
@@ -492,8 +495,10 @@ namespace dmAutomationBridge
             return;
         }
 
+        bool visualize = true;
+        RequestGetBoolParam(ctx, "visualize", &visualize);
         duration = MaxFloat(0.0f, duration);
-        if (!AddMouseInput(x1, y1, x2, y2, duration))
+        if (!AddMouseInput(x1, y1, x2, y2, duration, visualize))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
