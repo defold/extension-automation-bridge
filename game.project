@@ -25,3 +25,9 @@ title = extension-automation-bridge
 [library]
 include_dirs = automation_bridge
 defold_min_version = 1.12.4
+
+[render]
+clear_color_red = 0.5
+clear_color_green = 0.5
+clear_color_blue = 0.5
+

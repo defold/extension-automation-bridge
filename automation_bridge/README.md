@@ -26,7 +26,7 @@ Checks that the extension is running. Returns API version, platform, screen data
 GET /automation-bridge/v1/screen
 ```
 
-Returns window, backbuffer, viewport, and coordinate convention data. Input coordinates use top-left screen pixels.
+Returns window, backbuffer, configured display, viewport, and coordinate convention data. Input coordinates use top-left screen pixels. Game object bounds are projected from the configured `display.width`/`display.height` space to the current window size; GUI bounds are reported in screen pixels.
 
 ```text
 GET /automation-bridge/v1/scene?visible=1&include=basic,bounds,properties

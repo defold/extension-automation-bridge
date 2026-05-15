@@ -11,4 +11,8 @@
 - `Node` objects are snapshots. Re-query after clicks, drags, or scene changes.
 - Use `bridge.click(...)`, `bridge.drag(..., duration=...)`, `bridge.type_text(...)`, and `bridge.key("KEY_ENTER")`; drag blocks until the queued drag should be finished by default.
 - Use `bridge.screenshot(wait=True)` and `bridge.format_nodes(...)` for diagnostics.
+- Use `bridge.log_stream()` or `bridge.read_logs(duration=..., limit=...)` to read future engine log lines from Defold's TCP log service; use `EditorClient.console_lines()` for existing editor console history.
+- Use `bridge.resize(width, height)` for Defold `/post/@render/resize`; `bridge.last_window_size` is updated by `resize()`, `screen()`, and `health()`.
+- Use `bridge.set_portrait()` and `bridge.set_landscape()` to swap the last known width/height when the current orientation differs.
+- Use `bridge.reboot(*args)` for Defold `/post/@system/reboot`; pass up to six command-line style strings and `wait=False` if the reboot target will not load Automation Bridge again. For editor-launched projects, pass explicit project/bootstrap args when Automation Bridge should come back after reboot.
 - Call `bridge.close_engine()` only when the script intentionally shuts down the running engine.

@@ -18,12 +18,23 @@ items = bridge.nodes(type="labelc", text_exact="L1", limit=100)
 bridge.drag(bridge.parent(items[0]), bridge.parent(items[1]), duration=0.16)
 
 png = bridge.screenshot(wait=True)
+
+with bridge.log_stream(read_timeout=1.0) as logs:
+    print(logs.readline(timeout=1.0))
 ```
 
 Close the running engine when a script needs to clean up after itself:
 
 ```python
 bridge.close_engine()
+```
+
+Resize the running engine window or swap the last known size between portrait and landscape:
+
+```python
+bridge.resize(1280, 720)
+bridge.set_portrait()
+bridge.set_landscape()
 ```
 
 When running from this repository without installing anything, add `automation_bridge/automation-bridge-python` to `PYTHONPATH`:
@@ -121,6 +132,23 @@ png = bridge.screenshot(wait=True, timeout=5)
 
 ## Engine Control
 
+The helper can post a subset of Defold's built-in engine service protobuf messages to the same engine service port used by the Automation Bridge API:
+
+```python
+bridge.resize(1280, 720)
+bridge.set_portrait()
+bridge.set_landscape()
+
+bridge.reboot(
+    "--config=bootstrap.main_collection=/main/main.collectionc",
+    "build/default/game.projectc",
+)
+```
+
+`bridge.resize(width, height)` posts `com.dynamo.render.proto.Render$Resize` to `/post/@render/resize`, then remembers `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
+
+`bridge.reboot(*args)` posts `com.dynamo.system.proto.System$Reboot` to `/post/@system/reboot`. Defold accepts up to six string arguments; pass the same command-line style arguments you would pass to `sys.reboot(...)` or the editor reboot helper. For editor-launched projects, a bare `bridge.reboot()` may restart without the project or this extension, so pass explicit project/bootstrap args when you expect Automation Bridge to return. By default the wrapper waits for the Automation Bridge endpoint to become ready again; pass `wait=False` when rebooting into a target that will not load this extension.
+
 `bridge.close_engine()` posts Defold's built-in `@system/exit` message to the same engine service port used by the Automation Bridge API. If the process stays alive on macOS/Linux, the helper falls back to terminating the local process listening on that port. The graceful request is equivalent to:
 
 ```sh
@@ -137,6 +165,19 @@ print(bridge.format_nodes(type="gui_node", limit=100))
 print(bridge.dump_scene(visible=True, include=["basic", "bounds"]))
 bridge.dump_scene("scene.json", visible=True)
 ```
+
+Read future engine logs from Defold's TCP log service:
+
+```python
+print(bridge.engine_info()["log_port"])
+
+with bridge.log_stream(read_timeout=1.0) as logs:
+    print(logs.readline(timeout=1.0))
+
+recent = bridge.read_logs(duration=2.0, limit=20)
+```
+
+`bridge.log_stream()` discovers the log port from engine `/info`, performs Defold's `0 OK` log-service handshake, and then yields plain log lines without trailing newlines. The stream only receives logs emitted after it connects; use `EditorClient.console_lines()` when you need the editor's existing console history.
 
 ## Errors
 

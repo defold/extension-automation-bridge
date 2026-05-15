@@ -29,6 +29,8 @@ namespace dmAutomationBridge
     {
         memset(bridge, 0, sizeof(*bridge));
         InitSnapshot(&bridge->m_Snapshot);
+        bridge->m_DisplayWidth = 960;
+        bridge->m_DisplayHeight = 640;
     }
 
     static ExtensionResult PostRender(ExtensionParams* params)
@@ -44,6 +46,19 @@ namespace dmAutomationBridge
         InitAutomationBridgeContext(&g_AutomationBridge);
         g_AutomationBridge.m_Register = dmEngine::GetGameObjectRegister(params);
         g_AutomationBridge.m_HidContext = dmEngine::GetHIDContext(params);
+        if (params->m_ConfigFile)
+        {
+            int32_t display_width = dmConfigFile::GetInt(params->m_ConfigFile, "display.width", 960);
+            int32_t display_height = dmConfigFile::GetInt(params->m_ConfigFile, "display.height", 640);
+            if (display_width > 0)
+            {
+                g_AutomationBridge.m_DisplayWidth = (uint32_t)display_width;
+            }
+            if (display_height > 0)
+            {
+                g_AutomationBridge.m_DisplayHeight = (uint32_t)display_height;
+            }
+        }
         g_AutomationBridge.m_LastTime = dmTime::GetTime();
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);

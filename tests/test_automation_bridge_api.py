@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
+import socket
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -8,7 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import AutomationBridgeApiError, AutomationBridgeClient, EditorClient, wait_until  # noqa: E402
+from automation_bridge import AutomationBridgeApiError, AutomationBridgeClient, EditorClient, EngineLogStream, wait_until  # noqa: E402
+from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
@@ -18,6 +21,124 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 return 0
 
         self.assertEqual(0, AutomationBridgeClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
+
+    def test_render_resize_payload(self):
+        self.assertEqual(b"\x08\x80\x08\x10\x80\x06", _encode_render_resize(1024, 768))
+
+    def test_system_reboot_payload(self):
+        self.assertEqual(b"\x0a\x01a\x12\x02bc", _encode_system_reboot(("a", "bc")))
+
+    def test_system_reboot_rejects_too_many_args(self):
+        with self.assertRaises(ValueError):
+            _encode_system_reboot(("1", "2", "3", "4", "5", "6", "7"))
+
+    def test_resize_remembers_window_size(self):
+        bridge = FakeEngineClient()
+
+        result = bridge.resize(640, 480, wait=0)
+
+        self.assertEqual({"width": 640, "height": 480}, result)
+        self.assertEqual((640, 480), bridge.last_window_size)
+        self.assertEqual(
+            [("/post/@render/resize", _encode_render_resize(640, 480), None)],
+            bridge.engine_posts,
+        )
+
+    def test_orientation_helpers_swap_last_known_size(self):
+        bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
+
+        landscape = bridge.set_landscape(wait=0)
+        portrait = bridge.set_portrait(wait=0)
+
+        self.assertEqual({"width": 568, "height": 320}, landscape)
+        self.assertEqual({"width": 320, "height": 568}, portrait)
+        self.assertEqual((320, 568), bridge.last_window_size)
+        self.assertEqual(
+            [
+                ("/post/@render/resize", _encode_render_resize(568, 320), None),
+                ("/post/@render/resize", _encode_render_resize(320, 568), None),
+            ],
+            bridge.engine_posts,
+        )
+
+    def test_reboot_posts_system_reboot_without_waiting(self):
+        bridge = FakeEngineClient()
+
+        bridge.reboot("--config=foo=bar", "build/game.projectc", wait=False)
+
+        self.assertEqual(
+            [("/post/@system/reboot", _encode_system_reboot(("--config=foo=bar", "build/game.projectc")), None)],
+            bridge.engine_posts,
+        )
+
+    def test_engine_log_stream_reads_lines(self):
+        with FakeLogServer([b"0 OK\n", b"INFO:TEST: hello\n", b"WARNING:TEST: done\n"]) as server:
+            with EngineLogStream("127.0.0.1", server.port, timeout=1.0, read_timeout=1.0) as logs:
+                self.assertEqual("INFO:TEST: hello", logs.readline(timeout=1.0))
+                self.assertEqual("WARNING:TEST: done", logs.readline(timeout=1.0))
+
+    def test_read_logs_collects_future_lines(self):
+        bridge = FakeEngineClient()
+        with FakeLogServer([b"0 OK\n", b"INFO:TEST: one\n", b"INFO:TEST: two\n"]) as server:
+            bridge._engine_info = {"log_port": str(server.port)}
+
+            self.assertEqual(
+                ["INFO:TEST: one", "INFO:TEST: two"],
+                bridge.read_logs(duration=1.0, limit=2, idle_timeout=0.05),
+            )
+
+
+class FakeEngineClient(AutomationBridgeClient):
+    def __init__(self, screen=None):
+        super().__init__(12345)
+        self.engine_posts = []
+        self._screen = screen or {"window": {"width": 800, "height": 600}}
+        self._engine_info = {"log_port": "0"}
+
+    def _request(self, method, path, params=None):
+        if method == "GET" and path == "/screen":
+            return self._screen
+        raise AssertionError(f"unexpected request: {method} {path} {params}")
+
+    def _post_engine_message(self, path, payload, timeout=None):
+        self.engine_posts.append((path, payload, timeout))
+        return b"OK"
+
+    def engine_info(self):
+        return self._engine_info
+
+
+class FakeLogServer:
+    def __init__(self, chunks):
+        self.chunks = chunks
+        self.port = 0
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._thread = None
+        self._error = None
+
+    def __enter__(self):
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self.port = self._socket.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._socket.close()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if exc_type is None and self._error:
+            raise self._error
+
+    def _serve(self):
+        try:
+            client, _ = self._socket.accept()
+            with client:
+                for chunk in self.chunks:
+                    client.sendall(chunk)
+        except OSError as exc:
+            self._error = exc
 
 
 class AutomationBridgeApiTest(unittest.TestCase):
@@ -62,6 +183,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 previous_port = self.bridge.port
 
             with self.subTest(run=run_index + 1):
+                if run_index == 1:
+                    self.bridge.resize(800, 600, wait=0.3)
+                    portrait = self.bridge.set_portrait(wait=0.3)
+                    self.assertLessEqual(portrait["width"], portrait["height"])
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
@@ -75,6 +200,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("top-left", screen["coordinates"]["origin"])
         self.assertGreater(screen["window"]["width"], 0)
         self.assertGreater(screen["window"]["height"], 0)
+        self.assertEqual({"width": 960, "height": 640}, screen["display"])
 
         scene = self.bridge.scene(visible=True, include=["basic", "bounds", "properties"])
         self.assertEqual("main", scene["root"]["name"])

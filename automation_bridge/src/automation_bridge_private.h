@@ -100,6 +100,8 @@ namespace dmAutomationBridge
         uint32_t         m_WindowHeight;
         uint32_t         m_BackbufferWidth;
         uint32_t         m_BackbufferHeight;
+        uint32_t         m_DisplayWidth;
+        uint32_t         m_DisplayHeight;
         int32_t          m_ViewportX;
         int32_t          m_ViewportY;
         uint32_t         m_ViewportWidth;
@@ -145,6 +147,8 @@ namespace dmAutomationBridge
         bool                    m_ScreenshotPending;
         uint32_t                m_ScreenshotCounter;
         char                    m_ScreenshotPath[1024];
+        uint32_t                m_DisplayWidth;
+        uint32_t                m_DisplayHeight;
     };
 
     struct IncludeOptions
