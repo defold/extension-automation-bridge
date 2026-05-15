@@ -314,6 +314,36 @@ namespace dmAutomationBridge
         node->m_Bounds.m_Valid = true;
     }
 
+    static void DiscoverSnapshotCamera(dmGameObject::SceneNode* scene_node)
+    {
+        Node node;
+        InitNode(&node);
+
+        dmGameObject::SceneNodePropertyIterator pit = dmGameObject::TraverseIterateProperties(scene_node);
+        while (dmGameObject::TraverseIteratePropertiesNext(&pit))
+        {
+            Property property;
+            if (MakeProperty(&property, &pit.m_Property))
+            {
+                ApplyPropertyToNode(&node, &property);
+                FreeProperty(&property);
+            }
+        }
+
+        if (scene_node->m_Type == dmGameObject::SCENE_NODE_TYPE_COMPONENT && node.m_Enabled && StringsEqual(node.m_Type, "camerac"))
+        {
+            DefoldPrivateApiUseSnapshotCamera(scene_node);
+        }
+
+        FreeNode(&node);
+
+        dmGameObject::SceneNodeIterator it = dmGameObject::TraverseIterateChildren(scene_node);
+        while (dmGameObject::TraverseIterateNext(&it))
+        {
+            DiscoverSnapshotCamera(&it.m_Node);
+        }
+    }
+
     void InitSnapshot(Snapshot* snapshot)
     {
         memset(snapshot, 0, sizeof(*snapshot));
@@ -461,6 +491,8 @@ namespace dmAutomationBridge
             dmGameObject::SceneNode root;
             if (dmGameObject::TraverseGetRoot(g_AutomationBridge.m_Register, &root))
             {
+                DefoldPrivateApiResetSnapshotCamera();
+                DiscoverSnapshotCamera(&root);
                 snapshot.m_Root = BuildNode(&snapshot, &root, -1, "", 0);
             }
         }

@@ -202,7 +202,7 @@ png = bridge.screenshot(wait=True, timeout=5)
 
 ## Engine Control
 
-The helper can post a subset of Defold's built-in engine service protobuf messages to the same engine service port used by the Automation Bridge API:
+The helper combines Automation Bridge window control with a small subset of Defold's built-in engine service protobuf messages on the same engine service port:
 
 ```python
 bridge.resize(1280, 720)

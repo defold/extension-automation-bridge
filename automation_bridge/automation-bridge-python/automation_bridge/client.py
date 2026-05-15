@@ -586,10 +586,15 @@ class AutomationBridgeClient:
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
         """Resize the Defold window through `PUT /screen` and remember the new size."""
         _validate_screen_size(width, height)
+        capabilities = self.health().get("capabilities", [])
+        if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
+            raise AutomationBridgeError("Automation Bridge endpoint does not advertise the screen.resize capability")
+
         screen = self.put("/screen", {"width": width, "height": height})
         self._remember_window_size(screen)
         if wait:
             time.sleep(wait)
+            screen = self.screen()
         window = screen.get("window") if isinstance(screen, Mapping) else None
         if isinstance(window, Mapping):
             screen_width = window.get("width")

@@ -33,6 +33,16 @@ namespace dmPlatform
 
 namespace dmRender
 {
+    typedef uint32_t HRenderCamera;
+
+    struct FrustumOptions;
+    void RenderListBegin(HRenderContext render_context);
+    void RenderListEnd(HRenderContext render_context);
+    void SetViewMatrix(HRenderContext render_context, const dmVMath::Matrix4& view);
+    void SetProjectionMatrix(HRenderContext render_context, const dmVMath::Matrix4& projection);
+    Result ClearRenderObjects(HRenderContext context);
+    Result DrawDebug3d(HRenderContext context, const FrustumOptions* frustum_options);
+    Result CameraWorldToScreen(HRenderContext render_context, HRenderCamera camera, const dmVMath::Vector3& world, dmVMath::Vector3* out_screen);
     void Line3D(HRenderContext context, dmVMath::Point3 start, dmVMath::Point3 end, dmVMath::Vector4 start_color, dmVMath::Vector4 end_color);
 }
 
@@ -46,6 +56,14 @@ namespace dmAutomationBridge
             void*         m_Resource;
             dmGui::HScene m_Scene;
         };
+
+        struct CameraComponentPrivateApi
+        {
+            dmGameObject::HInstance m_Instance;
+            dmRender::HRenderCamera m_RenderCamera;
+        };
+
+        static dmRender::HRenderCamera g_SnapshotCamera = 0;
 
         static bool IsUsableScreen(const Snapshot* snapshot)
         {
@@ -97,6 +115,34 @@ namespace dmAutomationBridge
             return true;
         }
 
+        static bool IsDesktopWindowResizeSupported()
+        {
+#if defined(DM_PLATFORM_OSX) || defined(DM_PLATFORM_WINDOWS) || defined(DM_PLATFORM_LINUX)
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        static bool IsCloseDimension(uint32_t actual, uint32_t expected, float tolerance)
+        {
+            return fabsf((float)actual - (float)expected) <= tolerance;
+        }
+
+        static bool CurrentWindowSizeMatches(uint32_t width, uint32_t height, float scale)
+        {
+            if (!g_AutomationBridge.m_GraphicsContext)
+            {
+                return false;
+            }
+
+            uint32_t actual_width = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
+            uint32_t actual_height = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
+            float tolerance = MaxFloat(1.0f, ceilf(scale));
+            return IsCloseDimension(actual_width, width, tolerance) &&
+                   IsCloseDimension(actual_height, height, tolerance);
+        }
+
         static bool ScreenToDebugWorld(float x, float y, dmVMath::Point3* out)
         {
             if (!g_AutomationBridge.m_GraphicsContext)
@@ -104,18 +150,13 @@ namespace dmAutomationBridge
                 return false;
             }
 
-            uint32_t window_width = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
             uint32_t window_height = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
-            uint32_t render_width = dmGraphics::GetWidth(g_AutomationBridge.m_GraphicsContext);
-            uint32_t render_height = dmGraphics::GetHeight(g_AutomationBridge.m_GraphicsContext);
-            if (window_width == 0 || window_height == 0 || render_width == 0 || render_height == 0)
+            if (window_height == 0)
             {
                 return false;
             }
 
-            float world_x = x * ((float)render_width / (float)window_width);
-            float world_y = ((float)window_height - y) * ((float)render_height / (float)window_height);
-            *out = dmVMath::Point3(world_x, world_y, 0.0f);
+            *out = dmVMath::Point3(x, (float)window_height - y, 0.0f);
             return true;
         }
 
@@ -216,6 +257,82 @@ namespace dmAutomationBridge
             return SetBoundsFromAccumulator(min_x, min_y, max_x, max_y, snapshot, out_bounds);
         }
 
+        static bool AccumulateCameraPoint(const Snapshot* snapshot, const dmVMath::Vector3& world, float* min_x, float* min_y, float* max_x, float* max_y)
+        {
+            if (!g_AutomationBridge.m_RenderContext || g_SnapshotCamera == 0)
+            {
+                return false;
+            }
+
+            dmVMath::Vector3 screen;
+            dmRender::Result result = dmRender::CameraWorldToScreen((dmRender::HRenderContext)g_AutomationBridge.m_RenderContext, g_SnapshotCamera, world, &screen);
+            if (result != dmRender::RESULT_OK)
+            {
+                return false;
+            }
+
+            float screen_x = screen.getX();
+            float screen_y = (float)snapshot->m_WindowHeight - screen.getY();
+            return AccumulatePoint(screen_x, screen_y, min_x, min_y, max_x, max_y);
+        }
+
+        static bool ComputeCameraBounds(const Node* node, const Snapshot* snapshot, Bounds* out_bounds)
+        {
+            if (g_SnapshotCamera == 0 || !node->m_HasPosition)
+            {
+                return false;
+            }
+
+            float width = node->m_HasSize ? fabsf(node->m_Size[0]) : 0.0f;
+            float height = node->m_HasSize ? fabsf(node->m_Size[1]) : 0.0f;
+            float x = node->m_Position[0];
+            float y = node->m_Position[1];
+            float z = node->m_Position[2];
+
+            if (!IsFiniteFloat(x) || !IsFiniteFloat(y) || !IsFiniteFloat(z) || !IsFiniteFloat(width) || !IsFiniteFloat(height))
+            {
+                return false;
+            }
+
+            float min_x;
+            float min_y;
+            float max_x;
+            float max_y;
+            InitAccumulator(&min_x, &min_y, &max_x, &max_y);
+
+            if (width <= 0.0f && height <= 0.0f)
+            {
+                if (!AccumulateCameraPoint(snapshot, dmVMath::Vector3(x, y, z), &min_x, &min_y, &max_x, &max_y))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                float left = x - width * node->m_AnchorX;
+                float right = left + width;
+                float bottom = y - height * node->m_AnchorY;
+                float top = bottom + height;
+
+                const dmVMath::Vector3 points[] = {
+                    dmVMath::Vector3(left, bottom, z),
+                    dmVMath::Vector3(right, bottom, z),
+                    dmVMath::Vector3(right, top, z),
+                    dmVMath::Vector3(left, top, z),
+                };
+
+                for (uint32_t i = 0; i < DM_ARRAY_SIZE(points); ++i)
+                {
+                    if (!AccumulateCameraPoint(snapshot, points[i], &min_x, &min_y, &max_x, &max_y))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return SetBoundsFromAccumulator(min_x, min_y, max_x, max_y, snapshot, out_bounds);
+        }
+
         static HWindow GetAutomationBridgeWindow()
         {
             if (!g_AutomationBridge.m_GraphicsContext)
@@ -223,6 +340,51 @@ namespace dmAutomationBridge
                 return 0;
             }
             return dmGraphics::GetWindow(g_AutomationBridge.m_GraphicsContext);
+        }
+
+        static void RestoreInputVisualizationGraphicsState(dmGraphics::HContext graphics_context, const dmGraphics::PipelineState& previous_state, int32_t viewport_x, int32_t viewport_y, uint32_t viewport_width, uint32_t viewport_height)
+        {
+            if (previous_state.m_BlendEnabled)
+            {
+                dmGraphics::EnableState(graphics_context, dmGraphics::STATE_BLEND);
+            }
+            else
+            {
+                dmGraphics::DisableState(graphics_context, dmGraphics::STATE_BLEND);
+            }
+
+            if (previous_state.m_DepthTestEnabled)
+            {
+                dmGraphics::EnableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
+            }
+            else
+            {
+                dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
+            }
+
+            dmGraphics::SetBlendFuncSeparate(
+                graphics_context,
+                (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactor,
+                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactor,
+                (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactorAlpha,
+                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactorAlpha);
+            dmGraphics::SetViewport(graphics_context, viewport_x, viewport_y, viewport_width, viewport_height);
+        }
+
+        static void PrepareInputVisualizationRenderState(dmGraphics::HContext graphics_context, dmRender::HRenderContext render_context, uint32_t window_width, uint32_t window_height)
+        {
+            dmGraphics::SetViewport(graphics_context, 0, 0, window_width, window_height);
+            dmGraphics::EnableState(graphics_context, dmGraphics::STATE_BLEND);
+            dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
+            dmGraphics::SetBlendFuncSeparate(
+                graphics_context,
+                dmGraphics::BLEND_FACTOR_SRC_ALPHA,
+                dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                dmGraphics::BLEND_FACTOR_ONE,
+                dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+
+            dmRender::SetViewMatrix(render_context, dmVMath::Matrix4::identity());
+            dmRender::SetProjectionMatrix(render_context, dmVMath::Matrix4::orthographic(0.0f, (float)window_width, 0.0f, (float)window_height, 1.0f, -1.0f));
         }
     }
 
@@ -233,12 +395,12 @@ namespace dmAutomationBridge
 
     bool DefoldPrivateApiCanSetWindowSize()
     {
-        return GetAutomationBridgeWindow() != 0;
+        return IsDesktopWindowResizeSupported() && GetAutomationBridgeWindow() != 0;
     }
 
     bool DefoldPrivateApiSetWindowSize(uint32_t width, uint32_t height)
     {
-        if (!g_AutomationBridge.m_GraphicsContext || width == 0 || height == 0)
+        if (!DefoldPrivateApiCanSetWindowSize() || width == 0 || height == 0)
         {
             return false;
         }
@@ -260,7 +422,23 @@ namespace dmAutomationBridge
         uint32_t window_width = (uint32_t)MaxFloat(1.0f, floorf((float)width / scale + 0.5f));
         uint32_t window_height = (uint32_t)MaxFloat(1.0f, floorf((float)height / scale + 0.5f));
         dmPlatform::SetWindowSize(window, window_width, window_height);
-        return true;
+        return CurrentWindowSizeMatches(width, height, scale);
+    }
+
+    void DefoldPrivateApiResetSnapshotCamera()
+    {
+        g_SnapshotCamera = 0;
+    }
+
+    void DefoldPrivateApiUseSnapshotCamera(const dmGameObject::SceneNode* scene_node)
+    {
+        if (!scene_node || scene_node->m_Component == 0)
+        {
+            return;
+        }
+
+        CameraComponentPrivateApi* camera = (CameraComponentPrivateApi*)scene_node->m_Component;
+        g_SnapshotCamera = camera->m_RenderCamera;
     }
 
     bool DefoldPrivateApiComputeBounds(const dmGameObject::SceneNode* scene_node, const Node* node, const Snapshot* snapshot, Bounds* out_bounds)
@@ -277,20 +455,42 @@ namespace dmAutomationBridge
             return true;
         }
 
+        if (!StringsEqual(node->m_Kind, "gui_node") && ComputeCameraBounds(node, snapshot, out_bounds))
+        {
+            return true;
+        }
+
         return false;
     }
 
     void DefoldPrivateApiDrawInputVisualization(InputVisualization* visualization)
     {
-        if (!visualization || !visualization->m_Active || !g_AutomationBridge.m_RenderContext)
+        if (!visualization || !visualization->m_Active || !g_AutomationBridge.m_RenderContext || !g_AutomationBridge.m_GraphicsContext)
         {
             return;
         }
+
+        uint32_t window_width = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
+        uint32_t window_height = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
+        if (window_width == 0 || window_height == 0)
+        {
+            return;
+        }
+
+        int32_t previous_viewport_x = 0;
+        int32_t previous_viewport_y = 0;
+        uint32_t previous_viewport_width = 0;
+        uint32_t previous_viewport_height = 0;
+        dmGraphics::GetViewport(g_AutomationBridge.m_GraphicsContext, &previous_viewport_x, &previous_viewport_y, &previous_viewport_width, &previous_viewport_height);
+        dmGraphics::PipelineState previous_state = dmGraphics::GetPipelineState(g_AutomationBridge.m_GraphicsContext);
 
         float duration = visualization->m_Duration > 0.0f ? visualization->m_Duration : 1.0f;
         float t = ClampFloat(visualization->m_Age / duration, 0.0f, 1.0f);
         float alpha = 1.0f - t;
         dmRender::HRenderContext render_context = (dmRender::HRenderContext)g_AutomationBridge.m_RenderContext;
+
+        dmRender::RenderListBegin(render_context);
+        PrepareInputVisualizationRenderState(g_AutomationBridge.m_GraphicsContext, render_context, window_width, window_height);
 
         if (visualization->m_Drag)
         {
@@ -298,6 +498,10 @@ namespace dmAutomationBridge
             DrawDebugLine(render_context, visualization->m_X1, visualization->m_Y1, visualization->m_X2, visualization->m_Y2, color);
             DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, 6.0f, color);
             DrawDebugCircle(render_context, visualization->m_X2, visualization->m_Y2, 6.0f, color);
+            dmRender::RenderListEnd(render_context);
+            dmRender::DrawDebug3d(render_context, 0);
+            dmRender::ClearRenderObjects(render_context);
+            RestoreInputVisualizationGraphicsState(g_AutomationBridge.m_GraphicsContext, previous_state, previous_viewport_x, previous_viewport_y, previous_viewport_width, previous_viewport_height);
             AdvanceInputVisualization(visualization);
             return;
         }
@@ -305,6 +509,10 @@ namespace dmAutomationBridge
         float radius = 6.0f + 34.0f * t;
         dmVMath::Vector4 color(0.15f, 0.85f, 1.0f, alpha);
         DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, radius, color);
+        dmRender::RenderListEnd(render_context);
+        dmRender::DrawDebug3d(render_context, 0);
+        dmRender::ClearRenderObjects(render_context);
+        RestoreInputVisualizationGraphicsState(g_AutomationBridge.m_GraphicsContext, previous_state, previous_viewport_x, previous_viewport_y, previous_viewport_width, previous_viewport_height);
 
         AdvanceInputVisualization(visualization);
     }

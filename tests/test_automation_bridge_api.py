@@ -80,14 +80,34 @@ def _read_automation_bridge_png(path):
     return width, height, bytes(pixels)
 
 
-def _count_orange_debug_pixels(path):
-    _, _, pixels = _read_automation_bridge_png(path)
-    count = 0
+def _point_segment_distance(px, py, start, end):
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    length_squared = dx * dx + dy * dy
+    if length_squared <= 0:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / length_squared))
+    nearest_x = x1 + t * dx
+    nearest_y = y1 + t * dy
+    return ((px - nearest_x) ** 2 + (py - nearest_y) ** 2) ** 0.5
+
+
+def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
+    width, height, pixels = _read_automation_bridge_png(path)
+    counts = [0, 0]
     for i in range(0, len(pixels), 4):
         r, g, b, a = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
-        if a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25:
-            count += 1
-    return count
+        if not (a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25):
+            continue
+        pixel_index = i // 4
+        x = pixel_index % width
+        row = pixel_index // width
+        for index, y in enumerate((row, height - 1 - row)):
+            if _point_segment_distance(x + 0.5, y + 0.5, start, end) <= max_distance:
+                counts[index] += 1
+    return max(counts)
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
@@ -113,9 +133,20 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual({"width": 640, "height": 480}, result)
         self.assertEqual((640, 480), bridge.last_window_size)
         self.assertEqual(
-            [("PUT", "/screen", {"width": 640, "height": 480})],
+            [
+                ("GET", "/health", None),
+                ("PUT", "/screen", {"width": 640, "height": 480}),
+            ],
             bridge.api_requests,
         )
+
+    def test_resize_requires_screen_resize_capability(self):
+        bridge = FakeEngineClient(capabilities=["scene", "nodes"])
+
+        with self.assertRaisesRegex(AutomationBridgeError, "screen.resize"):
+            bridge.resize(640, 480, wait=0)
+
+        self.assertEqual([("GET", "/health", None)], bridge.api_requests)
 
     def test_resize_rejects_oversized_dimensions_before_request(self):
         bridge = FakeEngineClient()
@@ -159,7 +190,9 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(
             [
                 ("GET", "/screen", None),
+                ("GET", "/health", None),
                 ("PUT", "/screen", {"width": 568, "height": 320}),
+                ("GET", "/health", None),
                 ("PUT", "/screen", {"width": 320, "height": 568}),
             ],
             bridge.api_requests,
@@ -426,15 +459,18 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
 
 class FakeEngineClient(AutomationBridgeClient):
-    def __init__(self, screen=None):
+    def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
         self.engine_posts = []
         self.api_requests = []
         self._screen = screen or {"window": {"width": 800, "height": 600}}
+        self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
 
     def _request(self, method, path, params=None):
         self.api_requests.append((method, path, dict(params) if params is not None else None))
+        if method == "GET" and path == "/health":
+            return {"version": "1", "capabilities": list(self._capabilities), "screen": self._screen}
         if method == "GET" and path == "/screen":
             return self._screen
         if method == "PUT" and path == "/screen":
@@ -843,10 +879,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
             with self.subTest(run=run_index + 1):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
                     if self.supports_capability("screen.resize"):
-                        resized = self.bridge.resize(800, 600, wait=0.3)
-                        self.assertEqual({"width": 800, "height": 600}, resized)
+                        resized = self.bridge.resize(1600, 1200, wait=0.3)
+                        self.assertEqual({"width": 1600, "height": 1200}, resized)
                         portrait = self.bridge.set_portrait(wait=0.3)
-                        self.assertEqual({"width": 600, "height": 800}, portrait)
+                        self.assertEqual({"width": 1200, "height": 1600}, portrait)
                     else:
                         print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
@@ -880,17 +916,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
         y = max(4, window["height"] - 16)
         start = (max(4, window["width"] * 0.15), y)
         end = (min(window["width"] - 4, window["width"] * 0.85), y)
+        baseline_path = self.bridge.screenshot(wait=True, timeout=5)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end)
 
         self.bridge.drag(start, end, duration=1.0, wait=0)
-        last_observation = {"path": None, "orange_pixels": 0}
+        last_observation = {"path": None, "orange_pixels": 0, "baseline_path": baseline_path, "baseline_orange": baseline_orange}
 
         def visible_overlay():
             screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
-            orange_pixels = _count_orange_debug_pixels(screenshot_path)
+            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end)
             last_observation["path"] = screenshot_path
             last_observation["orange_pixels"] = orange_pixels
-            print(f"DRAG_VISUALIZATION_SCREENSHOT {screenshot_path} orange_pixels={orange_pixels}")
-            return orange_pixels if orange_pixels > 20 else None
+            print(
+                "DRAG_VISUALIZATION_SCREENSHOT "
+                f"{screenshot_path} orange_pixels={orange_pixels} baseline_orange={baseline_orange}"
+            )
+            return orange_pixels if orange_pixels > max(20, baseline_orange + 20) else None
 
         try:
             orange_pixels = wait_until(
@@ -899,7 +940,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 interval=0.05,
                 message=f"drag visualization was not visible: {last_observation}",
             )
-            self.assertGreater(orange_pixels, 20)
+            self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
         finally:
             time.sleep(1.0)
 

@@ -37,13 +37,13 @@ namespace dmAutomationBridge
     static ExtensionResult PreRender(ExtensionParams* params)
     {
         DefoldPrivateApiInitialize(params);
-        DefoldPrivateApiDrawInputVisualization(&g_AutomationBridge.m_InputVisualization);
         return EXTENSION_RESULT_OK;
     }
 
     static ExtensionResult PostRender(ExtensionParams* params)
     {
         DefoldPrivateApiInitialize(params);
+        DefoldPrivateApiDrawInputVisualization(&g_AutomationBridge.m_InputVisualization);
         ProcessPendingScreenshot();
         return EXTENSION_RESULT_OK;
     }

@@ -2,31 +2,13 @@ name: "main"
 instances {
   id: "controller"
   prototype: "/main/controller.go"
-  position {
-    x: 0.0
-    y: 0.0
-    z: 0.0
-  }
-  rotation {
-    x: 0.0
-    y: 0.0
-    z: 0.0
-    w: 1.0
-  }
 }
 instances {
   id: "spawner"
   prototype: "/main/spawner.go"
   position {
-    x: 120.0
-    y: 540.0
-    z: 0.0
-  }
-  rotation {
-    x: 0.0
-    y: 0.0
-    z: 0.0
-    w: 1.0
+    x: 295.0
+    y: 461.0
   }
 }
 scale_along_z: 0
@@ -38,14 +20,31 @@ embedded_instances {
   "}\n"
   ""
   position {
-    x: 0.0
-    y: 0.0
     z: 1.0
   }
-  rotation {
-    x: 0.0
-    y: 0.0
-    z: 0.0
-    w: 1.0
+}
+embedded_instances {
+  id: "go"
+  data: "embedded_components {\n"
+  "  id: \"camera\"\n"
+  "  type: \"camera\"\n"
+  "  data: \"aspect_ratio: 1.0\\n"
+  "fov: 0.7854\\n"
+  "near_z: -1.0\\n"
+  "far_z: 1.0\\n"
+  "orthographic_projection: 1\\n"
+  "orthographic_zoom: 0.8\\n"
+  "orthographic_mode: ORTHO_MODE_AUTO_FIT\\n"
+  "\"\n"
+  "}\n"
+  ""
+  position {
+    x: 314.0
+    y: 315.0
+  }
+  scale3 {
+    x: 1.08
+    y: 1.08
+    z: 1.08
   }
 }
