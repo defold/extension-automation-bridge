@@ -227,7 +227,7 @@ namespace dmAutomationBridge
 
             float left = -width * node->m_AnchorX;
             float right = left + width;
-            float bottom = -height * node->m_AnchorY;
+            float bottom = -height * (1.0f - node->m_AnchorY);
             float top = bottom + height;
 
             const dmVMath::Vector4 points[] = {
@@ -362,12 +362,10 @@ namespace dmAutomationBridge
                 dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
             }
 
-            dmGraphics::SetBlendFuncSeparate(
+            dmGraphics::SetBlendFunc(
                 graphics_context,
                 (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactor,
-                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactor,
-                (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactorAlpha,
-                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactorAlpha);
+                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactor);
             dmGraphics::SetViewport(graphics_context, viewport_x, viewport_y, viewport_width, viewport_height);
         }
 
@@ -376,11 +374,9 @@ namespace dmAutomationBridge
             dmGraphics::SetViewport(graphics_context, 0, 0, window_width, window_height);
             dmGraphics::EnableState(graphics_context, dmGraphics::STATE_BLEND);
             dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
-            dmGraphics::SetBlendFuncSeparate(
+            dmGraphics::SetBlendFunc(
                 graphics_context,
                 dmGraphics::BLEND_FACTOR_SRC_ALPHA,
-                dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                dmGraphics::BLEND_FACTOR_ONE,
                 dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
 
             dmRender::SetViewMatrix(render_context, dmVMath::Matrix4::identity());
