@@ -48,7 +48,7 @@ PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automat
 `AutomationBridgeClient` is the main entry point.
 
 - Bootstrap: `AutomationBridgeClient(port)`, `from_project(...)`, `from_editor(...)`, and `wait_ready(...)`.
-- Raw API passthrough: `get(path, params=None)` and `post(path, params=None)`.
+- Raw API passthrough: `get(path, params=None)`, `post(path, params=None)`, and `put(path, params=None)`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
 - Input: `click(...)`, `drag(...)`, `type_text(...)`, and `key(...)`.
@@ -210,7 +210,7 @@ bridge.reboot(
 )
 ```
 
-`bridge.resize(width, height)` posts `com.dynamo.render.proto.Render$Resize` to `/post/@render/resize`, then remembers `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
+`bridge.resize(width, height)` calls Automation Bridge's `PUT /screen` endpoint, which sets the native Defold window size, then remembers the returned `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
 
 `bridge.reboot(*args)` posts `com.dynamo.system.proto.System$Reboot` to `/post/@system/reboot`. Defold accepts up to six string arguments; pass the same command-line style arguments you would pass to `sys.reboot(...)` or the editor reboot helper. For editor-launched projects, a bare `bridge.reboot()` may restart without the project or this extension, so pass explicit project/bootstrap args when you expect Automation Bridge to return. By default the wrapper waits for the Automation Bridge endpoint to become ready again; pass `wait=False` when rebooting into a target that will not load this extension.
 

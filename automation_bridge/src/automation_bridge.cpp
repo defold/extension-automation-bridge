@@ -11,6 +11,7 @@
 #if defined(DM_DEBUG)
 
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 namespace dmAutomationBridge
 {
@@ -69,6 +70,7 @@ namespace dmAutomationBridge
     static dmExtension::Result Initialize(dmExtension::Params* params)
     {
         g_AutomationBridge.m_GraphicsContext = (dmGraphics::HContext)ExtensionParamsGetContextByName((ExtensionParams*)params, "graphics");
+        DefoldPrivateApiInitialize(params);
         dmLogInfo("Registered %s extension", LIB_NAME);
         return dmExtension::RESULT_OK;
     }

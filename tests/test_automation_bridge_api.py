@@ -26,7 +26,7 @@ from automation_bridge import (  # noqa: E402
     RemoteryProtocolError,
     wait_until,
 )
-from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
+from automation_bridge.client import _encode_system_reboot  # noqa: E402
 from automation_bridge.profiler import parse_resources_data  # noqa: E402
 from automation_bridge.remotery import (  # noqa: E402
     build_message,
@@ -44,9 +44,6 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         self.assertEqual(0, AutomationBridgeClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
 
-    def test_render_resize_payload(self):
-        self.assertEqual(b"\x08\x80\x08\x10\x80\x06", _encode_render_resize(1024, 768))
-
     def test_system_reboot_payload(self):
         self.assertEqual(b"\x0a\x01a\x12\x02bc", _encode_system_reboot(("a", "bc")))
 
@@ -62,8 +59,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual({"width": 640, "height": 480}, result)
         self.assertEqual((640, 480), bridge.last_window_size)
         self.assertEqual(
-            [("/post/@render/resize", _encode_render_resize(640, 480), None)],
-            bridge.engine_posts,
+            [("PUT", "/screen", {"width": 640, "height": 480})],
+            bridge.api_requests,
         )
 
     def test_orientation_helpers_swap_last_known_size(self):
@@ -77,10 +74,11 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual((320, 568), bridge.last_window_size)
         self.assertEqual(
             [
-                ("/post/@render/resize", _encode_render_resize(568, 320), None),
-                ("/post/@render/resize", _encode_render_resize(320, 568), None),
+                ("GET", "/screen", None),
+                ("PUT", "/screen", {"width": 568, "height": 320}),
+                ("PUT", "/screen", {"width": 320, "height": 568}),
             ],
-            bridge.engine_posts,
+            bridge.api_requests,
         )
 
     def test_reboot_posts_system_reboot_without_waiting(self):
@@ -347,11 +345,19 @@ class FakeEngineClient(AutomationBridgeClient):
     def __init__(self, screen=None):
         super().__init__(12345)
         self.engine_posts = []
+        self.api_requests = []
         self._screen = screen or {"window": {"width": 800, "height": 600}}
         self._engine_info = {"log_port": "0"}
 
     def _request(self, method, path, params=None):
+        self.api_requests.append((method, path, dict(params) if params is not None else None))
         if method == "GET" and path == "/screen":
+            return self._screen
+        if method == "PUT" and path == "/screen":
+            self._screen = {
+                **self._screen,
+                "window": {"width": int(params["width"]), "height": int(params["height"])},
+            }
             return self._screen
         raise AssertionError(f"unexpected request: {method} {path} {params}")
 
@@ -752,9 +758,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
             with self.subTest(run=run_index + 1):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
-                    self.bridge.resize(800, 600, wait=0.3)
+                    resized = self.bridge.resize(800, 600, wait=0.3)
+                    self.assertEqual({"width": 800, "height": 600}, resized)
                     portrait = self.bridge.set_portrait(wait=0.3)
-                    self.assertLessEqual(portrait["width"], portrait["height"])
+                    self.assertEqual({"width": 600, "height": 800}, portrait)
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 

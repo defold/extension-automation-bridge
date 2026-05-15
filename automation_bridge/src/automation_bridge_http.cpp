@@ -1,4 +1,5 @@
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 #if defined(DM_DEBUG)
 
@@ -107,6 +108,29 @@ namespace dmAutomationBridge
         return GetBoolParam(&ctx->m_Query, key, value);
     }
 
+    static bool RequestGetUIntParam(const RequestContext* ctx, const char* key, uint32_t* value)
+    {
+        const char* text = GetParam(&ctx->m_Query, key);
+        if (IsEmpty(text))
+        {
+            return false;
+        }
+        if (!isdigit((unsigned char)text[0]))
+        {
+            return false;
+        }
+
+        char* end = 0;
+        unsigned long parsed = strtoul(text, &end, 10);
+        if (!end || *end != 0 || parsed == 0 || parsed > 0xffffffffUL)
+        {
+            return false;
+        }
+
+        *value = (uint32_t)parsed;
+        return true;
+    }
+
     static const char* RequestGetParam(const RequestContext* ctx, const char* key)
     {
         return GetParam(&ctx->m_Query, key);
@@ -206,7 +230,7 @@ namespace dmAutomationBridge
 #else
         AppendJsonString(&response, "unknown");
 #endif
-        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"input.click\",\"input.drag\",\"input.key\"");
+        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"screen.resize\",\"input.click\",\"input.drag\",\"input.key\"");
         if (IsScreenshotSupported())
         {
             StringBufferAppend(&response, ",\"screenshot\"");
@@ -222,6 +246,33 @@ namespace dmAutomationBridge
     static void HandleScreen(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleScreenPut(RequestContext* ctx)
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (!RequestGetUIntParam(ctx, "width", &width) || !RequestGetUIntParam(ctx, "height", &height))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide positive integer width and height");
+            return;
+        }
+
+        if (!DefoldPrivateApiSetWindowSize(width, height))
+        {
+            RequestSendError(ctx, 500, "screen_resize_failed", "failed to set window size");
+            return;
+        }
+
+        UpdateSnapshot();
+        g_AutomationBridge.m_SnapshotFrame = g_AutomationBridge.m_Frame;
 
         StringBuffer response;
         StringBufferInit(&response);
@@ -538,6 +589,7 @@ namespace dmAutomationBridge
     static const RouteDefinition ROUTES[] = {
         {"/health", "GET", HandleHealth},
         {"/screen", "GET", HandleScreen},
+        {"/screen", "PUT", HandleScreenPut},
         {"/scene", "GET", HandleScene},
         {"/nodes", "GET", HandleNodes},
         {"/node", "GET", HandleNode},
@@ -569,6 +621,7 @@ namespace dmAutomationBridge
             return;
         }
 
+        const char* allowed_method = 0;
         for (uint32_t i = 0; i < DM_ARRAY_SIZE(ROUTES); ++i)
         {
             const RouteDefinition* route = &ROUTES[i];
@@ -578,11 +631,20 @@ namespace dmAutomationBridge
             }
             if (!RequestIsMethod(&ctx, route->m_Method))
             {
-                SendMethodNotAllowed(&ctx, route->m_Method);
-                FreeRequestContext(&ctx);
-                return;
+                if (!allowed_method)
+                {
+                    allowed_method = route->m_Method;
+                }
+                continue;
             }
             route->m_Handler(&ctx);
+            FreeRequestContext(&ctx);
+            return;
+        }
+
+        if (allowed_method)
+        {
+            SendMethodNotAllowed(&ctx, allowed_method);
             FreeRequestContext(&ctx);
             return;
         }

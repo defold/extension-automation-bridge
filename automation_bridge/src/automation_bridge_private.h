@@ -138,6 +138,7 @@ namespace dmAutomationBridge
         dmHID::HContext         m_HidContext;
         dmWebServer::HServer    m_WebServer;
         dmGraphics::HContext    m_GraphicsContext;
+        void*                   m_RenderContext;
         bool                    m_WebHandlerRegistered;
         uint64_t                m_LastTime;
         uint64_t                m_Frame;

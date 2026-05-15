@@ -217,14 +217,6 @@ def _protobuf_varint(value: int) -> bytes:
     return bytes(encoded)
 
 
-def _protobuf_uint32(field: int, value: int) -> bytes:
-    if not isinstance(value, int):
-        raise TypeError(f"uint32 field {field} must be int, got {type(value).__name__}")
-    if value < 0 or value > _UINT32_MAX:
-        raise ValueError(f"uint32 field {field} out of range: {value}")
-    return _protobuf_varint(field << 3) + _protobuf_varint(value)
-
-
 def _protobuf_string(field: int, value: str) -> bytes:
     if not isinstance(value, str):
         raise TypeError(f"string field {field} must be str, got {type(value).__name__}")
@@ -232,12 +224,13 @@ def _protobuf_string(field: int, value: str) -> bytes:
     return _protobuf_varint((field << 3) | 2) + _protobuf_varint(len(encoded)) + encoded
 
 
-def _encode_render_resize(width: int, height: int) -> bytes:
+def _validate_screen_size(width: int, height: int) -> None:
     if not isinstance(width, int) or not isinstance(height, int):
         raise TypeError(f"resize dimensions must be ints, got {type(width).__name__}x{type(height).__name__}")
     if width <= 0 or height <= 0:
         raise ValueError(f"resize dimensions must be positive, got {width}x{height}")
-    return _protobuf_uint32(1, width) + _protobuf_uint32(2, height)
+    if width > _UINT32_MAX or height > _UINT32_MAX:
+        raise ValueError(f"resize dimensions must fit uint32, got {width}x{height}")
 
 
 def _encode_system_reboot(args: Sequence[str]) -> bytes:
@@ -366,6 +359,10 @@ class AutomationBridgeClient:
     def post(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
         """POST an Automation Bridge API path with query parameters and return `data`."""
         return self._request("POST", path, params)
+
+    def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
+        """PUT an Automation Bridge API path with query parameters and return `data`."""
+        return self._request("PUT", path, params)
 
     def health(self) -> JsonDict:
         """Return API version, capabilities, platform, and screen data."""
@@ -574,12 +571,19 @@ class AutomationBridgeClient:
         return self._last_window_size
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
-        """Resize the Defold window through `/post/@render/resize` and remember the new size."""
-        payload = _encode_render_resize(width, height)
-        self._post_engine_message("/post/@render/resize", payload)
-        self._last_window_size = (width, height)
+        """Resize the Defold window through `PUT /screen` and remember the new size."""
+        _validate_screen_size(width, height)
+        screen = self.put("/screen", {"width": width, "height": height})
+        self._remember_window_size(screen)
         if wait:
             time.sleep(wait)
+        window = screen.get("window") if isinstance(screen, Mapping) else None
+        if isinstance(window, Mapping):
+            screen_width = window.get("width")
+            screen_height = window.get("height")
+            if isinstance(screen_width, int) and isinstance(screen_height, int):
+                width = screen_width
+                height = screen_height
         return {"width": width, "height": height}
 
     def set_portrait(self, wait: float = 0.25) -> JsonDict:

@@ -1,4 +1,5 @@
 #include "automation_bridge_private.h"
+#include "automation_bridge_defold_private_api.h"
 
 #if defined(DM_DEBUG)
 
@@ -268,7 +269,7 @@ namespace dmAutomationBridge
         }
     }
 
-    static void ComputeBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t display_w, uint32_t display_h)
+    static void ComputeFallbackBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t display_w, uint32_t display_h)
     {
         if (!node->m_HasPosition || screen_w == 0 || screen_h == 0)
         {
@@ -390,7 +391,15 @@ namespace dmAutomationBridge
             SetString(&node.m_Parent, snapshot->m_Nodes.m_Data[parent_index].m_Id);
         }
 
-        ComputeBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_DisplayWidth, snapshot->m_DisplayHeight);
+        Bounds private_bounds;
+        if (DefoldPrivateApiComputeBounds(scene_node, &node, snapshot, &private_bounds))
+        {
+            node.m_Bounds = private_bounds;
+        }
+        else
+        {
+            ComputeFallbackBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_DisplayWidth, snapshot->m_DisplayHeight);
+        }
 
         uint32_t index = snapshot->m_Nodes.m_Count;
         if (!ArrayPush(&snapshot->m_Nodes, &node))
