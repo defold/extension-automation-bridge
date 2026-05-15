@@ -161,6 +161,20 @@ def request_json(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[
     return status, parsed
 
 
+def request_raw(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[int, bytes]:
+    """Request raw bytes and return `(status, body)`."""
+    request = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.getcode(), response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except urllib.error.URLError as exc:
+        raise HttpError(method, url, str(exc)) from exc
+    except OSError as exc:
+        raise HttpError(method, url, str(exc)) from exc
+
+
 def request_bytes(url: str, data: bytes, method: str = "POST", timeout: float = 10.0) -> Tuple[int, bytes]:
     """POST bytes and return `(status, body)`."""
     request = urllib.request.Request(url, data=data, method=method)
@@ -528,6 +542,13 @@ class AutomationBridgeClient:
                 if line is not None:
                     lines.append(line)
         return lines
+
+    @property
+    def profiler(self) -> "ProfilerClient":
+        """Return a client for Defold's built-in engine profiler endpoints."""
+        from .profiler import ProfilerClient
+
+        return ProfilerClient(self.port, timeout=self.timeout)
 
     @property
     def last_window_size(self) -> Optional[Tuple[int, int]]:

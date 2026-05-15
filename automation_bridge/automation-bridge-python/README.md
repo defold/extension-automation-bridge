@@ -179,6 +179,19 @@ recent = bridge.read_logs(duration=2.0, limit=20)
 
 `bridge.log_stream()` discovers the log port from engine `/info`, performs Defold's `0 OK` log-service handshake, and then yields plain log lines without trailing newlines. The stream only receives logs emitted after it connects; use `EditorClient.console_lines()` when you need the editor's existing console history.
 
+## Profiler
+
+Read Defold's built-in resource profiler data from `/resources_data`:
+
+```python
+resources = bridge.profiler.resources()
+for resource in resources:
+    print(resource.name, resource.type, resource.size, resource.size_on_disc, resource.ref_count)
+```
+
+`resources()` returns `ResourceProfileEntry` objects. `size` is the in-memory size reported by Defold, falling back to size on disc when the engine does not report a separate memory size.
+The returned list is sorted by `size` from largest to smallest.
+
 ## Errors
 
 All custom errors inherit from `AutomationBridgeError`.
@@ -186,3 +199,4 @@ All custom errors inherit from `AutomationBridgeError`.
 - `HttpError`: transport failures or invalid JSON.
 - `AutomationBridgeApiError`: extension returned `{ "ok": false }`.
 - `SelectorError`: `node()` or `maybe_node()` found the wrong number of nodes.
+- `ProfilerDataError`: a Defold profiler endpoint returned malformed or unexpected binary data.

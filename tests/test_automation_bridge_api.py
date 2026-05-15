@@ -10,8 +10,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import AutomationBridgeApiError, AutomationBridgeClient, EditorClient, EngineLogStream, wait_until  # noqa: E402
+from automation_bridge import (  # noqa: E402
+    AutomationBridgeApiError,
+    AutomationBridgeClient,
+    EditorClient,
+    EngineLogStream,
+    ProfilerClient,
+    ProfilerDataError,
+    wait_until,
+)
 from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
+from automation_bridge.profiler import parse_resources_data  # noqa: E402
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
@@ -87,6 +96,47 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 bridge.read_logs(duration=1.0, limit=2, idle_timeout=0.05),
             )
 
+    def test_profiler_accessor_uses_engine_port(self):
+        bridge = AutomationBridgeClient(12345, timeout=3.0)
+
+        profiler = bridge.profiler
+
+        self.assertIsInstance(profiler, ProfilerClient)
+        self.assertEqual(12345, profiler.port)
+        self.assertEqual(3.0, profiler.timeout)
+
+    def test_profiler_resources_requests_resources_data(self):
+        payload = _resources_payload()
+        with FakeHttpServer(payload) as server:
+            resources = ProfilerClient(server.port, timeout=1.0).resources()
+
+        self.assertEqual("GET /resources_data HTTP/1.1", server.request_line)
+        self.assertEqual("/assets/player.texturec", resources[0].name)
+        self.assertEqual(8192, resources[0].size)
+        self.assertEqual("/main/main.collectionc", resources[1].name)
+        self.assertEqual(4096, resources[1].size)
+
+    def test_parse_resources_data(self):
+        resources = parse_resources_data(_resources_payload())
+
+        self.assertEqual(2, len(resources))
+        self.assertEqual("/main/main.collectionc", resources[0].name)
+        self.assertEqual(".collectionc", resources[0].type)
+        self.assertEqual(4096, resources[0].size)
+        self.assertEqual(1024, resources[0].size_on_disc)
+        self.assertEqual(2, resources[0].ref_count)
+        self.assertEqual("/assets/player.texturec", resources[1].name)
+
+    def test_parse_resources_data_rejects_unexpected_tag(self):
+        with self.assertRaisesRegex(ProfilerDataError, "unexpected resource profiler tag"):
+            parse_resources_data(_profiler_string("GOBJ"))
+
+    def test_parse_resources_data_rejects_truncated_record(self):
+        payload = _profiler_string("RESS") + _profiler_string("/main/main.collectionc") + b"\x08"
+
+        with self.assertRaisesRegex(ProfilerDataError, "truncated profiler data"):
+            parse_resources_data(payload)
+
 
 class FakeEngineClient(AutomationBridgeClient):
     def __init__(self, screen=None):
@@ -106,6 +156,27 @@ class FakeEngineClient(AutomationBridgeClient):
 
     def engine_info(self):
         return self._engine_info
+
+
+def _profiler_string(value):
+    encoded = value.encode("utf-8")
+    return len(encoded).to_bytes(2, "little") + encoded
+
+
+def _resources_payload():
+    return (
+        _profiler_string("RESS")
+        + _profiler_string("/main/main.collectionc")
+        + _profiler_string(".collectionc")
+        + (4096).to_bytes(4, "little")
+        + (1024).to_bytes(4, "little")
+        + (2).to_bytes(4, "little")
+        + _profiler_string("/assets/player.texturec")
+        + _profiler_string(".texturec")
+        + (8192).to_bytes(4, "little")
+        + (2048).to_bytes(4, "little")
+        + (1).to_bytes(4, "little")
+    )
 
 
 class FakeLogServer:
@@ -137,6 +208,49 @@ class FakeLogServer:
             with client:
                 for chunk in self.chunks:
                     client.sendall(chunk)
+        except OSError as exc:
+            self._error = exc
+
+
+class FakeHttpServer:
+    def __init__(self, body, status=200, reason="OK"):
+        self.body = body
+        self.status = status
+        self.reason = reason
+        self.port = 0
+        self.request_line = None
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._thread = None
+        self._error = None
+
+    def __enter__(self):
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self.port = self._socket.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._socket.close()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if exc_type is None and self._error:
+            raise self._error
+
+    def _serve(self):
+        try:
+            client, _ = self._socket.accept()
+            with client:
+                request = client.recv(4096).decode("iso-8859-1", "replace")
+                self.request_line = request.splitlines()[0] if request else ""
+                headers = (
+                    f"HTTP/1.1 {self.status} {self.reason}\r\n"
+                    f"Content-Length: {len(self.body)}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ).encode("ascii")
+                client.sendall(headers + self.body)
         except OSError as exc:
             self._error = exc
 

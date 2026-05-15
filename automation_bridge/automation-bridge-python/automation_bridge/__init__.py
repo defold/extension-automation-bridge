@@ -3,6 +3,7 @@
 from .client import AutomationBridgeApiError, AutomationBridgeClient, AutomationBridgeError, EngineLogStream, HttpError, SelectorError
 from .editor import EditorClient
 from .nodes import Bounds, Node
+from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
 from .waits import wait_until
 
 
@@ -15,6 +16,10 @@ __all__ = [
     "EditorClient",
     "HttpError",
     "Node",
+    "ProfilerClient",
+    "ProfilerDataError",
+    "ResourceProfileEntry",
     "SelectorError",
+    "parse_resources_data",
     "wait_until",
 ]
