@@ -117,6 +117,36 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             bridge.api_requests,
         )
 
+    def test_resize_rejects_oversized_dimensions_before_request(self):
+        bridge = FakeEngineClient()
+
+        with self.assertRaises(ValueError):
+            bridge.resize(0x80000000, 480, wait=0)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_click_visualize_false_is_encoded(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+
+            bridge.click(10, 20, wait=0, visualize=False)
+
+        self.assertEqual(
+            "POST /automation-bridge/v1/input/click?x=10&y=20&visualize=0 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_drag_visualize_false_is_encoded(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"drag"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+
+            bridge.drag((10, 20), (30, 40), duration=0.1, wait=0, visualize=False)
+
+        self.assertEqual(
+            "POST /automation-bridge/v1/input/drag?x1=10&y1=20&x2=30&y2=40&duration=0.1&visualize=0 HTTP/1.1",
+            server.request_line,
+        )
+
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
 
@@ -812,10 +842,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
             with self.subTest(run=run_index + 1):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
-                    resized = self.bridge.resize(800, 600, wait=0.3)
-                    self.assertEqual({"width": 800, "height": 600}, resized)
-                    portrait = self.bridge.set_portrait(wait=0.3)
-                    self.assertEqual({"width": 600, "height": 800}, portrait)
+                    if self.supports_capability("screen.resize"):
+                        resized = self.bridge.resize(800, 600, wait=0.3)
+                        self.assertEqual({"width": 800, "height": 600}, resized)
+                        portrait = self.bridge.set_portrait(wait=0.3)
+                        self.assertEqual({"width": 600, "height": 800}, portrait)
+                    else:
+                        print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
@@ -844,16 +877,28 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.reset_if_popup_is_visible()
         screen = self.bridge.screen()
         window = screen["window"]
-        start = (window["width"] * 0.25, window["height"] * 0.35)
-        end = (window["width"] * 0.75, window["height"] * 0.65)
+        y = max(4, window["height"] - 16)
+        start = (max(4, window["width"] * 0.15), y)
+        end = (min(window["width"] - 4, window["width"] * 0.85), y)
 
         self.bridge.drag(start, end, duration=1.0, wait=0)
-        time.sleep(0.15)
-        screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
-        orange_pixels = _count_orange_debug_pixels(screenshot_path)
-        print(f"DRAG_VISUALIZATION_SCREENSHOT {screenshot_path} orange_pixels={orange_pixels}")
+        last_observation = {"path": None, "orange_pixels": 0}
+
+        def visible_overlay():
+            screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+            orange_pixels = _count_orange_debug_pixels(screenshot_path)
+            last_observation["path"] = screenshot_path
+            last_observation["orange_pixels"] = orange_pixels
+            print(f"DRAG_VISUALIZATION_SCREENSHOT {screenshot_path} orange_pixels={orange_pixels}")
+            return orange_pixels if orange_pixels > 20 else None
 
         try:
+            orange_pixels = wait_until(
+                visible_overlay,
+                timeout=1.2,
+                interval=0.05,
+                message=f"drag visualization was not visible: {last_observation}",
+            )
             self.assertGreater(orange_pixels, 20)
         finally:
             time.sleep(1.0)
@@ -941,6 +986,9 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
         self.__class__.bridge = self.bridge
         self.bridge.wait_ready()
+
+    def supports_capability(self, capability):
+        return capability in self.bridge.health().get("capabilities", [])
 
     def record_sprite_counter(self, observations, label):
         scene_count = self.bridge.count(type="spritec")

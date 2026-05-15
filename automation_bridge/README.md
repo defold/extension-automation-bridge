@@ -139,7 +139,7 @@ curl -fsS "$BASE/screen" | python3 -m json.tool
 
 ### `PUT /automation-bridge/v1/screen`
 
-Sets the native Defold window size and returns updated screen metadata.
+Sets the native Defold window size and returns updated screen metadata. This endpoint is available when `GET /health` reports the `screen.resize` capability.
 
 Query parameters:
 

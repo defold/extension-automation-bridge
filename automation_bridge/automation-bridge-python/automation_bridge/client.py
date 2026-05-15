@@ -20,7 +20,7 @@ from .waits import wait_until
 JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _INPUT_SETTLE_SECONDS = 0.1
-_UINT32_MAX = 0xFFFFFFFF
+_SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 
 
 class AutomationBridgeError(RuntimeError):
@@ -229,8 +229,8 @@ def _validate_screen_size(width: int, height: int) -> None:
         raise TypeError(f"resize dimensions must be ints, got {type(width).__name__}x{type(height).__name__}")
     if width <= 0 or height <= 0:
         raise ValueError(f"resize dimensions must be positive, got {width}x{height}")
-    if width > _UINT32_MAX or height > _UINT32_MAX:
-        raise ValueError(f"resize dimensions must fit uint32, got {width}x{height}")
+    if width > _SCREEN_DIMENSION_MAX or height > _SCREEN_DIMENSION_MAX:
+        raise ValueError(f"resize dimensions must fit platform window limits, got {width}x{height}")
 
 
 def _encode_system_reboot(args: Sequence[str]) -> bytes:

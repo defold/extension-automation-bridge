@@ -215,11 +215,25 @@ namespace dmAutomationBridge
 
             return SetBoundsFromAccumulator(min_x, min_y, max_x, max_y, snapshot, out_bounds);
         }
+
+        static HWindow GetAutomationBridgeWindow()
+        {
+            if (!g_AutomationBridge.m_GraphicsContext)
+            {
+                return 0;
+            }
+            return dmGraphics::GetWindow(g_AutomationBridge.m_GraphicsContext);
+        }
     }
 
     void DefoldPrivateApiInitialize(dmExtension::Params* params)
     {
         g_AutomationBridge.m_RenderContext = params ? ExtensionParamsGetContextByName((ExtensionParams*)params, "render") : 0;
+    }
+
+    bool DefoldPrivateApiCanSetWindowSize()
+    {
+        return GetAutomationBridgeWindow() != 0;
     }
 
     bool DefoldPrivateApiSetWindowSize(uint32_t width, uint32_t height)
@@ -229,7 +243,7 @@ namespace dmAutomationBridge
             return false;
         }
 
-        HWindow window = dmGraphics::GetWindow(g_AutomationBridge.m_GraphicsContext);
+        HWindow window = GetAutomationBridgeWindow();
         if (!window)
         {
             return false;
@@ -238,7 +252,7 @@ namespace dmAutomationBridge
         // Defold reports screen/window metadata in framebuffer pixels, while
         // GLFW's platform setter takes window coordinates on high-DPI displays.
         float scale = dmPlatform::GetDisplayScaleFactor(window);
-        if (!IsFiniteFloat(scale) || scale <= 0.0f)
+        if (!IsFiniteFloat(scale) || scale < 1.0f)
         {
             scale = 1.0f;
         }

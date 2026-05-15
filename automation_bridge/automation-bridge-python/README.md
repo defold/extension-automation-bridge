@@ -89,18 +89,21 @@ bridge.wait_ready()
 
 ## Raw API and Scene Data
 
-Use the named helpers for normal scripts, or `get()` and `post()` when you need direct access to a new native endpoint shape:
+Use the named helpers for normal scripts:
 
 ```python
 health = bridge.health()
 screen = bridge.screen()
 scene = bridge.scene(visible=True, include=["bounds", "properties"])
 
-raw_count = bridge.get("/nodes", {"type": "labelc", "limit": 0})["matched"]
-bridge.post("/input/click", {"x": 480, "y": 320})
+label_count = bridge.count(type="labelc")
+bridge.click(480, 320)
+bridge.resize(1280, 720)
 ```
 
 `health()` and `screen()` update `bridge.last_window_size` from the engine response. `scene()` returns the full native scene-tree payload with `count`, `visible_filter`, `screen`, and `root`.
+
+Raw `get()`, `post()`, and `put()` are available for curl-level debugging or endpoints that do not have named wrapper methods yet.
 
 ## Selectors
 
