@@ -603,10 +603,7 @@ class AutomationBridgeClient:
         self._last_window_size = None
         if wait:
             wait_timeout = self.timeout if timeout is None else timeout
-            time.sleep(0.1)
-            if not self._wait_until_unavailable(wait_timeout):
-                raise AutomationBridgeError("engine did not become unavailable after reboot request")
-            self.wait_ready(timeout=wait_timeout)
+            self._wait_ready_after_reboot(wait_timeout)
 
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
@@ -644,6 +641,40 @@ class AutomationBridgeClient:
                 return True
             time.sleep(0.05)
         return False
+
+    def _wait_ready_after_reboot(self, timeout: float) -> JsonDict:
+        deadline = time.monotonic() + timeout
+        accept_ready_after = time.monotonic() + min(0.25, max(0.0, timeout) / 2.0)
+        saw_unavailable = False
+        last_error: Optional[BaseException] = None
+
+        while time.monotonic() <= deadline:
+            try:
+                data = self.health()
+            except AutomationBridgeError as exc:
+                saw_unavailable = True
+                last_error = exc
+            else:
+                if saw_unavailable or time.monotonic() >= accept_ready_after:
+                    return data
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.05, remaining))
+
+        try:
+            data = self.health()
+        except AutomationBridgeError as exc:
+            last_error = exc
+        else:
+            if saw_unavailable or time.monotonic() >= accept_ready_after:
+                return data
+
+        message = "Automation Bridge endpoint did not become ready after reboot"
+        if last_error:
+            raise AssertionError(f"{message}: {last_error}") from last_error
+        raise AssertionError(message)
 
     def _terminate_process_on_port(self, timeout: float) -> bool:
         for pid in self._listening_pids(self.port):

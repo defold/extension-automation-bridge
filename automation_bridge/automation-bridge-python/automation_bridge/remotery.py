@@ -3,6 +3,7 @@
 import base64
 import fnmatch
 import hashlib
+import math
 import os
 import re
 import socket
@@ -1084,6 +1085,13 @@ class _Reader:
         return struct.unpack_from("<d", self.read_bytes(8, label))[0]
 
 
+def _read_integer_f64(reader: _Reader, label: str) -> int:
+    value = reader.read_f64(label)
+    if not math.isfinite(value) or not value.is_integer():
+        raise RemoteryProtocolError(f"invalid integer value for {label}: {value!r}")
+    return int(value)
+
+
 def parse_message(data: bytes) -> Tuple[str, bytes]:
     """Parse one Remotery websocket payload into `(message_id, body)`."""
     if len(data) < 8:
@@ -1167,10 +1175,10 @@ def _read_sample(reader: _Reader, names: Mapping[int, str]) -> RemoterySample:
         reader.read_u8("sample blue"),
     )
     depth = reader.read_u8("sample depth")
-    start_us = reader.read_u64("sample start")
-    duration_us = reader.read_u64("sample duration")
-    self_us = reader.read_u64("sample self time")
-    gpu_to_cpu_us = reader.read_u64("sample gpu-to-cpu time")
+    start_us = _read_integer_f64(reader, "sample start")
+    duration_us = _read_integer_f64(reader, "sample duration")
+    self_us = _read_integer_f64(reader, "sample self time")
+    gpu_to_cpu_us = _read_integer_f64(reader, "sample gpu-to-cpu time")
     call_count = reader.read_u32("sample call count")
     max_recursion_depth = reader.read_u32("sample max recursion depth")
     child_count = reader.read_u32("sample child count")
@@ -1228,9 +1236,13 @@ def _read_property_values(reader: _Reader, property_type: int) -> Tuple[NumericV
     if property_type in (4, 7):
         return reader.read_f64("float property value"), reader.read_f64("float previous property value")
     if property_type == 5:
-        return reader.read_s64("s64 property value"), reader.read_s64("s64 previous property value")
+        return _read_integer_f64(reader, "s64 property value"), _read_integer_f64(
+            reader, "s64 previous property value"
+        )
     if property_type == 6:
-        return reader.read_u64("u64 property value"), reader.read_u64("u64 previous property value")
+        return _read_integer_f64(reader, "u64 property value"), _read_integer_f64(
+            reader, "u64 previous property value"
+        )
     raise RemoteryProtocolError(f"unknown Remotery property type: {property_type}")
 
 

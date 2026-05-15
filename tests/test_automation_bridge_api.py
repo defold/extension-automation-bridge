@@ -92,13 +92,19 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             bridge.engine_posts,
         )
 
-    def test_reboot_wait_requires_engine_to_go_unavailable(self):
-        bridge = RebootNeverUnavailableClient()
+    def test_reboot_wait_accepts_endpoint_that_stays_available(self):
+        bridge = RebootReadyClient()
 
-        with self.assertRaisesRegex(AutomationBridgeError, "did not become unavailable"):
-            bridge.reboot("build/game.projectc", timeout=0.01)
+        bridge.reboot("build/game.projectc", timeout=0.02)
 
-        self.assertFalse(bridge.wait_ready_called)
+        self.assertGreaterEqual(bridge.health_calls, 1)
+
+    def test_reboot_wait_accepts_endpoint_after_temporary_outage(self):
+        bridge = RebootReadyClient(failures=1)
+
+        bridge.reboot("build/game.projectc", timeout=0.05)
+
+        self.assertGreaterEqual(bridge.health_calls, 2)
 
     def test_fresh_build_ignores_cached_remotery_url(self):
         class FakeEditor:
@@ -274,6 +280,22 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual("group", capture.counters(name="Memory", include_groups=True)[0].type)
         self.assertEqual(["Memory/Used"], [entry.path for entry in second.find("used", include_groups=False)])
 
+    def test_parse_remotery_integer64_properties_from_writer_format(self):
+        body = (
+            struct.pack("<II", 2, 7)
+            + _remotery_property(200, 2000, 0, 5, 42, previous_value=40, previous_value_frame=6)
+            + _remotery_property(201, 2001, 0, 6, 1234567890123, previous_value=1234567890000, previous_value_frame=6)
+        )
+
+        frame = parse_property_frame(body, {200: "Signed", 201: "Unsigned"})
+
+        self.assertEqual("s64", frame.properties[0].type)
+        self.assertEqual(42, frame.properties[0].value)
+        self.assertEqual(40, frame.properties[0].previous_value)
+        self.assertEqual("u64", frame.properties[1].type)
+        self.assertEqual(1234567890123, frame.properties[1].value)
+        self.assertEqual(1234567890000, frame.properties[1].previous_value)
+
     def test_remotery_client_get_frame_resolves_sample_names(self):
         sample_message = build_message("SMPL", _remotery_sample_frame_body())
         with FakeRemoteryServer(sample_message, {1: "Frame", 2: "Update"}) as server:
@@ -331,17 +353,17 @@ class FakeEngineClient(AutomationBridgeClient):
         return self._engine_info
 
 
-class RebootNeverUnavailableClient(FakeEngineClient):
-    def __init__(self):
+class RebootReadyClient(FakeEngineClient):
+    def __init__(self, failures=0):
         super().__init__()
-        self.wait_ready_called = False
+        self.failures = failures
+        self.health_calls = 0
 
-    def _wait_until_unavailable(self, timeout):
-        return False
-
-    def wait_ready(self, timeout=20.0):
-        self.wait_ready_called = True
-        return {}
+    def health(self):
+        self.health_calls += 1
+        if self.health_calls <= self.failures:
+            raise AutomationBridgeError("engine is rebooting")
+        return {"version": "1"}
 
 
 def _profiler_string(value):
@@ -410,7 +432,7 @@ def _remotery_sample(
 ):
     return (
         struct.pack(
-            "<II4BQQQQIII",
+            "<II4BddddIII",
             name_hash,
             unique_id,
             colour[0],
@@ -462,12 +484,8 @@ def _remotery_property(
 ):
     if property_type == 0:
         values = b"\x00" * 16
-    elif property_type in (1, 2, 3, 4, 7):
+    elif property_type in (1, 2, 3, 4, 5, 6, 7):
         values = struct.pack("<dd", value, previous_value)
-    elif property_type == 5:
-        values = struct.pack("<qq", value, previous_value)
-    elif property_type == 6:
-        values = struct.pack("<QQ", value, previous_value)
     else:
         raise ValueError(f"unsupported property type: {property_type}")
     return (
@@ -732,11 +750,23 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     def test_drag_negative_duration_is_clamped_in_response(self):
         self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
 
-        response = self.bridge.drag((1, 1), (2, 2), duration=-0.25, wait=0.2)
+        start_count = self.label_count("L1")
+        self.bridge.click(spawner)
+        wait_until(lambda: self.label_count("L1") > start_count, timeout=2, message="first negative-drag item missing")
+        self.bridge.click(spawner.center)
+        wait_until(lambda: self.label_count("L1") > start_count + 1, timeout=2, message="second negative-drag item missing")
+
+        before = self.label_count("L1")
+        first, second = self.parents_for_label("L1")[:2]
+
+        response = self.bridge.drag(first, second, duration=-0.25, wait=0.2)
 
         self.assertEqual("drag", response["queued"])
         self.assertEqual(0, response["duration"])
+        self.wait_for_merge("L1", before, "L2")
 
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
