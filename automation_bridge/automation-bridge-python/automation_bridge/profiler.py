@@ -159,12 +159,16 @@ def parse_resources_data(data: bytes) -> List[ResourceProfileEntry]:
 
     resources: List[ResourceProfileEntry] = []
     while not reader.eof():
+        name = reader.read_string("resource name")
+        resource_type = reader.read_string("resource type")
+        size = reader.read_u32("resource size")
+        size_on_disc = reader.read_u32("resource size on disc")
         resources.append(
             ResourceProfileEntry(
-                name=reader.read_string("resource name"),
-                type=reader.read_string("resource type"),
-                size=reader.read_u32("resource size"),
-                size_on_disc=reader.read_u32("resource size on disc"),
+                name=name,
+                type=resource_type,
+                size=size if size > 0 else size_on_disc,
+                size_on_disc=size_on_disc,
                 ref_count=reader.read_u32("resource reference count"),
             )
         )

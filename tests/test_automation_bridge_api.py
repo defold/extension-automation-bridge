@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 from automation_bridge import (  # noqa: E402
     AutomationBridgeApiError,
     AutomationBridgeClient,
+    AutomationBridgeError,
     EditorClient,
     EngineLogStream,
     ProfilerClient,
@@ -91,6 +92,28 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             bridge.engine_posts,
         )
 
+    def test_reboot_wait_requires_engine_to_go_unavailable(self):
+        bridge = RebootNeverUnavailableClient()
+
+        with self.assertRaisesRegex(AutomationBridgeError, "did not become unavailable"):
+            bridge.reboot("build/game.projectc", timeout=0.01)
+
+        self.assertFalse(bridge.wait_ready_called)
+
+    def test_fresh_build_ignores_cached_remotery_url(self):
+        class FakeEditor:
+            def latest_registration_remotery_urls(self):
+                return []
+
+            def remotery_url(self):
+                return "ws://127.0.0.1:17815/rmt"
+
+        self.assertIsNone(AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=True))
+        self.assertEqual(
+            "ws://127.0.0.1:17815/rmt",
+            AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=False),
+        )
+
     def test_engine_log_stream_reads_lines(self):
         with FakeLogServer([b"0 OK\n", b"INFO:TEST: hello\n", b"WARNING:TEST: done\n"]) as server:
             with EngineLogStream("127.0.0.1", server.port, timeout=1.0, read_timeout=1.0) as logs:
@@ -144,6 +167,21 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(1024, resources[0].size_on_disc)
         self.assertEqual(2, resources[0].ref_count)
         self.assertEqual("/assets/player.texturec", resources[1].name)
+
+    def test_parse_resources_data_uses_disc_size_when_memory_size_is_missing(self):
+        payload = (
+            _profiler_string("RESS")
+            + _profiler_string("/dynamic.texturec")
+            + _profiler_string(".texturec")
+            + (0).to_bytes(4, "little")
+            + (2048).to_bytes(4, "little")
+            + (1).to_bytes(4, "little")
+        )
+
+        resources = parse_resources_data(payload)
+
+        self.assertEqual(2048, resources[0].size)
+        self.assertEqual(2048, resources[0].size_on_disc)
 
     def test_parse_resources_data_rejects_unexpected_tag(self):
         with self.assertRaisesRegex(ProfilerDataError, "unexpected resource profiler tag"):
@@ -210,7 +248,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(8.0, update.total.median_ms)
         self.assertEqual(8.9, update.total.p95_ms)
         self.assertEqual(["Frame/Update"], [entry.path for entry in capture.scopes(path="Frame/*")])
-        self.assertEqual(["Frame/Update"], [entry.path for entry in capture.scopes(regex="Update")])
+        self.assertEqual(["Frame/Update"], [entry.path for entry in capture.scopes(regex="update")])
+        self.assertEqual([], capture.scopes(regex="update", case_sensitive=True))
 
     def test_remotery_capture_counter_stats_filter_and_aggregate_snapshots(self):
         names = {100: "Memory", 101: "Used"}
@@ -229,6 +268,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(138.0, used.values.p95)
         self.assertEqual(["Memory/Used"], [entry.path for entry in capture.counters(path="Memory/*")])
         self.assertEqual(["Memory/Used"], [entry.path for entry in capture.counters(contains="used")])
+        self.assertEqual(["Memory/Used"], [entry.path for entry in capture.counters(regex="used")])
+        self.assertEqual([], capture.counters(regex="used", case_sensitive=True))
         self.assertEqual([], capture.counters(name="Memory"))
         self.assertEqual("group", capture.counters(name="Memory", include_groups=True)[0].type)
         self.assertEqual(["Memory/Used"], [entry.path for entry in second.find("used", include_groups=False)])
@@ -288,6 +329,19 @@ class FakeEngineClient(AutomationBridgeClient):
 
     def engine_info(self):
         return self._engine_info
+
+
+class RebootNeverUnavailableClient(FakeEngineClient):
+    def __init__(self):
+        super().__init__()
+        self.wait_ready_called = False
+
+    def _wait_until_unavailable(self, timeout):
+        return False
+
+    def wait_ready(self, timeout=20.0):
+        self.wait_ready_called = True
+        return {}
 
 
 def _profiler_string(value):
@@ -626,7 +680,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         cls.bridge = None
         port = os.environ.get("AUTOMATION_BRIDGE_ENGINE_PORT")
         if port:
-            cls.bridge = AutomationBridgeClient(int(port))
+            remotery_url = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_URL")
+            remotery_port = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_PORT")
+            if remotery_url is None and remotery_port:
+                remotery_url = f"ws://127.0.0.1:{remotery_port}/rmt"
+            cls.bridge = AutomationBridgeClient(int(port), remotery_url=remotery_url)
             cls.bridge.wait_ready()
             return
 
@@ -642,6 +700,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
         bridge = cls.bridge
         cls.bridge = None
         bridge.close_engine()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.close_bridge()
 
     def setUp(self):
         if self.bridge:
@@ -661,15 +723,25 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 previous_port = self.bridge.port
 
             with self.subTest(run=run_index + 1):
-                if run_index == 1:
+                if run_index == 1 or (run_index == 0 and self.editor is None):
                     self.bridge.resize(800, 600, wait=0.3)
                     portrait = self.bridge.set_portrait(wait=0.3)
                     self.assertLessEqual(portrait["width"], portrait["height"])
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
+    def test_drag_negative_duration_is_clamped_in_response(self):
+        self.ensure_running_bridge()
+
+        response = self.bridge.drag((1, 1), (2, 2), duration=-0.25, wait=0.2)
+
+        self.assertEqual("drag", response["queued"])
+        self.assertEqual(0, response["duration"])
+
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
+        if self.editor is None and self.bridge.remotery_url is None:
+            raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for Remotery tests")
         self.reset_if_popup_is_visible()
         spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
         observations = []

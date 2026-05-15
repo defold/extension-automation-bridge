@@ -419,7 +419,7 @@ class RemoteryCapture:
     ) -> List[RemoteryScopeStats]:
         """Return scope statistics filtered by name, path, thread, text, or regex."""
         rows: Dict[Tuple[str, str, int], Dict[str, object]] = {}
-        pattern = re.compile(regex) if regex is not None else None
+        pattern = _compile_regex(regex, case_sensitive)
         for frame_index, frame in enumerate(self.frames):
             if thread is not None and frame.thread_name != thread:
                 continue
@@ -483,7 +483,7 @@ class RemoteryCapture:
     ) -> List[RemoteryCounterStats]:
         """Return counter/property statistics filtered by name, path, text, or regex."""
         rows: Dict[Tuple[str, int], Dict[str, object]] = {}
-        pattern = re.compile(regex) if regex is not None else None
+        pattern = _compile_regex(regex, case_sensitive)
         for frame in self.property_frames:
             for prop_path, prop in _walk_properties_with_paths(frame.properties):
                 if prop.type == "group" and not include_groups:
@@ -1334,6 +1334,13 @@ def _matches_path(value: str, selector: str) -> bool:
     if "*" in selector or "?" in selector or "[" in selector:
         return fnmatch.fnmatchcase(value, selector)
     return value == selector
+
+
+def _compile_regex(regex: Optional[str], case_sensitive: bool) -> Optional[re.Pattern]:
+    if regex is None:
+        return None
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.compile(regex, flags)
 
 
 def _scope_stats_from_entry(entry: Mapping[str, object]) -> RemoteryScopeStats:

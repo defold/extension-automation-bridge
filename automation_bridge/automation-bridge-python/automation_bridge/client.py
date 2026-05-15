@@ -283,7 +283,7 @@ class AutomationBridgeClient:
 
         def bridge_after_build() -> Optional["AutomationBridgeClient"]:
             service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
-            remotery_url = editor.remotery_url() if hasattr(editor, "remotery_url") else None
+            remotery_url = cls._editor_remotery_url(editor, fresh_build=build)
             for service_port in service_ports:
                 if not service_port:
                     continue
@@ -332,6 +332,15 @@ class AutomationBridgeClient:
         if not hasattr(editor, "last_build_had_engine_service_port"):
             return False
         return editor.last_build_had_engine_service_port() is False
+
+    @staticmethod
+    def _editor_remotery_url(editor: Any, fresh_build: bool) -> Optional[str]:
+        if fresh_build and hasattr(editor, "latest_registration_remotery_urls"):
+            urls = editor.latest_registration_remotery_urls()
+            return urls[0] if urls else None
+        if hasattr(editor, "remotery_url"):
+            return editor.remotery_url()
+        return None
 
     @classmethod
     def from_project(cls, root: Union[str, Path] = ".", build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
@@ -595,7 +604,8 @@ class AutomationBridgeClient:
         if wait:
             wait_timeout = self.timeout if timeout is None else timeout
             time.sleep(0.1)
-            self._wait_until_unavailable(min(wait_timeout, 2.0))
+            if not self._wait_until_unavailable(wait_timeout):
+                raise AutomationBridgeError("engine did not become unavailable after reboot request")
             self.wait_ready(timeout=wait_timeout)
 
     def close_engine(self, timeout: float = 2.0) -> None:
