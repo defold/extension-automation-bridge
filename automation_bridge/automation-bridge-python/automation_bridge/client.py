@@ -265,11 +265,12 @@ class AutomationBridgeClient:
     }
     _SELECTOR_KEYS = _SERVER_FILTERS | _CLIENT_FILTERS | {"include", "limit"}
 
-    def __init__(self, port: int, timeout: float = 10.0):
+    def __init__(self, port: int, timeout: float = 10.0, remotery_url: Optional[str] = None):
         """Create a client for an already-known engine service `port`."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
+        self._remotery_url = remotery_url
         self._last_window_size: Optional[Tuple[int, int]] = None
 
     @classmethod
@@ -282,16 +283,19 @@ class AutomationBridgeClient:
 
         def bridge_after_build() -> Optional["AutomationBridgeClient"]:
             service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
+            remotery_url = editor.remotery_url() if hasattr(editor, "remotery_url") else None
             for service_port in service_ports:
                 if not service_port:
                     continue
                 try:
-                    bridge = cls(service_port)
+                    bridge = cls(service_port, remotery_url=remotery_url)
                     bridge.health()
                 except Exception:  # noqa: BLE001 - keep polling other candidate ports.
                     continue
                 if hasattr(editor, "remember_engine_service_port"):
                     editor.remember_engine_service_port(service_port)
+                if remotery_url and hasattr(editor, "remember_remotery_url"):
+                    editor.remember_remotery_url(remotery_url)
                 return bridge
             return None
 
@@ -548,7 +552,12 @@ class AutomationBridgeClient:
         """Return a client for Defold's built-in engine profiler endpoints."""
         from .profiler import ProfilerClient
 
-        return ProfilerClient(self.port, timeout=self.timeout)
+        return ProfilerClient(self.port, timeout=self.timeout, remotery_url=self._remotery_url)
+
+    @property
+    def remotery_url(self) -> Optional[str]:
+        """Return the Remotery websocket URL discovered while bootstrapping, if known."""
+        return self._remotery_url
 
     @property
     def last_window_size(self) -> Optional[Tuple[int, int]]:

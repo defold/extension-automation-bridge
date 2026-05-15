@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import base64
+import hashlib
 import os
 import socket
+import struct
 import sys
 import threading
 import unittest
@@ -17,10 +20,18 @@ from automation_bridge import (  # noqa: E402
     EngineLogStream,
     ProfilerClient,
     ProfilerDataError,
+    RemoteryCapture,
+    RemoteryClient,
     wait_until,
 )
 from automation_bridge.client import _encode_render_resize, _encode_system_reboot  # noqa: E402
 from automation_bridge.profiler import parse_resources_data  # noqa: E402
+from automation_bridge.remotery import (  # noqa: E402
+    build_message,
+    build_sample_name,
+    parse_property_frame,
+    parse_sample_frame,
+)
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
@@ -97,13 +108,20 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
 
     def test_profiler_accessor_uses_engine_port(self):
-        bridge = AutomationBridgeClient(12345, timeout=3.0)
+        bridge = AutomationBridgeClient(12345, timeout=3.0, remotery_url="ws://127.0.0.1:17816/rmt")
 
         profiler = bridge.profiler
 
         self.assertIsInstance(profiler, ProfilerClient)
         self.assertEqual(12345, profiler.port)
         self.assertEqual(3.0, profiler.timeout)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", profiler.remotery_url)
+
+        remotery = profiler.remotery()
+
+        self.assertEqual("127.0.0.1", remotery.host)
+        self.assertEqual(17816, remotery.port)
+        self.assertEqual("/rmt", remotery.path)
 
     def test_profiler_resources_requests_resources_data(self):
         payload = _resources_payload()
@@ -136,6 +154,120 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ProfilerDataError, "truncated profiler data"):
             parse_resources_data(payload)
+
+    def test_profiler_remotery_accessor_uses_remotery_port(self):
+        profiler = ProfilerClient(12345, timeout=3.0)
+
+        remotery = profiler.remotery(port=23456)
+
+        self.assertIsInstance(remotery, RemoteryClient)
+        self.assertEqual(23456, remotery.port)
+        self.assertEqual(3.0, remotery.timeout)
+
+    def test_editor_latest_registration_remotery_urls(self):
+        lines = [
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:11111/rmt)",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:22222/rmt)",
+            "INFO:ENGINE: Engine service started on port 33333",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+
+        self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorClient._latest_registration_remotery_urls(lines))
+
+    def test_parse_remotery_sample_frame(self):
+        frame = parse_sample_frame(_remotery_sample_frame_body(), {1: "Frame", 2: "Update"})
+
+        self.assertEqual("Main", frame.thread_name)
+        self.assertEqual("Frame", frame.root.name)
+        self.assertEqual(1000, frame.root.start_us)
+        self.assertEqual(16000, frame.root.duration_us)
+        self.assertEqual("Update", frame.root.children[0].name)
+        self.assertEqual(1, frame.root.children[0].depth)
+        self.assertEqual(17000, frame.end_us)
+
+        aggregate = {entry.label: entry for entry in frame.aggregate()}
+        self.assertEqual(16000, aggregate["Frame"].total_us)
+        self.assertEqual(7000, aggregate["Update"].total_us)
+        self.assertEqual(2, aggregate["Update"].call_count)
+
+    def test_remotery_capture_scope_stats_filter_and_aggregate_frames(self):
+        names = {1: "Frame", 2: "Update"}
+        first = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=7000), names)
+        second = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=9000, root_duration_us=18000), names)
+        capture = RemoteryCapture(frames=(first, second))
+
+        update = capture.scope("Frame/Update")
+
+        self.assertEqual("Main", update.thread_name)
+        self.assertEqual("Update", update.name)
+        self.assertEqual(2, update.frames_seen)
+        self.assertEqual(2, update.occurrences)
+        self.assertEqual(4, update.calls_total)
+        self.assertEqual(2.0, update.calls_avg)
+        self.assertEqual(16.0, update.total.total_ms)
+        self.assertEqual(8.0, update.total.avg_ms)
+        self.assertEqual(8.0, update.total.median_ms)
+        self.assertEqual(8.9, update.total.p95_ms)
+        self.assertEqual(["Frame/Update"], [entry.path for entry in capture.scopes(path="Frame/*")])
+        self.assertEqual(["Frame/Update"], [entry.path for entry in capture.scopes(regex="Update")])
+
+    def test_remotery_capture_counter_stats_filter_and_aggregate_snapshots(self):
+        names = {100: "Memory", 101: "Used"}
+        first = parse_property_frame(_remotery_property_frame_body(property_frame=1, used=100), names)
+        second = parse_property_frame(_remotery_property_frame_body(property_frame=2, used=140), names)
+        capture = RemoteryCapture(frames=(), property_frames=(first, second))
+
+        used = capture.counter("Memory/Used")
+
+        self.assertEqual("Used", used.name)
+        self.assertEqual("u32", used.type)
+        self.assertEqual(2, used.frames_seen)
+        self.assertEqual(140, used.last_value)
+        self.assertEqual(120.0, used.values.avg)
+        self.assertEqual(120.0, used.values.median)
+        self.assertEqual(138.0, used.values.p95)
+        self.assertEqual(["Memory/Used"], [entry.path for entry in capture.counters(path="Memory/*")])
+        self.assertEqual(["Memory/Used"], [entry.path for entry in capture.counters(contains="used")])
+        self.assertEqual([], capture.counters(name="Memory"))
+        self.assertEqual("group", capture.counters(name="Memory", include_groups=True)[0].type)
+        self.assertEqual(["Memory/Used"], [entry.path for entry in second.find("used", include_groups=False)])
+
+    def test_remotery_client_get_frame_resolves_sample_names(self):
+        sample_message = build_message("SMPL", _remotery_sample_frame_body())
+        with FakeRemoteryServer(sample_message, {1: "Frame", 2: "Update"}) as server:
+            with RemoteryClient(port=server.port, timeout=1.0) as remotery:
+                frame = remotery.get_frame(timeout=1.0)
+
+        self.assertEqual({"GSMP1", "GSMP2"}, set(server.client_messages))
+        self.assertEqual("Frame", frame.root.name)
+        self.assertEqual("Update", frame.root.children[0].name)
+
+    def test_profiler_start_recording_collects_until_stop(self):
+        messages = [
+            build_message("SMPL", _remotery_sample_frame_body(child_duration_us=7000)),
+            build_message("SMPL", _remotery_sample_frame_body(child_duration_us=9000, root_duration_us=18000)),
+            build_message("PSNP", _remotery_property_frame_body(property_frame=1, used=100)),
+        ]
+        names = {1: "Frame", 2: "Update", 100: "Memory", 101: "Used"}
+        with FakeRemoteryServer(messages, names) as server:
+            profiler = ProfilerClient(12345, timeout=1.0, remotery_url=f"ws://127.0.0.1:{server.port}/rmt")
+            recording = profiler.start_recording(read_timeout=0.05)
+            try:
+                wait_until(
+                    lambda: True if recording.frame_count >= 2 and recording.property_frame_count >= 1 else None,
+                    timeout=2.0,
+                    interval=0.01,
+                    message="Remotery recording did not collect test frames",
+                )
+            finally:
+                capture = recording.stop()
+
+        update = capture.scope("Frame/Update")
+        self.assertFalse(recording.running)
+        self.assertEqual(2, len(capture.frames))
+        self.assertEqual(8.0, update.self.avg_ms)
+        self.assertEqual(100, capture.counter("Memory/Used").last_value)
 
 
 class FakeEngineClient(AutomationBridgeClient):
@@ -176,6 +308,120 @@ def _resources_payload():
         + (8192).to_bytes(4, "little")
         + (2048).to_bytes(4, "little")
         + (1).to_bytes(4, "little")
+    )
+
+
+def _remotery_string(value):
+    encoded = value.encode("utf-8")
+    return struct.pack("<I", len(encoded)) + encoded
+
+
+def _remotery_sample_frame_body(child_duration_us=7000, root_duration_us=16000, root_self_us=9000):
+    child = _remotery_sample(
+        name_hash=2,
+        unique_id=20,
+        colour=(20, 30, 40),
+        depth=1,
+        start_us=5000,
+        duration_us=child_duration_us,
+        self_us=child_duration_us,
+        call_count=2,
+    )
+    root = _remotery_sample(
+        name_hash=1,
+        unique_id=10,
+        colour=(10, 20, 30),
+        depth=0,
+        start_us=1000,
+        duration_us=root_duration_us,
+        self_us=root_self_us,
+        call_count=1,
+        children=child,
+        child_count=1,
+    )
+    return _remotery_string("Main") + struct.pack("<II", 2, 0) + root
+
+
+def _remotery_sample(
+    name_hash,
+    unique_id,
+    colour,
+    depth,
+    start_us,
+    duration_us,
+    self_us,
+    call_count,
+    children=b"",
+    child_count=0,
+):
+    return (
+        struct.pack(
+            "<II4BQQQQIII",
+            name_hash,
+            unique_id,
+            colour[0],
+            colour[1],
+            colour[2],
+            depth,
+            start_us,
+            duration_us,
+            self_us,
+            0,
+            call_count,
+            0,
+            child_count,
+        )
+        + children
+    )
+
+
+def _remotery_property_frame_body(property_frame, used):
+    memory = _remotery_property(
+        name_hash=100,
+        unique_id=1000,
+        depth=0,
+        property_type=0,
+        value=0,
+        child_count=1,
+    )
+    used_memory = _remotery_property(
+        name_hash=101,
+        unique_id=1001,
+        depth=1,
+        property_type=3,
+        value=used,
+        previous_value=used - 10,
+        previous_value_frame=property_frame - 1,
+    )
+    return struct.pack("<II", 2, property_frame) + memory + used_memory
+
+
+def _remotery_property(
+    name_hash,
+    unique_id,
+    depth,
+    property_type,
+    value,
+    previous_value=0,
+    previous_value_frame=0,
+    child_count=0,
+):
+    if property_type == 0:
+        values = b"\x00" * 16
+    elif property_type in (1, 2, 3, 4, 7):
+        values = struct.pack("<dd", value, previous_value)
+    elif property_type == 5:
+        values = struct.pack("<qq", value, previous_value)
+    elif property_type == 6:
+        values = struct.pack("<QQ", value, previous_value)
+    else:
+        raise ValueError(f"unsupported property type: {property_type}")
+    return (
+        struct.pack("<II", name_hash, unique_id)
+        + bytes((0, 0, 0, depth))
+        + struct.pack("<I", property_type)
+        + values
+        + struct.pack("<II", previous_value_frame, child_count)
     )
 
 
@@ -255,7 +501,125 @@ class FakeHttpServer:
             self._error = exc
 
 
+class FakeRemoteryServer:
+    def __init__(self, sample_message, sample_names):
+        self.sample_messages = sample_message if isinstance(sample_message, list) else [sample_message]
+        self.sample_names = sample_names
+        self.client_messages = []
+        self.port = 0
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._thread = None
+        self._error = None
+
+    def __enter__(self):
+        self._socket.bind(("127.0.0.1", 0))
+        self._socket.listen(1)
+        self.port = self._socket.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._socket.close()
+        if self._thread:
+            self._thread.join(timeout=1.0)
+        if exc_type is None and self._error:
+            raise self._error
+
+    def _serve(self):
+        try:
+            client, _ = self._socket.accept()
+            with client:
+                client.settimeout(1.0)
+                self._handshake(client)
+                for sample_message in self.sample_messages:
+                    self._send_frame(client, 0x2, sample_message)
+                while True:
+                    try:
+                        opcode, payload = self._recv_frame(client)
+                    except socket.timeout:
+                        continue
+                    if opcode == 0x8:
+                        break
+                    message = payload.decode("utf-8")
+                    self.client_messages.append(message)
+                    if message.startswith("GSMP"):
+                        name_hash = int(message[4:])
+                        name = self.sample_names.get(name_hash)
+                        if name is not None:
+                            body = build_sample_name(name_hash, name)
+                            self._send_frame(client, 0x2, build_message("SSMP", body))
+        except OSError as exc:
+            self._error = exc
+
+    def _handshake(self, client):
+        request = self._recv_until(client, b"\r\n\r\n").decode("iso-8859-1", "replace")
+        key = None
+        for line in request.split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+                break
+        if key is None:
+            raise AssertionError("missing Sec-WebSocket-Key")
+
+        accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        client.sendall(response)
+
+    def _recv_until(self, client, marker):
+        data = bytearray()
+        while marker not in data:
+            chunk = client.recv(1)
+            if not chunk:
+                raise AssertionError("connection closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _recv_frame(self, client):
+        header = self._recv_exact(client, 2)
+        opcode = header[0] & 0x0F
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(client, 2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(client, 8))[0]
+        mask = self._recv_exact(client, 4) if (header[1] & 0x80) else b""
+        payload = self._recv_exact(client, length) if length else b""
+        if mask:
+            payload = bytes(byte ^ mask[index & 3] for index, byte in enumerate(payload))
+        return opcode, payload
+
+    def _recv_exact(self, client, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = client.recv(size - len(data))
+            if not chunk:
+                raise AssertionError("connection closed")
+            data.extend(chunk)
+        return bytes(data)
+
+    def _send_frame(self, client, opcode, payload):
+        length = len(payload)
+        if length <= 125:
+            header = bytes([0x80 | opcode, length])
+        elif length <= 0xFFFF:
+            header = bytes([0x80 | opcode, 126]) + struct.pack("!H", length)
+        else:
+            header = bytes([0x80 | opcode, 127]) + struct.pack("!Q", length)
+        client.sendall(header + payload)
+
+
 class AutomationBridgeApiTest(unittest.TestCase):
+    SPRITE_COUNTER_NAME = "Sprite"
+
     @classmethod
     def setUpClass(cls):
         cls.editor = None
@@ -303,6 +667,113 @@ class AutomationBridgeApiTest(unittest.TestCase):
                     self.assertLessEqual(portrait["width"], portrait["height"])
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
+
+    def test_remotery_sprite_counter_after_actions(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        observations = []
+
+        self.record_sprite_counter(observations, "initial")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="first spawn did not appear")
+        self.record_sprite_counter(observations, "click spawner node")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner.center)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="second spawn did not appear")
+        self.record_sprite_counter(observations, "click spawner coordinates")
+
+        self.assert_drag_merge_by_node_ids("L1", expected_new_level="L2")
+        self.record_sprite_counter(observations, "drag merge L1 by ids")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="third spawn did not appear")
+        self.record_sprite_counter(observations, "click spawner node again")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner.center)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="fourth spawn did not appear")
+        self.record_sprite_counter(observations, "click spawner coordinates again")
+
+        self.assert_drag_merge_by_coordinates("L1", expected_new_level="L2")
+        self.record_sprite_counter(observations, "drag merge L1 by coordinates")
+
+        self.bridge.type_text("hello")
+        self.record_sprite_counter(observations, "type text")
+
+        self.bridge.key("KEY_ENTER")
+        self.record_sprite_counter(observations, "key enter")
+
+        self.merge_label("L2")
+        self.record_sprite_counter(observations, "drag merge L2")
+
+        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        for index in range(4):
+            before = self.label_count("L1")
+            self.bridge.click(spawner)
+            wait_until(
+                lambda: self.label_count("L1") > before,
+                timeout=2,
+                message=f"finish spawn {index + 1} did not appear",
+            )
+            self.record_sprite_counter(observations, f"finish spawn {index + 1}")
+
+        self.merge_label("L1")
+        self.record_sprite_counter(observations, "finish merge L1 #1")
+        self.merge_label("L1")
+        self.record_sprite_counter(observations, "finish merge L1 #2")
+        self.merge_label("L2")
+        self.record_sprite_counter(observations, "finish merge L2")
+        self.merge_label("L3")
+        self.assertEqual(1, self.label_count("L4"))
+        self.record_sprite_counter(observations, "finish merge L3")
+
+        restart = self.bridge.node(name_exact="restart", enabled=True)
+        self.bridge.click(restart, wait=0.4)
+        self.assertEqual(0, len(self.item_labels()))
+        self.record_sprite_counter(observations, "restart")
+
+        for label, scene_count, counter_value in observations:
+            print(f"SPRITE_COUNTER {label}: scene_spritec={scene_count} remotery_Sprite={counter_value}")
+
+    def ensure_running_bridge(self):
+        if self.bridge is not None:
+            self.bridge.wait_ready()
+            return
+        if self.editor is None:
+            raise unittest.SkipTest("no Automation Bridge engine or Defold editor is available")
+        self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+        self.__class__.bridge = self.bridge
+        self.bridge.wait_ready()
+
+    def record_sprite_counter(self, observations, label):
+        scene_count = self.bridge.count(type="spritec")
+        with self.bridge.profiler.remotery() as remotery:
+            counter_value = self.wait_for_sprite_counter(remotery, scene_count)
+        self.assertEqual(scene_count, counter_value, label)
+        observations.append((label, scene_count, counter_value))
+
+    def wait_for_sprite_counter(self, remotery, expected):
+        def matching_counter():
+            properties = remotery.get_properties(timeout=2.0)
+            for entry in properties.find(self.SPRITE_COUNTER_NAME, include_groups=False):
+                if entry.name == self.SPRITE_COUNTER_NAME:
+                    value = int(entry.value)
+                    if value == expected:
+                        return value
+                    raise AssertionError(f"{entry.path}={value}, expected {expected}")
+            raise AssertionError(f"missing Remotery counter {self.SPRITE_COUNTER_NAME}")
+
+        return wait_until(
+            matching_counter,
+            timeout=5,
+            interval=0.05,
+            message=f"Remotery {self.SPRITE_COUNTER_NAME} did not match scene spritec count",
+        )
 
     def run_automation_bridge_api_end_to_end(self):
         health = self.bridge.health()
