@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ from .waits import wait_until
 JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _INPUT_SETTLE_SECONDS = 0.1
+_UINT32_MAX = 0xFFFFFFFF
 
 
 class AutomationBridgeError(RuntimeError):
@@ -54,6 +56,85 @@ class SelectorError(AutomationBridgeError):
     pass
 
 
+class EngineLogStream:
+    """Context-managed reader for Defold's TCP log service."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = 2.0,
+        read_timeout: Optional[float] = None,
+    ):
+        self.host = host
+        self.port = int(port)
+        self._socket = socket.create_connection((host, self.port), timeout=timeout)
+        self._buffer = bytearray()
+        try:
+            status = self._readline_raw(timeout).decode("utf-8", "replace").rstrip("\r\n")
+            if status != "0 OK":
+                raise AutomationBridgeError(f"log service rejected connection: {status}")
+            self._socket.settimeout(read_timeout)
+        except Exception:
+            self.close()
+            raise
+
+    def __enter__(self) -> "EngineLogStream":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.close()
+
+    def __iter__(self) -> "EngineLogStream":
+        return self
+
+    def __next__(self) -> str:
+        line = self.readline()
+        if line is None:
+            raise StopIteration
+        return line
+
+    def close(self) -> None:
+        """Close the underlying log service socket."""
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+
+    def readline(self, timeout: Optional[float] = None) -> Optional[str]:
+        """Read one log line without its trailing newline; return `None` on timeout or EOF."""
+        data = self._readline_raw(timeout)
+        if not data:
+            return None
+        return data.decode("utf-8", "replace").rstrip("\r\n")
+
+    def _readline_raw(self, timeout: Optional[float] = None) -> bytes:
+        previous_timeout = self._socket.gettimeout()
+        if timeout is not None:
+            self._socket.settimeout(timeout)
+        try:
+            while True:
+                newline = self._buffer.find(b"\n")
+                if newline >= 0:
+                    line = bytes(self._buffer[: newline + 1])
+                    del self._buffer[: newline + 1]
+                    return line
+
+                chunk = self._socket.recv(4096)
+                if not chunk:
+                    if not self._buffer:
+                        return b""
+                    line = bytes(self._buffer)
+                    self._buffer.clear()
+                    return line
+                self._buffer.extend(chunk)
+        except socket.timeout:
+            return b""
+        finally:
+            if timeout is not None:
+                self._socket.settimeout(previous_timeout)
+
+
 def request_json(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[int, JsonDict]:
     """Request JSON and return `(status, object)`."""
     request = urllib.request.Request(url, method=method)
@@ -78,6 +159,20 @@ def request_json(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[
     if not isinstance(parsed, dict):
         raise HttpError(method, url, "JSON response was not an object", status=status)
     return status, parsed
+
+
+def request_raw(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[int, bytes]:
+    """Request raw bytes and return `(status, body)`."""
+    request = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.getcode(), response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+    except urllib.error.URLError as exc:
+        raise HttpError(method, url, str(exc)) from exc
+    except OSError as exc:
+        raise HttpError(method, url, str(exc)) from exc
 
 
 def request_bytes(url: str, data: bytes, method: str = "POST", timeout: float = 10.0) -> Tuple[int, bytes]:
@@ -108,6 +203,53 @@ def _encode_param(value: Any) -> str:
     return str(value)
 
 
+def _protobuf_varint(value: int) -> bytes:
+    if not isinstance(value, int):
+        raise TypeError(f"protobuf varint value must be int, got {type(value).__name__}")
+    if value < 0:
+        raise ValueError("protobuf varint value must be non-negative")
+
+    encoded = bytearray()
+    while value >= 0x80:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _protobuf_uint32(field: int, value: int) -> bytes:
+    if not isinstance(value, int):
+        raise TypeError(f"uint32 field {field} must be int, got {type(value).__name__}")
+    if value < 0 or value > _UINT32_MAX:
+        raise ValueError(f"uint32 field {field} out of range: {value}")
+    return _protobuf_varint(field << 3) + _protobuf_varint(value)
+
+
+def _protobuf_string(field: int, value: str) -> bytes:
+    if not isinstance(value, str):
+        raise TypeError(f"string field {field} must be str, got {type(value).__name__}")
+    encoded = value.encode("utf-8")
+    return _protobuf_varint((field << 3) | 2) + _protobuf_varint(len(encoded)) + encoded
+
+
+def _encode_render_resize(width: int, height: int) -> bytes:
+    if not isinstance(width, int) or not isinstance(height, int):
+        raise TypeError(f"resize dimensions must be ints, got {type(width).__name__}x{type(height).__name__}")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"resize dimensions must be positive, got {width}x{height}")
+    return _protobuf_uint32(1, width) + _protobuf_uint32(2, height)
+
+
+def _encode_system_reboot(args: Sequence[str]) -> bytes:
+    if len(args) > 6:
+        raise ValueError("Defold reboot accepts at most six arguments")
+
+    payload = bytearray()
+    for index, arg in enumerate(args, start=1):
+        payload.extend(_protobuf_string(index, arg))
+    return bytes(payload)
+
+
 class AutomationBridgeClient:
     """High-level client for `/automation-bridge/v1` scene inspection and input control."""
 
@@ -123,11 +265,13 @@ class AutomationBridgeClient:
     }
     _SELECTOR_KEYS = _SERVER_FILTERS | _CLIENT_FILTERS | {"include", "limit"}
 
-    def __init__(self, port: int, timeout: float = 10.0):
+    def __init__(self, port: int, timeout: float = 10.0, remotery_url: Optional[str] = None):
         """Create a client for an already-known engine service `port`."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
+        self._remotery_url = remotery_url
+        self._last_window_size: Optional[Tuple[int, int]] = None
 
     @classmethod
     def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
@@ -139,16 +283,19 @@ class AutomationBridgeClient:
 
         def bridge_after_build() -> Optional["AutomationBridgeClient"]:
             service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
+            remotery_url = cls._editor_remotery_url(editor, fresh_build=build)
             for service_port in service_ports:
                 if not service_port:
                     continue
                 try:
-                    bridge = cls(service_port)
+                    bridge = cls(service_port, remotery_url=remotery_url)
                     bridge.health()
                 except Exception:  # noqa: BLE001 - keep polling other candidate ports.
                     continue
                 if hasattr(editor, "remember_engine_service_port"):
                     editor.remember_engine_service_port(service_port)
+                if remotery_url and hasattr(editor, "remember_remotery_url"):
+                    editor.remember_remotery_url(remotery_url)
                 return bridge
             return None
 
@@ -186,6 +333,15 @@ class AutomationBridgeClient:
             return False
         return editor.last_build_had_engine_service_port() is False
 
+    @staticmethod
+    def _editor_remotery_url(editor: Any, fresh_build: bool) -> Optional[str]:
+        if fresh_build and hasattr(editor, "latest_registration_remotery_urls"):
+            urls = editor.latest_registration_remotery_urls()
+            return urls[0] if urls else None
+        if hasattr(editor, "remotery_url"):
+            return editor.remotery_url()
+        return None
+
     @classmethod
     def from_project(cls, root: Union[str, Path] = ".", build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
         """Create an editor client from `root`, then connect to the Automation Bridge API."""
@@ -213,11 +369,17 @@ class AutomationBridgeClient:
 
     def health(self) -> JsonDict:
         """Return API version, capabilities, platform, and screen data."""
-        return self.get("/health")
+        data = self.get("/health")
+        screen = data.get("screen")
+        if isinstance(screen, Mapping):
+            self._remember_window_size(screen)
+        return data
 
     def screen(self) -> JsonDict:
         """Return window, backbuffer, viewport, and coordinate metadata."""
-        return self.get("/screen")
+        data = self.get("/screen")
+        self._remember_window_size(data)
+        return data
 
     def scene(
         self,
@@ -348,14 +510,106 @@ class AutomationBridgeClient:
             )
         return path
 
+    def engine_info(self) -> JsonDict:
+        """Return Defold engine service `/info`, including version, platform, sha1, and log port."""
+        status, response = request_json(f"http://127.0.0.1:{self.port}/info", timeout=self.timeout)
+        if status < 200 or status >= 300:
+            raise HttpError("GET", f"http://127.0.0.1:{self.port}/info", f"unexpected status {status}", status=status)
+        return response
+
+    def engine_log_port(self) -> int:
+        """Return the Defold TCP log service port from engine `/info`."""
+        value = self.engine_info().get("log_port")
+        try:
+            port = int(value)
+        except (TypeError, ValueError) as exc:
+            raise AutomationBridgeError(f"engine /info did not include a valid log_port: {value!r}") from exc
+        if port <= 0:
+            raise AutomationBridgeError(f"engine log service is unavailable: {value!r}")
+        return port
+
+    def log_stream(
+        self,
+        timeout: float = 2.0,
+        read_timeout: Optional[float] = None,
+        host: str = "127.0.0.1",
+    ) -> EngineLogStream:
+        """Open Defold's TCP log stream. Use as `with bridge.log_stream() as logs:`."""
+        return EngineLogStream(host, self.engine_log_port(), timeout=timeout, read_timeout=read_timeout)
+
+    def read_logs(
+        self,
+        duration: float = 1.0,
+        limit: Optional[int] = None,
+        idle_timeout: float = 0.1,
+    ) -> List[str]:
+        """Collect future engine log lines for `duration` seconds or until `limit` lines are read."""
+        lines: List[str] = []
+        deadline = time.monotonic() + max(0.0, duration)
+        with self.log_stream(timeout=self.timeout) as logs:
+            while time.monotonic() < deadline:
+                if limit is not None and len(lines) >= limit:
+                    break
+                remaining = deadline - time.monotonic()
+                line = logs.readline(timeout=max(0.0, min(idle_timeout, remaining)))
+                if line is not None:
+                    lines.append(line)
+        return lines
+
+    @property
+    def profiler(self) -> "ProfilerClient":
+        """Return a client for Defold's built-in engine profiler endpoints."""
+        from .profiler import ProfilerClient
+
+        return ProfilerClient(self.port, timeout=self.timeout, remotery_url=self._remotery_url)
+
+    @property
+    def remotery_url(self) -> Optional[str]:
+        """Return the Remotery websocket URL discovered while bootstrapping, if known."""
+        return self._remotery_url
+
+    @property
+    def last_window_size(self) -> Optional[Tuple[int, int]]:
+        """Return the last known `(width, height)` from `screen()`, `health()`, or `resize()`."""
+        return self._last_window_size
+
+    def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
+        """Resize the Defold window through `/post/@render/resize` and remember the new size."""
+        payload = _encode_render_resize(width, height)
+        self._post_engine_message("/post/@render/resize", payload)
+        self._last_window_size = (width, height)
+        if wait:
+            time.sleep(wait)
+        return {"width": width, "height": height}
+
+    def set_portrait(self, wait: float = 0.25) -> JsonDict:
+        """Resize to portrait by swapping the last known width and height when needed."""
+        width, height = self._known_window_size()
+        if width > height:
+            return self.resize(height, width, wait=wait)
+        return {"width": width, "height": height}
+
+    def set_landscape(self, wait: float = 0.25) -> JsonDict:
+        """Resize to landscape by swapping the last known width and height when needed."""
+        width, height = self._known_window_size()
+        if width < height:
+            return self.resize(height, width, wait=wait)
+        return {"width": width, "height": height}
+
+    def reboot(self, *args: str, wait: bool = True, timeout: Optional[float] = None) -> None:
+        """Reboot the engine through `/post/@system/reboot` with up to six command-line args."""
+        payload = _encode_system_reboot(args)
+        self._post_engine_message("/post/@system/reboot", payload, timeout=timeout)
+        self._last_window_size = None
+        if wait:
+            wait_timeout = self.timeout if timeout is None else timeout
+            self._wait_ready_after_reboot(wait_timeout)
+
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
         try:
-            status, body = request_bytes(url, b"\010\000", timeout=timeout)
-            if status < 200 or status >= 300:
-                preview = body[:200].decode("utf-8", "replace")
-                raise HttpError("POST", url, f"unexpected status {status}: {preview}", status=status)
+            self._post_engine_message("/post/@system/exit", b"\010\000", timeout=timeout)
         except AutomationBridgeError:
             if self._terminate_process_on_port(timeout):
                 return
@@ -387,6 +641,40 @@ class AutomationBridgeClient:
                 return True
             time.sleep(0.05)
         return False
+
+    def _wait_ready_after_reboot(self, timeout: float) -> JsonDict:
+        deadline = time.monotonic() + timeout
+        accept_ready_after = time.monotonic() + min(0.25, max(0.0, timeout) / 2.0)
+        saw_unavailable = False
+        last_error: Optional[BaseException] = None
+
+        while time.monotonic() <= deadline:
+            try:
+                data = self.health()
+            except AutomationBridgeError as exc:
+                saw_unavailable = True
+                last_error = exc
+            else:
+                if saw_unavailable or time.monotonic() >= accept_ready_after:
+                    return data
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            time.sleep(min(0.05, remaining))
+
+        try:
+            data = self.health()
+        except AutomationBridgeError as exc:
+            last_error = exc
+        else:
+            if saw_unavailable or time.monotonic() >= accept_ready_after:
+                return data
+
+        message = "Automation Bridge endpoint did not become ready after reboot"
+        if last_error:
+            raise AssertionError(f"{message}: {last_error}") from last_error
+        raise AssertionError(message)
 
     def _terminate_process_on_port(self, timeout: float) -> bool:
         for pid in self._listening_pids(self.port):
@@ -483,6 +771,30 @@ class AutomationBridgeClient:
             message = str(error.get("message", response))
             raise AutomationBridgeApiError(code, message, status, response)
         return response.get("data", {})
+
+    def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
+        url = f"http://127.0.0.1:{self.port}{path}"
+        status, body = request_bytes(url, payload, timeout=self.timeout if timeout is None else timeout)
+        if status < 200 or status >= 300:
+            preview = body[:200].decode("utf-8", "replace")
+            raise HttpError("POST", url, f"unexpected status {status}: {preview}", status=status)
+        return body
+
+    def _remember_window_size(self, screen: Mapping[str, Any]) -> None:
+        window = screen.get("window")
+        if not isinstance(window, Mapping):
+            return
+        width = window.get("width")
+        height = window.get("height")
+        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+            self._last_window_size = (width, height)
+
+    def _known_window_size(self) -> Tuple[int, int]:
+        if self._last_window_size is None:
+            self.screen()
+        if self._last_window_size is None:
+            raise AutomationBridgeError("window size is unavailable")
+        return self._last_window_size
 
     @staticmethod
     def _encoded_params(params: Optional[Mapping[str, Any]]) -> Dict[str, str]:

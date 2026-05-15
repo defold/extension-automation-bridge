@@ -441,7 +441,8 @@ namespace dmAutomationBridge
             return;
         }
 
-        if (!AddMouseInput(x1, y1, x2, y2, MaxFloat(0.0f, duration)))
+        duration = MaxFloat(0.0f, duration);
+        if (!AddMouseInput(x1, y1, x2, y2, duration))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;

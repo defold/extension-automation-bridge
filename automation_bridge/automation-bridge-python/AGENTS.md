@@ -1,14 +1,18 @@
 # Automation Bridge Python Wrapper Notes
 
-- Add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path` before importing `automation_bridge`.
-- Public APIs have docstrings. Use `help(AutomationBridgeClient)`, `help(AutomationBridgeClient.drag)`, or `.__doc__` for quick reference.
-- Prefer `AutomationBridgeClient.from_project(".", build=True)` for normal scripts; it closes known candidate engine ports, builds, waits for `Automation Bridge endpoint registered`, discovers the engine service port, and waits for `/automation-bridge/v1/health`.
-- The editor may reuse the same engine process and omit a fresh service-port log line before `Automation Bridge endpoint registered`; `EditorClient` caches the last seen engine service port in `.internal/automation_bridge.engine.port`.
-- If the latest registration has no fresh port, or candidate ports do not answer `/automation-bridge/v1/health`, `AutomationBridgeClient.from_editor(..., build=True)` closes candidate engine ports, rebuilds once, and retries.
-- Use `AUTOMATION_BRIDGE_ENGINE_PORT` only when a running engine port is already known.
-- Query nodes through `bridge.node(...)`, `bridge.maybe_node(...)`, `bridge.nodes(...)`, and `bridge.by_id(...)`; use `name_exact`/`text_exact` when exact matching matters.
-- Use `bridge.parent(component_node)` when a matched component, such as a label or sprite, belongs to a parent game object that should receive input.
-- `Node` objects are snapshots. Re-query after clicks, drags, or scene changes.
-- Use `bridge.click(...)`, `bridge.drag(..., duration=...)`, `bridge.type_text(...)`, and `bridge.key("KEY_ENTER")`; drag blocks until the queued drag should be finished by default.
-- Use `bridge.screenshot(wait=True)` and `bridge.format_nodes(...)` for diagnostics.
-- Call `bridge.close_engine()` only when the script intentionally shuts down the running engine.
+- Purpose: dependency-free Python helpers for driving a Defold debug build through the Automation Bridge HTTP API. Use it for editor/bootstrap automation, runtime scene inspection, node selection, input, screenshots, logs, window control, reboot/shutdown, resource data, and Remotery profiling.
+- Setup from this repo: add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path`, then import `AutomationBridgeClient`, `EditorClient`, or `wait_until` from `automation_bridge` as needed.
+- Public APIs have docstrings. Use `help(AutomationBridgeClient)`, `help(AutomationBridgeClient.drag)`, or `.__doc__` for quick in-code reference.
+- Normal bootstrap: `bridge = AutomationBridgeClient.from_project(".", build=True)`. It builds through the editor, discovers/caches the engine service port and, when present in fresh logs, the Remotery URL, handles stale reused engine ports, and waits for `/automation-bridge/v1/health`. If Remotery discovery is missing, `bridge.profiler.remotery()` falls back to Defold's default port; pass `url=` or `port=` to override it.
+- Use `AutomationBridgeClient.from_editor(editor, build=True)` for explicit editor control, `AutomationBridgeClient(port)` for an already known engine port, and `AUTOMATION_BRIDGE_ENGINE_PORT` only when a running port is known.
+- Core API: `health()`, `screen()`, `scene(...)`, raw `get(path, params)`/`post(path, params)`, `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, `count(...)`, `click(...)`, `drag(...)`, `type_text(...)`, `key("KEY_ENTER")`, `wait_for_node(...)`, `wait_for_count(...)`, module-level `wait_until(...)`, `screenshot(...)`, `format_nodes(...)`, and `dump_scene(...)`.
+- Selectors pass native filters `id`, `type`, `name`, `text`, `url`, `visible`, `include`, `limit`; Python also adds `enabled`, `kind`, `path`, `name_exact`, `text_exact`, `has_bounds`, and `visible_and_enabled`.
+- Native `type`/`name`/`text`/`url` matching is case-insensitive substring matching. Use `name_exact` or `text_exact` when exact matching matters.
+- `Node` objects are snapshots with fields like `id`, `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, `visible`, `enabled`, `bounds`, `center`, `children`, and `raw`. Re-query after clicks, drags, collection changes, or UI updates.
+- Component nodes often expose useful labels/properties while the parent game object receives input. Use `bridge.parent(component_node)` before clicking or dragging when needed.
+- Input accepts nodes, node ids, point mappings, `(x, y)` tuples, or raw `x, y` coordinates. Coordinates are top-left screen pixels. `drag(..., duration=...)` waits for the queued drag to finish by default.
+- Use `bridge.screenshot(wait=True)` for PNG diagnostics; use `bridge.format_nodes(...)` or `bridge.dump_scene(...)` when selector failures need scene context.
+- Engine logs: `bridge.log_stream()` and `bridge.read_logs(duration=..., limit=...)` read future Defold TCP log lines; `EditorClient.console_lines()` reads existing editor console history.
+- Engine control: `resize(width, height)`, `set_portrait()`, `set_landscape()`, `reboot(*args, wait=True)`, and `close_engine()`. Only call `close_engine()` when intentionally shutting down the running engine. For editor-launched reboots that must return to Automation Bridge, pass explicit project/bootstrap args.
+- Profiling: `bridge.profiler.resources()` reads Defold `/resources_data`; `bridge.profiler.capture(frames=..., warmup_frames=...)` captures Remotery frames; `bridge.profiler.start_recording(...)` records until your script stops it. Use `capture.scopes(...)` for timing stats and `capture.counters(...)` for Remotery property counters.
+- Full user/API docs live in `README.md`; raw endpoint docs live in `../README.md`.

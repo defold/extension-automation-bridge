@@ -168,18 +168,21 @@ namespace dmAutomationBridge
 
     static bool UpdateMouseEvent(dmHID::HMouse mouse, dmHID::HTouchDevice device, float dt, InputEvent* event)
     {
-        float t = event->m_Duration > 0.0f ? event->m_Elapsed / event->m_Duration : 0.0f;
+        bool instant = event->m_Duration <= 0.0f;
+        bool pressed = event->m_Elapsed == 0.0f;
+        bool released = instant ? !pressed : event->m_Elapsed >= event->m_Duration;
+        float t = instant ? (pressed ? 0.0f : 1.0f) : event->m_Elapsed / event->m_Duration;
         t = ClampFloat(t, 0.0f, 1.0f);
         float x = event->m_X1 + (event->m_X2 - event->m_X1) * t;
         float y = event->m_Y1 + (event->m_Y2 - event->m_Y1) * t;
 
-        bool pressed = event->m_Elapsed == 0.0f;
-        bool released = event->m_Elapsed >= event->m_Duration;
-        event->m_Elapsed += dt;
-
-        if (pressed && released)
+        if (instant && pressed)
         {
-            released = false;
+            event->m_Elapsed = 1.0f;
+        }
+        else
+        {
+            event->m_Elapsed += dt;
         }
 
         DoTouch(mouse, device, (int32_t)x, (int32_t)y, pressed, released);

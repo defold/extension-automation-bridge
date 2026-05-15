@@ -14,6 +14,7 @@ _ENGINE_SERVICE_PORT_PATTERNS = (
     re.compile(r"Engine service started on port (\d+)"),
     re.compile(r"Log server started on port (\d+)"),
 )
+_REMOTERY_URL_PATTERN = re.compile(r"Initialized Remotery \((ws://[^)\s]+)\)")
 
 
 class EditorClient:
@@ -29,6 +30,7 @@ class EditorClient:
         self.port = int(port)
         self.base_url = f"http://localhost:{self.port}"
         self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
+        self._remotery_url: Optional[str] = self._read_cached_remotery_url()
         self._last_build_had_engine_service_port: Optional[bool] = None
 
     @classmethod
@@ -86,6 +88,22 @@ class EditorClient:
         """Return ports logged before the latest Automation Bridge endpoint registration only."""
         return self._latest_registration_engine_service_ports(self.console_lines())
 
+    def remotery_url(self) -> Optional[str]:
+        """Return the Remotery websocket URL from current logs, then the cached URL."""
+        urls = self.remotery_urls()
+        return urls[0] if urls else None
+
+    def remotery_urls(self) -> list:
+        """Return candidate Remotery websocket URLs from current logs, then the cached URL."""
+        candidates = self.latest_registration_remotery_urls()
+        if self._remotery_url is not None:
+            self._append_unique_candidate(candidates, self._remotery_url)
+        return candidates
+
+    def latest_registration_remotery_urls(self) -> list:
+        """Return Remotery websocket URLs logged before the latest endpoint registration only."""
+        return self._latest_registration_remotery_urls(self.console_lines())
+
     @classmethod
     def _latest_registration_engine_service_ports(cls, lines: list) -> list:
         search_lines = cls._latest_registration_window(lines)
@@ -97,6 +115,18 @@ class EditorClient:
                 match = candidate_pattern.search(line)
                 if match:
                     cls._append_port_candidate(candidates, int(match.group(1)))
+        return candidates
+
+    @classmethod
+    def _latest_registration_remotery_urls(cls, lines: list) -> list:
+        search_lines = cls._latest_registration_window(lines)
+        if search_lines is None:
+            search_lines = lines
+        candidates = []
+        for line in reversed(search_lines):
+            match = _REMOTERY_URL_PATTERN.search(line)
+            if match:
+                cls._append_unique_candidate(candidates, match.group(1))
         return candidates
 
     def latest_registration_has_engine_service_port(self) -> bool:
@@ -142,10 +172,20 @@ class EditorClient:
         self._engine_service_port = int(port)
         self._write_cached_engine_service_port(self._engine_service_port)
 
+    def remember_remotery_url(self, url: str) -> None:
+        """Remember the Remotery websocket URL for reused-engine builds."""
+        self._remotery_url = url
+        self._write_cached_remotery_url(url)
+
     @staticmethod
     def _append_port_candidate(candidates: list, port: int) -> None:
         if port not in candidates:
             candidates.append(port)
+
+    @staticmethod
+    def _append_unique_candidate(candidates: list, value: str) -> None:
+        if value not in candidates:
+            candidates.append(value)
 
     @property
     def _engine_service_port_cache_path(self) -> Path:
@@ -168,3 +208,20 @@ class EditorClient:
         path = self._engine_service_port_cache_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{port}\n", encoding="utf-8")
+
+    @property
+    def _remotery_url_cache_path(self) -> Path:
+        return self.root / ".internal" / "automation_bridge.remotery.url"
+
+    def _read_cached_remotery_url(self) -> Optional[str]:
+        path = self._remotery_url_cache_path
+        try:
+            value = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        return value or None
+
+    def _write_cached_remotery_url(self, url: str) -> None:
+        path = self._remotery_url_cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{url}\n", encoding="utf-8")

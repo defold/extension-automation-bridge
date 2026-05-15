@@ -268,7 +268,7 @@ namespace dmAutomationBridge
         }
     }
 
-    static void ComputeBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t backbuffer_w, uint32_t backbuffer_h)
+    static void ComputeBounds(Node* node, uint32_t screen_w, uint32_t screen_h, uint32_t display_w, uint32_t display_h)
     {
         if (!node->m_HasPosition || screen_w == 0 || screen_h == 0)
         {
@@ -296,8 +296,8 @@ namespace dmAutomationBridge
         }
         else
         {
-            float source_w = backbuffer_w > 0 ? (float)backbuffer_w : (float)screen_w;
-            float source_h = backbuffer_h > 0 ? (float)backbuffer_h : (float)screen_h;
+            float source_w = display_w > 0 ? (float)display_w : (float)screen_w;
+            float source_h = display_h > 0 ? (float)display_h : (float)screen_h;
             float scale_x = source_w > 0.0f ? (float)screen_w / source_w : 1.0f;
             float scale_y = source_h > 0.0f ? (float)screen_h / source_h : 1.0f;
             node->m_Bounds.m_CX = x * scale_x;
@@ -390,7 +390,7 @@ namespace dmAutomationBridge
             SetString(&node.m_Parent, snapshot->m_Nodes.m_Data[parent_index].m_Id);
         }
 
-        ComputeBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_BackbufferWidth, snapshot->m_BackbufferHeight);
+        ComputeBounds(&node, snapshot->m_WindowWidth, snapshot->m_WindowHeight, snapshot->m_DisplayWidth, snapshot->m_DisplayHeight);
 
         uint32_t index = snapshot->m_Nodes.m_Count;
         if (!ArrayPush(&snapshot->m_Nodes, &node))
@@ -416,6 +416,9 @@ namespace dmAutomationBridge
 
     static void RefreshScreenInfo(Snapshot* snapshot)
     {
+        snapshot->m_DisplayWidth = g_AutomationBridge.m_DisplayWidth;
+        snapshot->m_DisplayHeight = g_AutomationBridge.m_DisplayHeight;
+
         if (!g_AutomationBridge.m_GraphicsContext)
         {
             return;
@@ -599,6 +602,10 @@ namespace dmAutomationBridge
         AppendNumber(out, snapshot->m_BackbufferWidth);
         StringBufferAppend(out, ",\"height\":");
         AppendNumber(out, snapshot->m_BackbufferHeight);
+        StringBufferAppend(out, "},\"display\":{\"width\":");
+        AppendNumber(out, snapshot->m_DisplayWidth);
+        StringBufferAppend(out, ",\"height\":");
+        AppendNumber(out, snapshot->m_DisplayHeight);
         StringBufferAppend(out, "},\"viewport\":{\"x\":");
         AppendNumber(out, snapshot->m_ViewportX);
         StringBufferAppend(out, ",\"y\":");
