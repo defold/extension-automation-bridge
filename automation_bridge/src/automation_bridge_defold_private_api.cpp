@@ -271,11 +271,6 @@ namespace dmAutomationBridge
             return true;
         }
 
-        if (!StringsEqual(node->m_Kind, "gui_node") && ComputeRenderBounds(node, snapshot, out_bounds))
-        {
-            return true;
-        }
-
         return false;
     }
 }
