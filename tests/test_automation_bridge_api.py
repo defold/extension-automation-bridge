@@ -1083,6 +1083,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("/spawner", spawner_detail.name)
         self.assertGreaterEqual(len(spawner_detail.children), 2)
 
+        self.assert_game_object_bounds_follow_child_component()
         self.assert_spawned_by_node_click(spawner)
         self.assert_spawned_by_coordinate_click(spawner)
         self.assert_drag_merge_by_node_ids("L1", expected_new_level="L2")
@@ -1119,6 +1120,29 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual(0, len(self.item_labels()))
         panel = self.bridge.node(name_exact="panel")
         self.assertFalse(panel.enabled)
+
+    def assert_game_object_bounds_follow_child_component(self):
+        fixture = self.bridge.node(
+            type="goc",
+            name_exact="/bounds_fixture",
+            visible=True,
+            include=["basic", "bounds", "children"],
+        )
+        sprite_children = [child for child in fixture.children if child.type == "spritec"]
+        self.assertEqual(1, len(sprite_children), fixture.compact())
+
+        sprite = sprite_children[0]
+        fixture_x = fixture.center["x"]
+        fixture_y = fixture.center["y"]
+        sprite_x = sprite.center["x"]
+        sprite_y = sprite.center["y"]
+        distance = ((fixture_x - sprite_x) ** 2 + (fixture_y - sprite_y) ** 2) ** 0.5
+        self.assertLessEqual(distance, 2.0)
+
+        response = self.bridge.click(fixture, wait=0.1)
+        self.assertEqual("click", response["queued"])
+        self.assertAlmostEqual(fixture_x, response["x"], delta=0.5)
+        self.assertAlmostEqual(fixture_y, response["y"], delta=0.5)
 
     def assert_spawned_by_node_click(self, node):
         before = self.label_count("L1")

@@ -314,6 +314,105 @@ namespace dmAutomationBridge
         node->m_Bounds.m_Valid = true;
     }
 
+    static bool IsUsableBounds(const Bounds* bounds)
+    {
+        return bounds->m_Valid &&
+               IsFiniteFloat(bounds->m_X) &&
+               IsFiniteFloat(bounds->m_Y) &&
+               IsFiniteFloat(bounds->m_W) &&
+               IsFiniteFloat(bounds->m_H) &&
+               bounds->m_W >= 0.0f &&
+               bounds->m_H >= 0.0f;
+    }
+
+    static bool HasClickableArea(const Bounds* bounds)
+    {
+        return IsUsableBounds(bounds) && bounds->m_W > 0.5f && bounds->m_H > 0.5f;
+    }
+
+    static bool ShouldUseChildBounds(const Node* node)
+    {
+        return !HasClickableArea(&node->m_Bounds);
+    }
+
+    static bool ChildCanContributeBounds(const Node* child)
+    {
+        return child->m_Visible && child->m_Enabled && HasClickableArea(&child->m_Bounds);
+    }
+
+    static void UseChildBoundsIfBetter(Snapshot* snapshot, uint32_t index)
+    {
+        if (!snapshot || index >= snapshot->m_Nodes.m_Count)
+        {
+            return;
+        }
+
+        Node* node = &snapshot->m_Nodes.m_Data[index];
+        if (!ShouldUseChildBounds(node))
+        {
+            return;
+        }
+
+        float min_x = 0.0f;
+        float min_y = 0.0f;
+        float max_x = 0.0f;
+        float max_y = 0.0f;
+        bool has_bounds = false;
+
+        for (uint32_t i = 0; i < node->m_Children.m_Count; ++i)
+        {
+            uint32_t child_index = node->m_Children.m_Data[i];
+            if (child_index >= snapshot->m_Nodes.m_Count)
+            {
+                continue;
+            }
+
+            const Node* child = &snapshot->m_Nodes.m_Data[child_index];
+            if (!ChildCanContributeBounds(child))
+            {
+                continue;
+            }
+
+            const Bounds* bounds = &child->m_Bounds;
+            float child_min_x = bounds->m_X;
+            float child_min_y = bounds->m_Y;
+            float child_max_x = bounds->m_X + bounds->m_W;
+            float child_max_y = bounds->m_Y + bounds->m_H;
+
+            if (!has_bounds)
+            {
+                min_x = child_min_x;
+                min_y = child_min_y;
+                max_x = child_max_x;
+                max_y = child_max_y;
+                has_bounds = true;
+            }
+            else
+            {
+                min_x = MinFloat(min_x, child_min_x);
+                min_y = MinFloat(min_y, child_min_y);
+                max_x = MaxFloat(max_x, child_max_x);
+                max_y = MaxFloat(max_y, child_max_y);
+            }
+        }
+
+        if (!has_bounds)
+        {
+            return;
+        }
+
+        node = &snapshot->m_Nodes.m_Data[index];
+        node->m_Bounds.m_X = min_x;
+        node->m_Bounds.m_Y = min_y;
+        node->m_Bounds.m_W = MaxFloat(0.0f, max_x - min_x);
+        node->m_Bounds.m_H = MaxFloat(0.0f, max_y - min_y);
+        node->m_Bounds.m_CX = min_x + node->m_Bounds.m_W * 0.5f;
+        node->m_Bounds.m_CY = min_y + node->m_Bounds.m_H * 0.5f;
+        node->m_Bounds.m_NX = snapshot->m_WindowWidth > 0 ? node->m_Bounds.m_CX / (float)snapshot->m_WindowWidth : 0.0f;
+        node->m_Bounds.m_NY = snapshot->m_WindowHeight > 0 ? node->m_Bounds.m_CY / (float)snapshot->m_WindowHeight : 0.0f;
+        node->m_Bounds.m_Valid = true;
+    }
+
     static void DiscoverSnapshotCamera(dmGameObject::SceneNode* scene_node)
     {
         Node node;
@@ -449,6 +548,8 @@ namespace dmAutomationBridge
                 ArrayPush(&snapshot->m_Nodes.m_Data[index].m_Children, &child_u32);
             }
         }
+
+        UseChildBoundsIfBetter(snapshot, index);
 
         return (int32_t)index;
     }

@@ -11,6 +11,15 @@ instances {
     y: 461.0
   }
 }
+instances {
+  id: "bounds_fixture"
+  prototype: "/main/bounds_fixture.go"
+  position {
+    x: 580.0
+    y: 120.0
+    z: 0.2
+  }
+}
 scale_along_z: 0
 embedded_instances {
   id: "ui"

@@ -43,6 +43,14 @@ When running from this repository without installing anything, add `automation_b
 PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automation_bridge_api.py
 ```
 
+The repository also includes a runtime smoke test for game-object bounds:
+
+```sh
+PYTHONPATH=automation_bridge/automation-bridge-python python3 examples/gameobject_bounds.py
+```
+
+It uses a sample fixture whose sprite is offset from the parent game object origin, so it fails if parent game-object bounds collapse to the raw Defold world position.
+
 ## Public API Surface
 
 `AutomationBridgeClient` is the main entry point.
