@@ -24,6 +24,7 @@ from automation_bridge import (  # noqa: E402
     AutomationBridgeApiError,
     AutomationBridgeClient,
     AutomationBridgeError,
+    DefoldInstallation,
     EditorClient,
     EventBufferOverflow,
     EventStream,
@@ -149,7 +150,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertTrue(all(not hasattr(bridge, name) for name in removed_client_names))
         self.assertFalse(hasattr(Node({"parent": "root"}), "parent"))
         self.assertFalse(any(name.startswith("Remotery") for name in automation_bridge_package.__all__))
-        self.assertLessEqual(len(automation_bridge_package.__all__), 24)
+        self.assertLessEqual(len(automation_bridge_package.__all__), 25)
 
     def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
         class ScriptedClient:
@@ -295,7 +296,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         metadata = bridge.trace_metadata()
 
-        self.assertEqual("2.0.0", metadata["python_package_version"])
+        self.assertEqual("2.1.0", metadata["python_package_version"])
         self.assertEqual("1.1.0", metadata["native_version"])
         self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
 
@@ -353,6 +354,128 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
 
         self.assertTrue(accepted)
+
+    def test_editor_installations_returns_newest_valid_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            older_launcher = root / "older" / "Defold"
+            newer_launcher = root / "newer" / "Defold"
+            older_launcher.parent.mkdir()
+            newer_launcher.parent.mkdir()
+            older_launcher.touch()
+            newer_launcher.touch()
+            registry = root / "installations.json"
+            registry.write_text(
+                json.dumps([
+                    {
+                        "launcherPath": str(older_launcher),
+                        "installPath": str(older_launcher.parent),
+                        "lastLaunchedAt": "2026-07-06T12:00:00Z",
+                    },
+                    {
+                        "launcherPath": str(root / "missing" / "Defold"),
+                        "installPath": str(root / "missing"),
+                        "lastLaunchedAt": "2026-07-10T12:00:00Z",
+                    },
+                    {
+                        "launcherPath": str(newer_launcher),
+                        "installPath": str(newer_launcher.parent),
+                        "lastLaunchedAt": "2026-07-09T12:00:00Z",
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            with mock.patch.object(EditorClient, "installation_registry_path", return_value=registry):
+                installations = EditorClient.installations()
+                latest = EditorClient.latest_installation()
+
+        self.assertEqual([newer_launcher, older_launcher], [item.launcher_path for item in installations])
+        self.assertIsInstance(latest, DefoldInstallation)
+        self.assertEqual(newer_launcher, latest.launcher_path)
+
+    def test_editor_from_project_reuses_running_editor(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            with FakeHttpServer(b'{"openapi":"3.0.3"}') as server:
+                (internal / "editor.port").write_text(str(server.port), encoding="utf-8")
+                editor = EditorClient.from_project(root)
+
+        self.assertEqual(server.port, editor.port)
+        self.assertEqual("editor_reused", editor.lifecycle_events[-1]["stage"])
+
+    def test_editor_from_project_launches_latest_installation_when_port_is_missing(self):
+        with tempfile.TemporaryDirectory() as root:
+            project_root = Path(root).resolve()
+            project_file = project_root / "game.project"
+            project_file.write_text("[project]\ntitle = Test\n", encoding="utf-8")
+            launcher = project_root / "Defold"
+            launcher.touch()
+            process = mock.Mock(pid=4321)
+
+            def launch(*args, **kwargs):
+                internal = project_root / ".internal"
+                internal.mkdir()
+                (internal / "editor.port").write_text("54321", encoding="utf-8")
+                return process
+
+            with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
+                with mock.patch.object(EditorClient, "is_running", return_value=True):
+                    editor = EditorClient.from_project(root, launcher=launcher, timeout=0.2)
+
+        self.assertEqual(54321, editor.port)
+        self.assertEqual("editor_started", editor.lifecycle_events[-1]["stage"])
+        self.assertEqual([str(launcher), str(project_file)], popen.call_args.args[0])
+        self.assertEqual(project_root, popen.call_args.kwargs["cwd"])
+
+    def test_editor_preview_returns_png_and_encodes_dimensions(self):
+        png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
+        with tempfile.TemporaryDirectory() as root:
+            with FakeHttpServer(png) as server:
+                preview = EditorClient(root, port=server.port).preview(
+                    "gui/main menu.gui",
+                    width=320,
+                    height=180,
+                )
+
+        self.assertEqual(png, preview)
+        self.assertEqual(
+            "GET /preview/gui/main%20menu.gui?width=320&height=180 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_editor_preview_rejects_invalid_dimensions_before_request(self):
+        with tempfile.TemporaryDirectory() as root:
+            editor = EditorClient(root, port=12345)
+            with self.assertRaisesRegex(ValueError, "width"):
+                editor.preview("main/main.collection", width=0)
+
+    def test_editor_preview_scales_project_display_dimensions(self):
+        png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "game.project").write_text(
+                "[display]\nwidth = 960\nheight = 640\n",
+                encoding="utf-8",
+            )
+            with FakeHttpServer(png) as server:
+                preview = EditorClient(root, port=server.port).preview(
+                    "main/main.collection",
+                    resolution_multiplier=0.5,
+                )
+
+        self.assertEqual(png, preview)
+        self.assertEqual(
+            "GET /preview/main/main.collection?width=480&height=320 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_editor_preview_validates_resolution_multiplier(self):
+        with tempfile.TemporaryDirectory() as root:
+            editor = EditorClient(root, port=12345)
+            with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
+                editor.preview("main/main.collection", resolution_multiplier=0.001)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                editor.preview("main/main.collection", width=320, resolution_multiplier=0.5)
 
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
@@ -984,6 +1107,51 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             receipt.height,
             receipt.sha256,
         ))
+
+    def test_screenshot_resolution_multiplier_returns_scaled_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "native.png"
+            pixels = b"".join(
+                bytes((x * 40, y * 80, 120, 255))
+                for y in range(2)
+                for x in range(4)
+            )
+            source.write_bytes(_rgba_png(4, 2, pixels))
+
+            class ScreenshotClient(AutomationBridgeClient):
+                def __init__(self):
+                    super().__init__(1)
+
+                def _request(self, method, path, params=None, json_body=None):
+                    if path == "/screenshot":
+                        return {"capture_id": 9, "state": "pending", "path": str(source)}
+                    return {
+                        "capture_id": 9,
+                        "state": "complete",
+                        "path": str(source),
+                        "engine_frame": 30,
+                        "scene_sequence": 12,
+                        "width": 4,
+                        "height": 2,
+                        "sha256": "native-sha",
+                    }
+
+            receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
+
+            self.assertEqual((2, 1), (receipt.width, receipt.height))
+            self.assertEqual(0.5, receipt.raw["resolution_multiplier"])
+            self.assertEqual(str(source), receipt.raw["source_path"])
+            self.assertNotEqual(source, receipt.path)
+            self.assertTrue(receipt.exists())
+            self.assertEqual((2, 1), _read_automation_bridge_png(receipt.path)[:2])
+            self.assertEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), receipt.sha256)
+
+    def test_screenshot_validates_resolution_multiplier(self):
+        bridge = AutomationBridgeClient(1)
+        with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
+            bridge.screenshot(resolution_multiplier=0.001)
+        with self.assertRaisesRegex(ValueError, "wait=True"):
+            bridge.screenshot(wait=False, resolution_multiplier=0.5)
 
     def test_wait_frames_uses_native_frame_receipts(self):
         class FrameClient(AutomationBridgeClient):

@@ -1,5 +1,6 @@
 """Dependency-free Python client for the Automation Bridge runtime API."""
 
+import hashlib
 import json
 import difflib
 import os
@@ -25,7 +26,7 @@ JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "2.0.0"
+PYTHON_PACKAGE_VERSION = "2.1.0"
 SUPPORTED_API_VERSION_MIN = 1
 SUPPORTED_API_VERSION_MAX = 1
 
@@ -1316,11 +1317,22 @@ class AutomationBridgeClient:
         wait: bool = True,
         timeout: float = 5.0,
         after_frames: int = 0,
+        resolution_multiplier: Optional[float] = None,
         retry_exceptions: RetryExceptions = (),
     ) -> ScreenshotReceipt:
-        """Schedule an atomic PNG capture and return its native completion receipt."""
+        """Capture a PNG, optionally returning a lower-resolution derived image."""
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
+        if resolution_multiplier is not None:
+            if (
+                not isinstance(resolution_multiplier, (int, float))
+                or isinstance(resolution_multiplier, bool)
+                or not 0.01 <= float(resolution_multiplier) <= 1.0
+            ):
+                raise ValueError("screenshot resolution_multiplier must be from 0.01 through 1.0")
+            resolution_multiplier = float(resolution_multiplier)
+            if not wait and resolution_multiplier < 1.0:
+                raise ValueError("a downscaled screenshot requires wait=True")
         response = self._request("GET", "/screenshot", {"after_frames": after_frames})
         receipt = ScreenshotReceipt(response)
         if not wait:
@@ -1336,7 +1348,7 @@ class AutomationBridgeClient:
                 )
             return current if current.state == "complete" else None
 
-        return wait_until(
+        completed_receipt = wait_until(
             completed,
             timeout=timeout,
             interval=0.02,
@@ -1344,6 +1356,31 @@ class AutomationBridgeClient:
             retry_exceptions=retry_exceptions,
             scene_sequence=lambda: self._last_scene_sequence,
         )
+        if resolution_multiplier is None or resolution_multiplier == 1.0:
+            return completed_receipt
+        return self._scaled_screenshot(completed_receipt, resolution_multiplier)
+
+    @staticmethod
+    def _scaled_screenshot(receipt: ScreenshotReceipt, multiplier: float) -> ScreenshotReceipt:
+        from .visual import _resize_png
+
+        data, width, height = _resize_png(receipt, multiplier)
+        source = receipt.path
+        suffix = source.suffix or ".png"
+        destination = source.with_name(f"{source.stem}.scale-{multiplier:g}{suffix}")
+        destination.write_bytes(data)
+        scaled = dict(receipt.raw)
+        scaled.update(
+            {
+                "path": str(destination),
+                "width": width,
+                "height": height,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "source_path": str(source),
+                "resolution_multiplier": multiplier,
+            }
+        )
+        return ScreenshotReceipt(scaled)
 
     def convert_point(
         self,

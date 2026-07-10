@@ -4,6 +4,7 @@ The base client does not use pixels to decide node identity or visibility.
 This module is imported only by explicit visual waits/assertions.
 """
 
+import math
 import struct
 import time
 import zlib
@@ -96,6 +97,63 @@ def _read_png(source: Union[ScreenshotReceipt, str, Path, bytes]) -> _Image:
         rgba.extend(row)
         previous = row
     return _Image(width, height, bytes(rgba))
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(kind)
+    checksum = zlib.crc32(payload, checksum) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+
+def _encode_png(image: _Image) -> bytes:
+    stride = image.width * 4
+    rows = b"".join(
+        b"\0" + image.rgba[offset : offset + stride]
+        for offset in range(0, len(image.rgba), stride)
+    )
+    header = struct.pack(">IIBBBBB", image.width, image.height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(rows))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _resize_png(
+    source: Union[ScreenshotReceipt, str, Path, bytes],
+    multiplier: float,
+) -> Tuple[bytes, int, int]:
+    """Downscale an RGBA PNG with bilinear filtering."""
+    image = _read_png(source)
+    width = max(1, round(image.width * multiplier))
+    height = max(1, round(image.height * multiplier))
+    if (width, height) == (image.width, image.height):
+        data = source if isinstance(source, bytes) else Path(source).read_bytes()
+        return data, width, height
+
+    rgba = bytearray(width * height * 4)
+    for target_y in range(height):
+        source_y = (target_y + 0.5) * image.height / height - 0.5
+        y0 = max(0, min(image.height - 1, math.floor(source_y)))
+        y1 = min(image.height - 1, y0 + 1)
+        y_weight = max(0.0, min(1.0, source_y - y0))
+        for target_x in range(width):
+            source_x = (target_x + 0.5) * image.width / width - 0.5
+            x0 = max(0, min(image.width - 1, math.floor(source_x)))
+            x1 = min(image.width - 1, x0 + 1)
+            x_weight = max(0.0, min(1.0, source_x - x0))
+            target_offset = (target_y * width + target_x) * 4
+            for channel in range(4):
+                top_left = image.rgba[(y0 * image.width + x0) * 4 + channel]
+                top_right = image.rgba[(y0 * image.width + x1) * 4 + channel]
+                bottom_left = image.rgba[(y1 * image.width + x0) * 4 + channel]
+                bottom_right = image.rgba[(y1 * image.width + x1) * 4 + channel]
+                top = top_left + (top_right - top_left) * x_weight
+                bottom = bottom_left + (bottom_right - bottom_left) * x_weight
+                rgba[target_offset + channel] = round(top + (bottom - top) * y_weight)
+    resized = _Image(width, height, bytes(rgba))
+    return _encode_png(resized), width, height
 
 
 def _region(value: Optional[Region], width: int, height: int) -> Tuple[int, int, int, int]:

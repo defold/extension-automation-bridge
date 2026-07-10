@@ -11,7 +11,7 @@ from .client import (
     SelectorError,
     UnsupportedCapabilityError,
 )
-from .editor import EditorClient
+from .editor import DefoldInstallation, EditorClient
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
 from .nodes import Bounds, Node
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry
@@ -25,6 +25,7 @@ __all__ = [
     "AutomationBridgeError",
     "Bounds",
     "CommandTimeout",
+    "DefoldInstallation",
     "EditorClient",
     "Event",
     "EventBufferOverflow",

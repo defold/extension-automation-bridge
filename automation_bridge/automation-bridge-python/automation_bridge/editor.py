@@ -1,12 +1,18 @@
 """Client for the Defold editor HTTP server used to build and find the engine."""
 
+import configparser
 import json
+import os
 import re
+import subprocess
+import sys
 import time
+import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
-from .client import AutomationBridgeError, request_json
+from .client import AutomationBridgeError, HttpError, request_json, request_raw
 from .waits import wait_until
 
 
@@ -16,6 +22,15 @@ _ENGINE_SERVICE_PORT_PATTERNS = (
     re.compile(r"Log server started on port (\d+)"),
 )
 _REMOTERY_URL_PATTERN = re.compile(r"Initialized Remotery \((ws://[^)\s]+)\)")
+
+
+@dataclass(frozen=True)
+class DefoldInstallation:
+    """One Defold installation discovered through the editor registry."""
+
+    launcher_path: Path
+    install_path: Path
+    last_launched_at: str
 
 
 class EditorClient:
@@ -37,9 +52,130 @@ class EditorClient:
         self._lifecycle_events = []
 
     @classmethod
-    def from_project(cls, root: Union[str, Path] = ".") -> "EditorClient":
-        """Create a client by reading `.internal/editor.port` from `root`."""
-        return cls(root)
+    def from_project(
+        cls,
+        root: Union[str, Path] = ".",
+        *,
+        start_if_needed: bool = True,
+        timeout: float = 30.0,
+        launcher: Optional[Union[str, Path]] = None,
+    ) -> "EditorClient":
+        """Connect to this project's editor, launching Defold when necessary."""
+        project_root = Path(root).resolve()
+        try:
+            client = cls(project_root)
+        except (FileNotFoundError, ValueError):
+            client = None
+        if client is not None and client.is_running(timeout=min(1.0, timeout)):
+            client._record_lifecycle("editor_reused", port=client.port)
+            return client
+        if not start_if_needed:
+            if client is not None:
+                return client
+            raise FileNotFoundError(
+                f"Defold editor port file is missing: {project_root / '.internal' / 'editor.port'}"
+            )
+
+        project_file = project_root / "game.project"
+        if not project_file.is_file():
+            raise FileNotFoundError(f"Defold project file is missing: {project_file}")
+        launcher_path = Path(launcher).expanduser().resolve() if launcher is not None else cls.latest_installation().launcher_path
+        if not launcher_path.is_file():
+            raise FileNotFoundError(f"Defold launcher is missing: {launcher_path}")
+        process = subprocess.Popen(
+            [str(launcher_path), str(project_file)],
+            cwd=project_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=sys.platform != "win32",
+        )
+
+        def ready() -> Optional["EditorClient"]:
+            try:
+                candidate = cls(project_root)
+                return candidate if candidate.is_running(timeout=min(1.0, timeout)) else None
+            except (AutomationBridgeError, FileNotFoundError, OSError, ValueError):
+                return None
+
+        client = wait_until(
+            ready,
+            timeout=timeout,
+            interval=0.1,
+            message=f"Defold editor did not start for {project_root}",
+            retry_exceptions=(AutomationBridgeError,),
+        )
+        client._record_lifecycle(
+            "editor_started",
+            launcher=str(launcher_path),
+            process_id=process.pid,
+            port=client.port,
+        )
+        return client
+
+    @classmethod
+    def installations(cls) -> list[DefoldInstallation]:
+        """Return registered Defold installations, newest launch first."""
+        registry_path = cls.installation_registry_path()
+        try:
+            value = json.loads(registry_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError) as exc:
+            raise AutomationBridgeError(f"cannot read Defold installation registry {registry_path}: {exc}") from exc
+        if not isinstance(value, list):
+            raise AutomationBridgeError(f"Defold installation registry is not an array: {registry_path}")
+        installations = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            launcher_path = item.get("launcherPath")
+            install_path = item.get("installPath")
+            last_launched_at = item.get("lastLaunchedAt")
+            if not all(isinstance(field, str) and field for field in (launcher_path, install_path, last_launched_at)):
+                continue
+            launcher = Path(launcher_path).expanduser()
+            if not launcher.is_file():
+                continue
+            installations.append(
+                DefoldInstallation(
+                    launcher_path=launcher,
+                    install_path=Path(install_path).expanduser(),
+                    last_launched_at=last_launched_at,
+                )
+            )
+        return sorted(installations, key=lambda installation: installation.last_launched_at, reverse=True)
+
+    @classmethod
+    def latest_installation(cls) -> DefoldInstallation:
+        """Return the most recently launched registered Defold installation."""
+        installations = cls.installations()
+        if not installations:
+            raise AutomationBridgeError(
+                f"no Defold installation was found in {cls.installation_registry_path()}"
+            )
+        return installations[0]
+
+    @staticmethod
+    def installation_registry_path() -> Path:
+        """Return the platform-specific registry path introduced by Defold #12699."""
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / "Defold" / "installations.json"
+        if sys.platform == "win32":
+            base = os.environ.get("LOCALAPPDATA")
+            if not base:
+                raise AutomationBridgeError("LOCALAPPDATA is not set")
+            return Path(base) / "Defold" / "installations.json"
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+        return base / "Defold" / "installations.json"
+
+    def is_running(self, timeout: float = 1.0) -> bool:
+        """Return whether this project's recorded editor port serves the editor API."""
+        try:
+            status, _ = request_json(f"{self.base_url}/openapi.json", timeout=timeout)
+            return 200 <= status < 300
+        except AutomationBridgeError:
+            return False
 
     def build(self, timeout: float = 60.0) -> None:
         """Build/run the project and wait until the Automation Bridge HTTP endpoint registers."""
@@ -82,6 +218,71 @@ class EditorClient:
         """Return current editor console lines."""
         _, response = request_json(f"{self.base_url}/console", timeout=10.0)
         return response.get("lines", [])
+
+    def preview(
+        self,
+        path: Union[str, Path],
+        *,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        resolution_multiplier: Optional[float] = None,
+        timeout: float = 30.0,
+    ) -> bytes:
+        """Render a scene resource through the editor and return PNG bytes.
+
+        Supported resources are those with a scene view, such as collections,
+        game objects, GUI scenes, particle effects, and tile maps. Omitted
+        dimensions use the project display dimensions. Use
+        ``resolution_multiplier`` for a smaller project-aspect-ratio preview.
+        """
+        if resolution_multiplier is not None:
+            if width is not None or height is not None:
+                raise ValueError("resolution_multiplier is mutually exclusive with width and height")
+            if (
+                not isinstance(resolution_multiplier, (int, float))
+                or isinstance(resolution_multiplier, bool)
+                or not 0.01 <= float(resolution_multiplier) <= 1.0
+            ):
+                raise ValueError("preview resolution_multiplier must be from 0.01 through 1.0")
+            display_width, display_height = self._project_display_size()
+            width = max(1, round(display_width * float(resolution_multiplier)))
+            height = max(1, round(display_height * float(resolution_multiplier)))
+        params = {}
+        for name, value in (("width", width), ("height", height)):
+            if value is not None:
+                if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 4096:
+                    raise ValueError(f"preview {name} must be an integer from 1 through 4096")
+                params[name] = value
+        project_path = str(path).replace("\\", "/").lstrip("/")
+        if not project_path:
+            raise ValueError("preview path must identify a project resource")
+        encoded_path = urllib.parse.quote(project_path, safe="/")
+        url = f"{self.base_url}/preview/{encoded_path}"
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        status, body = request_raw(url, timeout=timeout)
+        if status < 200 or status >= 300:
+            message = body[:300].decode("utf-8", "replace").strip() or f"unexpected status {status}"
+            raise HttpError("GET", url, message, status=status)
+        if not body.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise HttpError("GET", url, "editor preview did not return a PNG", status=status)
+        return body
+
+    def _project_display_size(self) -> tuple[int, int]:
+        config = configparser.ConfigParser(interpolation=None, strict=False)
+        project_path = self.root / "game.project"
+        try:
+            with project_path.open(encoding="utf-8") as stream:
+                config.read_file(stream)
+            width = config.getint("display", "width", fallback=960)
+            height = config.getint("display", "height", fallback=640)
+        except (OSError, configparser.Error, ValueError) as exc:
+            raise AutomationBridgeError(f"cannot read project display dimensions from {project_path}: {exc}") from exc
+        if width <= 0 or height <= 0:
+            raise AutomationBridgeError(
+                f"project display dimensions must be positive, got {width}x{height}"
+            )
+        return width, height
 
     def engine_service_port(self) -> Optional[int]:
         """Return the service port before endpoint registration, or the cached reused port."""

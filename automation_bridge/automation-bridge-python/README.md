@@ -28,7 +28,7 @@ label = bridge.wait_for_node(
 )
 bridge.drag(bridge.parent(label), (500, 300), duration=0.16)
 
-shot = bridge.screenshot(wait=True)
+shot = bridge.screenshot(wait=True, resolution_multiplier=0.5)
 print(shot.path, shot.frame, shot.scene_sequence, shot.sha256)
 ```
 
@@ -78,9 +78,11 @@ The usual bootstrap is:
 bridge = AutomationBridgeClient.from_project(".", build=True)
 ```
 
-It builds through the editor, discovers the engine service port, rejects a
-stale cached port belonging to another engine or project, and waits for
-`/automation-bridge/v1/health`.
+It reuses the editor recorded in `.internal/editor.port`. If the port file is
+missing or stale, it discovers the most recently launched Defold installation,
+starts that editor with the project's `game.project`, then builds, discovers
+the engine service port, rejects a stale cached engine port belonging to
+another engine or project, and waits for `/automation-bridge/v1/health`.
 
 For explicit editor control:
 
@@ -93,9 +95,45 @@ bridge = AutomationBridgeClient.from_editor(editor, build=False)
 ```
 
 `EditorClient` deliberately exposes only `from_project()`, `build()`,
+`is_running()`, `installations()`, `latest_installation()`, `preview(...)`,
 `console_lines()`, `engine_service_port()`, and `lifecycle_events`. Port-cache,
 registration-window, and identity-validation operations are implementation
 details of bootstrap.
+
+Defold installations are read from the platform registry introduced for IDE
+integration. Entries include launcher path, installation path, and the last
+launch timestamp:
+
+```python
+for installation in EditorClient.installations():
+    print(installation.launcher_path, installation.last_launched_at)
+
+editor = EditorClient.from_project(".")  # reuses or launches automatically
+```
+
+Pass `start_if_needed=False` when missing editor state should remain an error,
+or `launcher=...` to use an explicit Defold executable.
+
+Render a scene resource without building or running the game:
+
+```python
+from pathlib import Path
+
+preview_png = editor.preview(
+    "main/main.collection",
+    resolution_multiplier=0.5,
+)
+Path("preview.png").write_bytes(preview_png)
+```
+
+Previewable resources are resources with a scene view, including collections,
+game objects, GUI scenes, particle effects, and tile maps. Omitted dimensions
+use the project display dimensions; explicit dimensions must be from 1 through
+4096. `resolution_multiplier` accepts `0.01` through `1.0`, preserves the
+project display aspect ratio, and is mutually exclusive with explicit
+dimensions. Agents should normally start with `0.5` to reduce transfer and
+image-processing cost, then request a larger preview only when fine visual
+detail matters.
 
 Connect to an already-running engine service directly:
 
@@ -237,7 +275,18 @@ gone = bridge.wait_for_disappearance(node.id)
 ## Screenshots and visual checks
 
 `screenshot(wait=True)` returns an atomic `ScreenshotReceipt` containing the
-capture path, engine frame, scene sequence, dimensions, and SHA-256.
+capture path, engine frame, scene sequence, dimensions, and SHA-256. Runtime
+screenshots also accept `resolution_multiplier` from `0.01` through `1.0`:
+
+```python
+shot = bridge.screenshot(resolution_multiplier=0.5)
+print(shot.path, shot.width, shot.height, shot.sha256)
+```
+
+The engine capture remains available at `shot.raw["source_path"]`; the returned
+receipt points to a bilinear-downscaled PNG with updated dimensions and hash.
+Downscaling requires `wait=True`. Agents should normally start with `0.5` and
+use full resolution only when fine detail matters.
 
 Pixel comparisons are explicitly namespaced:
 

@@ -15,7 +15,10 @@
 - Component nodes often expose labels while their parent game object receives
   input; use `bridge.parent(component_node)`.
 - Input accepts nodes, ids, point mappings, tuples, or raw coordinates.
-- `screenshot(wait=True)` returns an atomic completion receipt.
+- `screenshot(wait=True)` returns an atomic completion receipt. Prefer
+  `resolution_multiplier=0.5` for initial agent inspection; the returned
+  receipt describes the downscaled PNG and retains the native path in
+  `raw["source_path"]`.
 - Observation uses `wait_for_node(...)`, optionally with
   `after_scene_sequence`, `observe_node(...)`, and
   `wait_for_disappearance(...)`.
@@ -24,8 +27,14 @@
 - Profiling is publicly named only as profiling. The internal stream protocol
   implementation lives in `remotery.py`; callers use `bridge.profiler` and
   profiler-named types from `automation_bridge.profiler`.
-- `EditorClient` exposes build, console, discovered primary port, and lifecycle
-  diagnostics. Registration parsing, port caching, and identity validation are
-  private bootstrap mechanics.
+- `EditorClient.from_project(...)` reuses a healthy editor from
+  `.internal/editor.port`; if absent or stale, it uses the newest launcher from
+  Defold's platform installation registry and starts the editor for the project.
+  `installations()` and `latest_installation()` expose that discovery data.
+- `EditorClient.preview(...)` renders scene resources to PNG without running the
+  game. Prefer `resolution_multiplier=0.5` for initial agent inspection; use a
+  larger multiplier or explicit dimensions only when fine detail matters.
+  Registration parsing, port caching, and identity validation are private
+  bootstrap mechanics.
 - Full user/API documentation lives in `README.md`; raw endpoint documentation
   lives in `../README.md`.
