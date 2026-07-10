@@ -58,178 +58,409 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, status_code, &response);
     }
 
-    static bool DrainRequestBody(dmWebServer::Request* request)
+    static char* ReadRequestBody(dmWebServer::Request* request)
     {
-        char buffer[256];
-        uint32_t remaining = request->m_ContentLength;
-        while (remaining > 0)
-        {
-            uint32_t received = 0;
-            uint32_t to_read = remaining < sizeof(buffer) ? remaining : (uint32_t)sizeof(buffer);
-            dmWebServer::Result result = dmWebServer::Receive(request, buffer, to_read, &received);
-            if (result != dmWebServer::RESULT_OK || received == 0)
-            {
-                return false;
-            }
-            remaining -= received;
-        }
-        return true;
-    }
-
-    static char* ReceiveRequestBody(dmWebServer::Request* request, uint32_t max_size)
-    {
-        if (!request || request->m_ContentLength == 0 || request->m_ContentLength > max_size)
-        {
-            return 0;
-        }
-        char* body = (char*)malloc(request->m_ContentLength + 1);
+        char* body = (char*)malloc((size_t)request->m_ContentLength + 1);
         if (!body)
         {
             return 0;
         }
+        uint32_t remaining = request->m_ContentLength;
         uint32_t offset = 0;
-        while (offset < request->m_ContentLength)
+        while (remaining > 0)
         {
             uint32_t received = 0;
-            dmWebServer::Result result = dmWebServer::Receive(request, body + offset, request->m_ContentLength - offset, &received);
+            dmWebServer::Result result = dmWebServer::Receive(request, body + offset, remaining, &received);
             if (result != dmWebServer::RESULT_OK || received == 0)
             {
                 free(body);
                 return 0;
             }
+            remaining -= received;
             offset += received;
         }
         body[offset] = 0;
         return body;
     }
 
-    static void SkipJsonWhitespace(const char** cursor)
+    static void DiscardRequestBody(dmWebServer::Request* request)
     {
-        while (**cursor && isspace((unsigned char)**cursor)) ++*cursor;
+        char buffer[512];
+        uint32_t remaining = request->m_ContentLength;
+        while (remaining > 0)
+        {
+            uint32_t received = 0;
+            uint32_t requested = remaining < sizeof(buffer) ? remaining : (uint32_t)sizeof(buffer);
+            if (dmWebServer::Receive(request, buffer, requested, &received) != dmWebServer::RESULT_OK || received == 0)
+            {
+                return;
+            }
+            remaining -= received;
+        }
     }
 
-    static char* ParseJsonString(const char** cursor, uint32_t max_size)
+    static void JsonSkipWhitespace(const char** cursor)
     {
-        if (**cursor != '"') return 0;
+        while (**cursor && isspace((unsigned char)**cursor))
+        {
+            ++*cursor;
+        }
+    }
+
+    static int JsonHexValue(char c)
+    {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    static bool JsonAppendCodepoint(StringBuffer* out, uint32_t codepoint)
+    {
+        if (codepoint <= 0x7f)
+        {
+            StringBufferAppendChar(out, (char)codepoint);
+        }
+        else if (codepoint <= 0x7ff)
+        {
+            StringBufferAppendChar(out, (char)(0xc0 | (codepoint >> 6)));
+            StringBufferAppendChar(out, (char)(0x80 | (codepoint & 0x3f)));
+        }
+        else if (codepoint <= 0xffff)
+        {
+            StringBufferAppendChar(out, (char)(0xe0 | (codepoint >> 12)));
+            StringBufferAppendChar(out, (char)(0x80 | ((codepoint >> 6) & 0x3f)));
+            StringBufferAppendChar(out, (char)(0x80 | (codepoint & 0x3f)));
+        }
+        else if (codepoint <= 0x10ffff)
+        {
+            StringBufferAppendChar(out, (char)(0xf0 | (codepoint >> 18)));
+            StringBufferAppendChar(out, (char)(0x80 | ((codepoint >> 12) & 0x3f)));
+            StringBufferAppendChar(out, (char)(0x80 | ((codepoint >> 6) & 0x3f)));
+            StringBufferAppendChar(out, (char)(0x80 | (codepoint & 0x3f)));
+        }
+        else
+        {
+            return false;
+        }
+        return !out->m_Failed;
+    }
+
+    static bool JsonParseString(const char** cursor, char** value)
+    {
+        if (**cursor != '"') return false;
         ++*cursor;
-        StringBuffer value;
-        StringBufferInit(&value);
+        StringBuffer decoded;
+        StringBufferInit(&decoded);
         while (**cursor && **cursor != '"')
         {
-            char c = *(*cursor)++;
-            if (c == '\\')
+            unsigned char c = (unsigned char)*(*cursor)++;
+            if (c < 0x20)
             {
-                char escaped = *(*cursor)++;
-                if (!escaped || escaped == 'u')
-                {
-                    StringBufferFree(&value);
-                    return 0;
-                }
-                if (escaped == 'b') c = '\b';
-                else if (escaped == 'f') c = '\f';
-                else if (escaped == 'n') c = '\n';
-                else if (escaped == 'r') c = '\r';
-                else if (escaped == 't') c = '\t';
-                else if (escaped == '"' || escaped == '\\' || escaped == '/') c = escaped;
-                else
-                {
-                    StringBufferFree(&value);
-                    return 0;
-                }
+                StringBufferFree(&decoded);
+                return false;
             }
-            if ((unsigned char)c < 0x20 || value.m_Size >= max_size)
+            if (c != '\\')
             {
-                StringBufferFree(&value);
-                return 0;
+                StringBufferAppendChar(&decoded, (char)c);
+                continue;
             }
-            StringBufferAppendChar(&value, c);
+            char escaped = *(*cursor)++;
+            if (!escaped)
+            {
+                StringBufferFree(&decoded);
+                return false;
+            }
+            switch (escaped)
+            {
+            case '"': StringBufferAppendChar(&decoded, '"'); break;
+            case '\\': StringBufferAppendChar(&decoded, '\\'); break;
+            case '/': StringBufferAppendChar(&decoded, '/'); break;
+            case 'b': StringBufferAppendChar(&decoded, '\b'); break;
+            case 'f': StringBufferAppendChar(&decoded, '\f'); break;
+            case 'n': StringBufferAppendChar(&decoded, '\n'); break;
+            case 'r': StringBufferAppendChar(&decoded, '\r'); break;
+            case 't': StringBufferAppendChar(&decoded, '\t'); break;
+            case 'u':
+            {
+                uint32_t codepoint = 0;
+                for (uint32_t i = 0; i < 4; ++i)
+                {
+                    int digit = JsonHexValue(*(*cursor)++);
+                    if (digit < 0)
+                    {
+                        StringBufferFree(&decoded);
+                        return false;
+                    }
+                    codepoint = (codepoint << 4) | (uint32_t)digit;
+                }
+                if (codepoint >= 0xd800 && codepoint <= 0xdbff)
+                {
+                    if ((*cursor)[0] != '\\' || (*cursor)[1] != 'u')
+                    {
+                        StringBufferFree(&decoded);
+                        return false;
+                    }
+                    *cursor += 2;
+                    uint32_t low = 0;
+                    for (uint32_t i = 0; i < 4; ++i)
+                    {
+                        int digit = JsonHexValue(*(*cursor)++);
+                        if (digit < 0)
+                        {
+                            StringBufferFree(&decoded);
+                            return false;
+                        }
+                        low = (low << 4) | (uint32_t)digit;
+                    }
+                    if (low < 0xdc00 || low > 0xdfff)
+                    {
+                        StringBufferFree(&decoded);
+                        return false;
+                    }
+                    codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+                }
+                else if (codepoint >= 0xdc00 && codepoint <= 0xdfff)
+                {
+                    StringBufferFree(&decoded);
+                    return false;
+                }
+                if (!JsonAppendCodepoint(&decoded, codepoint))
+                {
+                    StringBufferFree(&decoded);
+                    return false;
+                }
+                break;
+            }
+            default:
+                StringBufferFree(&decoded);
+                return false;
+            }
         }
         if (**cursor != '"')
         {
-            StringBufferFree(&value);
-            return 0;
+            StringBufferFree(&decoded);
+            return false;
         }
         ++*cursor;
-        return StringBufferDetach(&value);
+        *value = StringBufferDetach(&decoded);
+        return *value != 0;
     }
 
-    static bool AddJsonQueryParam(Array<QueryParam>* query, char* key, char* value)
+    static bool JsonSkipValue(const char** cursor, uint32_t depth);
+
+    static bool JsonPushParam(Array<QueryParam>* params, const char* key, char* value)
     {
         QueryParam param;
-        param.m_Key = key;
+        memset(&param, 0, sizeof(param));
+        param.m_Key = DuplicateString(key);
         param.m_Value = value;
-        return ArrayPush(query, &param);
+        if (!param.m_Key || !param.m_Value || !ArrayPush(params, &param))
+        {
+            FreeString(&param.m_Key);
+            FreeString(&param.m_Value);
+            return false;
+        }
+        return true;
     }
 
-    static bool ParseFlatJsonObject(const char* body, Array<QueryParam>* query)
+    static bool JsonSkipArray(const char** cursor, uint32_t depth)
     {
-        const char* cursor = body;
-        SkipJsonWhitespace(&cursor);
-        if (*cursor++ != '{') return false;
-        SkipJsonWhitespace(&cursor);
-        if (*cursor == '}')
+        if (depth > MAX_JSON_NESTING || **cursor != '[') return false;
+        ++*cursor;
+        JsonSkipWhitespace(cursor);
+        if (**cursor == ']') { ++*cursor; return true; }
+        while (**cursor)
         {
-            ++cursor;
-            SkipJsonWhitespace(&cursor);
-            return *cursor == 0;
+            if (!JsonSkipValue(cursor, depth + 1)) return false;
+            JsonSkipWhitespace(cursor);
+            if (**cursor == ']') { ++*cursor; return true; }
+            if (**cursor != ',') return false;
+            ++*cursor;
+            JsonSkipWhitespace(cursor);
         }
-        while (*cursor)
+        return false;
+    }
+
+    static bool JsonSkipObject(const char** cursor, uint32_t depth)
+    {
+        if (depth > MAX_JSON_NESTING || **cursor != '{') return false;
+        ++*cursor;
+        JsonSkipWhitespace(cursor);
+        if (**cursor == '}') { ++*cursor; return true; }
+        while (**cursor)
         {
-            SkipJsonWhitespace(&cursor);
-            char* key = ParseJsonString(&cursor, 64);
-            if (!key) return false;
-            SkipJsonWhitespace(&cursor);
-            if (*cursor++ != ':')
+            char* key = 0;
+            if (!JsonParseString(cursor, &key)) return false;
+            free(key);
+            JsonSkipWhitespace(cursor);
+            if (**cursor != ':') return false;
+            ++*cursor;
+            JsonSkipWhitespace(cursor);
+            if (!JsonSkipValue(cursor, depth + 1)) return false;
+            JsonSkipWhitespace(cursor);
+            if (**cursor == '}') { ++*cursor; return true; }
+            if (**cursor != ',') return false;
+            ++*cursor;
+            JsonSkipWhitespace(cursor);
+        }
+        return false;
+    }
+
+    static bool JsonSkipValue(const char** cursor, uint32_t depth)
+    {
+        if (depth > MAX_JSON_NESTING) return false;
+        JsonSkipWhitespace(cursor);
+        if (**cursor == '{') return JsonSkipObject(cursor, depth);
+        if (**cursor == '[') return JsonSkipArray(cursor, depth);
+        if (**cursor == '"')
+        {
+            char* value = 0;
+            bool ok = JsonParseString(cursor, &value);
+            free(value);
+            return ok;
+        }
+        if (StartsWith(*cursor, "true")) { *cursor += 4; return true; }
+        if (StartsWith(*cursor, "false")) { *cursor += 5; return true; }
+        if (StartsWith(*cursor, "null")) { *cursor += 4; return true; }
+        const char* number = *cursor;
+        if (*number == '-') ++number;
+        if (*number == '0')
+        {
+            ++number;
+            if (isdigit((unsigned char)*number)) return false;
+        }
+        else
+        {
+            if (*number < '1' || *number > '9') return false;
+            while (isdigit((unsigned char)*number)) ++number;
+        }
+        if (*number == '.')
+        {
+            ++number;
+            if (!isdigit((unsigned char)*number)) return false;
+            while (isdigit((unsigned char)*number)) ++number;
+        }
+        if (*number == 'e' || *number == 'E')
+        {
+            ++number;
+            if (*number == '+' || *number == '-') ++number;
+            if (!isdigit((unsigned char)*number)) return false;
+            while (isdigit((unsigned char)*number)) ++number;
+        }
+        *cursor = number;
+        return true;
+    }
+
+    static bool JsonParsePointObject(const char** cursor, Array<QueryParam>* params)
+    {
+        if (**cursor != '{') return false;
+        ++*cursor;
+        JsonSkipWhitespace(cursor);
+        if (**cursor == '}') { ++*cursor; return true; }
+        while (**cursor)
+        {
+            char* key = 0;
+            if (!JsonParseString(cursor, &key)) return false;
+            JsonSkipWhitespace(cursor);
+            if (**cursor != ':') { free(key); return false; }
+            ++*cursor;
+            JsonSkipWhitespace(cursor);
+            if ((StringsEqual(key, "x") || StringsEqual(key, "y")) && **cursor != '{' && **cursor != '[')
             {
-                FreeString(&key);
+                char* value = 0;
+                if (**cursor == '"')
+                {
+                    if (!JsonParseString(cursor, &value)) { free(key); return false; }
+                }
+                else
+                {
+                    const char* start = *cursor;
+                    if (!JsonSkipValue(cursor, 2)) { free(key); return false; }
+                    value = DuplicateStringN(start, (uint32_t)(*cursor - start));
+                }
+                char flattened_key[16];
+                dmSnPrintf(flattened_key, sizeof(flattened_key), "point.%s", key);
+                if (!JsonPushParam(params, flattened_key, value)) { free(key); return false; }
+            }
+            else if (!JsonSkipValue(cursor, 2))
+            {
+                free(key);
                 return false;
             }
-            SkipJsonWhitespace(&cursor);
-            char* value = 0;
+            free(key);
+            JsonSkipWhitespace(cursor);
+            if (**cursor == '}') { ++*cursor; return true; }
+            if (**cursor != ',') return false;
+            ++*cursor;
+            JsonSkipWhitespace(cursor);
+        }
+        return false;
+    }
+
+    static bool JsonParseRootObject(const char* body, Array<QueryParam>* params)
+    {
+        const char* cursor = body;
+        JsonSkipWhitespace(&cursor);
+        if (*cursor != '{') return false;
+        ++cursor;
+        JsonSkipWhitespace(&cursor);
+        if (*cursor == '}') { ++cursor; JsonSkipWhitespace(&cursor); return *cursor == 0; }
+        while (*cursor)
+        {
+            QueryParam param;
+            memset(&param, 0, sizeof(param));
+            if (!JsonParseString(&cursor, &param.m_Key)) return false;
+            JsonSkipWhitespace(&cursor);
+            if (*cursor != ':') { FreeString(&param.m_Key); return false; }
+            ++cursor;
+            JsonSkipWhitespace(&cursor);
+
             if (*cursor == '"')
             {
-                value = ParseJsonString(&cursor, 8192);
+                if (!JsonParseString(&cursor, &param.m_Value)) { FreeString(&param.m_Key); return false; }
+            }
+            else if (*cursor == '{' || *cursor == '[')
+            {
+                if (StringsEqual(param.m_Key, "point") && *cursor == '{')
+                {
+                    if (!JsonParsePointObject(&cursor, params)) { FreeString(&param.m_Key); return false; }
+                }
+                else if (!JsonSkipValue(&cursor, 1)) { FreeString(&param.m_Key); return false; }
             }
             else
             {
                 const char* start = cursor;
-                while (*cursor && *cursor != ',' && *cursor != '}' && !isspace((unsigned char)*cursor)) ++cursor;
-                uint32_t length = (uint32_t)(cursor - start);
-                if (length == 0 || length > 64)
+                if (!JsonSkipValue(&cursor, 1)) { FreeString(&param.m_Key); return false; }
+                if ((uint32_t)(cursor - start) != 4 || strncmp(start, "null", 4) != 0)
                 {
-                    FreeString(&key);
+                    param.m_Value = DuplicateStringN(start, (uint32_t)(cursor - start));
+                }
+            }
+
+            if (param.m_Value)
+            {
+                if (!ArrayPush(params, &param))
+                {
+                    FreeString(&param.m_Key);
+                    FreeString(&param.m_Value);
                     return false;
                 }
-                value = DuplicateStringN(start, length);
-                if (value && !StringsEqual(value, "true") && !StringsEqual(value, "false"))
-                {
-                    char* end = 0;
-                    strtod(value, &end);
-                    if (!end || *end != 0)
-                    {
-                        FreeString(&value);
-                    }
-                }
             }
-            if (!value || !AddJsonQueryParam(query, key, value))
+            else
             {
-                FreeString(&key);
-                FreeString(&value);
-                return false;
+                FreeString(&param.m_Key);
             }
-            SkipJsonWhitespace(&cursor);
-            if (*cursor == ',')
-            {
-                ++cursor;
-                continue;
-            }
+            JsonSkipWhitespace(&cursor);
             if (*cursor == '}')
             {
                 ++cursor;
-                SkipJsonWhitespace(&cursor);
+                JsonSkipWhitespace(&cursor);
                 return *cursor == 0;
             }
-            return false;
+            if (*cursor != ',') return false;
+            ++cursor;
+            JsonSkipWhitespace(&cursor);
         }
         return false;
     }
@@ -292,6 +523,23 @@ namespace dmAutomationBridge
             return false;
         }
 
+        *value = (uint32_t)parsed;
+        return true;
+    }
+
+    static bool RequestGetUIntParamAllowZero(const RequestContext* ctx, const char* key, uint32_t* value, uint32_t max_value = 0xffffffffU)
+    {
+        const char* text = GetParam(&ctx->m_Query, key);
+        if (IsEmpty(text) || !isdigit((unsigned char)text[0]))
+        {
+            return false;
+        }
+        char* end = 0;
+        unsigned long parsed = strtoul(text, &end, 10);
+        if (!end || *end != 0 || parsed > (unsigned long)max_value)
+        {
+            return false;
+        }
         *value = (uint32_t)parsed;
         return true;
     }
@@ -452,6 +700,7 @@ namespace dmAutomationBridge
         {
             StringBufferAppend(&response, ",\"screenshot\"");
         }
+        StringBufferAppend(&response, ",\"scene.pagination\",\"scene.identity\",\"coordinates.convert\",\"frame.wait\"");
         StringBufferAppend(&response, "],\"screen\":");
         AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
         StringBufferAppend(&response, ",\"scene_sequence\":");
@@ -481,7 +730,13 @@ namespace dmAutomationBridge
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
         AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
-        StringBufferAppend(&response, "}\n");
+        response.m_Size--;
+        response.m_Data[response.m_Size] = 0;
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
 
@@ -496,21 +751,40 @@ namespace dmAutomationBridge
             return;
         }
 
-        if (!DefoldPrivateApiSetWindowSize(width, height))
+        if (!DefoldPrivateApiCanSetWindowSize())
         {
-            RequestSendError(ctx, 500, "screen_resize_failed", "failed to set window size");
+            RequestSendError(ctx, 409, "screen_resize_unsupported", "the platform window cannot be resized");
             return;
         }
+
+        RefreshSnapshotForRequest();
+        bool already_correct = g_AutomationBridge.m_Snapshot.m_WindowWidth == width &&
+                               g_AutomationBridge.m_Snapshot.m_WindowHeight == height;
+        bool observed = already_correct || DefoldPrivateApiSetWindowSize(width, height);
 
         UpdateSnapshot();
         g_AutomationBridge.m_SnapshotFrame = g_AutomationBridge.m_Frame;
 
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"requested\":{\"width\":");
+        AppendNumber(&response, width);
+        StringBufferAppend(&response, ",\"height\":");
+        AppendNumber(&response, height);
+        StringBufferAppend(&response, "},\"outcome\":");
+        AppendJsonString(&response, already_correct ? "already_correct" : (observed ? "resized" : "requested_not_observed"));
+        StringBufferAppend(&response, ",\"window_matches\":");
+        StringBufferAppend(&response, g_AutomationBridge.m_Snapshot.m_WindowWidth == width && g_AutomationBridge.m_Snapshot.m_WindowHeight == height ? "true" : "false");
+        StringBufferAppend(&response, ",\"backbuffer_matches\":");
+        StringBufferAppend(&response, g_AutomationBridge.m_Snapshot.m_BackbufferWidth == width && g_AutomationBridge.m_Snapshot.m_BackbufferHeight == height ? "true" : "false");
+        StringBufferAppend(&response, ",\"screen\":");
         AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
-        StringBufferAppend(&response, "}\n");
-        RequestSendJson(ctx, 200, &response);
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, observed ? 200 : 202, &response);
     }
 
     static void HandleScene(RequestContext* ctx)
@@ -536,36 +810,62 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, visible_only ? "true" : "false");
         StringBufferAppend(&response, ",\"screen\":");
         AppendScreenJson(&response, snapshot);
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)snapshot->m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
         StringBufferAppend(&response, ",\"root\":");
         AppendNodeJson(&response, snapshot, &snapshot->m_Nodes.m_Data[snapshot->m_Root], &include, true, visible_only);
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
 
-    static bool NodeMatchesFilters(const Node* node, const RequestContext* ctx)
+    static bool NodeMatchesFilters(const Node* node, const RequestContext* ctx, bool ignore_state_filters = false)
     {
+        bool case_sensitive = false;
+        RequestGetBoolParam(ctx, "case_sensitive", &case_sensitive);
         const char* value = RequestGetParam(ctx, "id");
         if (value && !StringsEqual(node->m_Id, value))
         {
             return false;
         }
         value = RequestGetParam(ctx, "type");
-        if (value && !ContainsCaseInsensitive(node->m_Type, value))
+        if (value && !(case_sensitive ? ContainsCaseSensitive(node->m_Type, value) : ContainsCaseInsensitive(node->m_Type, value)))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "type_exact");
+        if (value && !StringsEqual(node->m_Type, value))
         {
             return false;
         }
         value = RequestGetParam(ctx, "name");
-        if (value && !ContainsCaseInsensitive(node->m_Name, value))
+        if (value && !(case_sensitive ? ContainsCaseSensitive(node->m_Name, value) : ContainsCaseInsensitive(node->m_Name, value)))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "name_exact");
+        if (value && !StringsEqual(node->m_Name, value))
         {
             return false;
         }
         value = RequestGetParam(ctx, "text");
-        if (value && !ContainsCaseInsensitive(node->m_Text, value))
+        if (value && !(case_sensitive ? ContainsCaseSensitive(node->m_Text, value) : ContainsCaseInsensitive(node->m_Text, value)))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "text_exact");
+        if (value && !StringsEqual(node->m_Text, value))
         {
             return false;
         }
         value = RequestGetParam(ctx, "url");
-        if (value && !ContainsCaseInsensitive(node->m_Url, value))
+        if (value && !(case_sensitive ? ContainsCaseSensitive(node->m_Url, value) : ContainsCaseInsensitive(node->m_Url, value)))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "url_exact");
+        if (value && !StringsEqual(node->m_Url, value))
         {
             return false;
         }
@@ -584,12 +884,71 @@ namespace dmAutomationBridge
         {
             return false;
         }
-        bool visible = false;
-        if (RequestGetBoolParam(ctx, "visible", &visible) && node->m_Visible != visible)
+        value = RequestGetParam(ctx, "path");
+        if (value && !StringsEqual(node->m_Path, value))
         {
             return false;
         }
+        value = RequestGetParam(ctx, "kind");
+        if (value && !StringsEqual(node->m_Kind, value))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "instance_id");
+        if (value && !StringsEqual(node->m_InstanceId, value))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "logical_id");
+        if (value && !StringsEqual(node->m_LogicalId, value))
+        {
+            return false;
+        }
+        if (!ignore_state_filters)
+        {
+            bool visible = false;
+            if (RequestGetBoolParam(ctx, "visible", &visible) && node->m_Visible != visible)
+            {
+                return false;
+            }
+            bool enabled = false;
+            if (RequestGetBoolParam(ctx, "enabled", &enabled) && node->m_Enabled != enabled)
+            {
+                return false;
+            }
+            bool has_bounds = false;
+            if (RequestGetBoolParam(ctx, "has_bounds", &has_bounds) && node->m_Bounds.m_Valid != has_bounds)
+            {
+                return false;
+            }
+            bool visible_and_enabled = false;
+            if (RequestGetBoolParam(ctx, "visible_and_enabled", &visible_and_enabled) &&
+                (node->m_Visible && node->m_Enabled) != visible_and_enabled)
+            {
+                return false;
+            }
+        }
         return true;
+    }
+
+    static void AppendActiveCollectionsJson(StringBuffer* response, const Snapshot* snapshot)
+    {
+        StringBufferAppend(response, "[");
+        uint32_t emitted = 0;
+        for (uint32_t i = 0; i < snapshot->m_Nodes.m_Count; ++i)
+        {
+            const Node* node = &snapshot->m_Nodes.m_Data[i];
+            if (!StringsEqual(node->m_Kind, "collection") || !node->m_Visible)
+            {
+                continue;
+            }
+            if (emitted++)
+            {
+                StringBufferAppendChar(response, ',');
+            }
+            AppendJsonString(response, node->m_Name);
+        }
+        StringBufferAppend(response, "]");
     }
 
     static void HandleNodes(RequestContext* ctx)
@@ -597,13 +956,20 @@ namespace dmAutomationBridge
         RefreshSnapshotForRequest();
 
         IncludeOptions include = ParseInclude(ctx, false, false);
-        float limit_f = 50.0f;
-        RequestGetFloatParam(ctx, "limit", &limit_f);
-        uint32_t limit = (uint32_t)ClampFloat(limit_f, 0.0f, 500.0f);
+        uint32_t limit = 50;
+        RequestGetUIntParamAllowZero(ctx, "limit", &limit, 500);
+        uint32_t offset = 0;
+        if (!RequestGetUIntParamAllowZero(ctx, "cursor", &offset))
+        {
+            RequestGetUIntParamAllowZero(ctx, "offset", &offset);
+        }
 
         const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
         uint32_t matched = 0;
         uint32_t emitted = 0;
+        uint32_t excluded_visibility = 0;
+        uint32_t excluded_enabled = 0;
+        uint32_t excluded_bounds = 0;
 
         StringBuffer response;
         StringBufferInit(&response);
@@ -613,9 +979,25 @@ namespace dmAutomationBridge
             const Node* node = &snapshot->m_Nodes.m_Data[i];
             if (!NodeMatchesFilters(node, ctx))
             {
+                if (NodeMatchesFilters(node, ctx, true))
+                {
+                    bool expected = false;
+                    if (RequestGetBoolParam(ctx, "visible", &expected) && node->m_Visible != expected) ++excluded_visibility;
+                    if (RequestGetBoolParam(ctx, "enabled", &expected) && node->m_Enabled != expected) ++excluded_enabled;
+                    if (RequestGetBoolParam(ctx, "has_bounds", &expected) && node->m_Bounds.m_Valid != expected) ++excluded_bounds;
+                    if (RequestGetBoolParam(ctx, "visible_and_enabled", &expected) && (node->m_Visible && node->m_Enabled) != expected)
+                    {
+                        if (node->m_Visible != expected) ++excluded_visibility;
+                        if (node->m_Enabled != expected) ++excluded_enabled;
+                    }
+                }
                 continue;
             }
             ++matched;
+            if (matched <= offset)
+            {
+                continue;
+            }
             if (emitted >= limit)
             {
                 continue;
@@ -633,6 +1015,35 @@ namespace dmAutomationBridge
         AppendNumber(&response, (double)matched);
         StringBufferAppend(&response, ",\"total\":");
         AppendNumber(&response, (double)snapshot->m_Nodes.m_Count);
+        bool truncated = limit > 0 && offset + emitted < matched;
+        StringBufferAppend(&response, ",\"offset\":");
+        AppendNumber(&response, offset);
+        StringBufferAppend(&response, ",\"truncated\":");
+        StringBufferAppend(&response, truncated ? "true" : "false");
+        StringBufferAppend(&response, ",\"next_cursor\":");
+        if (truncated)
+        {
+            char cursor[32];
+            dmSnPrintf(cursor, sizeof(cursor), "%u", offset + emitted);
+            AppendJsonString(&response, cursor);
+        }
+        else
+        {
+            StringBufferAppend(&response, "null");
+        }
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)snapshot->m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, ",\"active_collections\":");
+        AppendActiveCollectionsJson(&response, snapshot);
+        StringBufferAppend(&response, ",\"excluded\":{\"visibility\":");
+        AppendNumber(&response, excluded_visibility);
+        StringBufferAppend(&response, ",\"enabled\":");
+        AppendNumber(&response, excluded_enabled);
+        StringBufferAppend(&response, ",\"bounds\":");
+        AppendNumber(&response, excluded_bounds);
+        StringBufferAppend(&response, "}");
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -660,6 +1071,10 @@ namespace dmAutomationBridge
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"node\":");
         AppendNodeJson(&response, &g_AutomationBridge.m_Snapshot, node, &include, include.m_Children, false);
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -851,7 +1266,6 @@ namespace dmAutomationBridge
         SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
         return true;
     }
-
     static void HandleClick(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
@@ -1067,6 +1481,139 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static bool PointToBackbuffer(const Snapshot* snapshot, const char* space, float x, float y, float* out_x, float* out_y)
+    {
+        float window_w = (float)snapshot->m_WindowWidth;
+        float window_h = (float)snapshot->m_WindowHeight;
+        float backbuffer_w = (float)snapshot->m_BackbufferWidth;
+        float backbuffer_h = (float)snapshot->m_BackbufferHeight;
+        float viewport_top = backbuffer_h - (float)snapshot->m_ViewportY - (float)snapshot->m_ViewportHeight;
+        if (window_w <= 0.0f || window_h <= 0.0f || backbuffer_w <= 0.0f || backbuffer_h <= 0.0f)
+        {
+            return false;
+        }
+        if (StringsEqual(space, "window") || StringsEqual(space, "client") || StringsEqual(space, "display_pixels"))
+        {
+            *out_x = x * backbuffer_w / window_w;
+            *out_y = y * backbuffer_h / window_h;
+            return true;
+        }
+        if (StringsEqual(space, "backbuffer"))
+        {
+            *out_x = x;
+            *out_y = y;
+            return true;
+        }
+        if (StringsEqual(space, "viewport"))
+        {
+            *out_x = (float)snapshot->m_ViewportX + x;
+            *out_y = viewport_top + y;
+            return true;
+        }
+        if (StringsEqual(space, "normalized_viewport"))
+        {
+            *out_x = (float)snapshot->m_ViewportX + x * (float)snapshot->m_ViewportWidth;
+            *out_y = viewport_top + y * (float)snapshot->m_ViewportHeight;
+            return true;
+        }
+        return false;
+    }
+
+    static bool PointFromBackbuffer(const Snapshot* snapshot, const char* space, float x, float y, float* out_x, float* out_y)
+    {
+        float window_w = (float)snapshot->m_WindowWidth;
+        float window_h = (float)snapshot->m_WindowHeight;
+        float backbuffer_w = (float)snapshot->m_BackbufferWidth;
+        float backbuffer_h = (float)snapshot->m_BackbufferHeight;
+        float viewport_top = backbuffer_h - (float)snapshot->m_ViewportY - (float)snapshot->m_ViewportHeight;
+        if (window_w <= 0.0f || window_h <= 0.0f || backbuffer_w <= 0.0f || backbuffer_h <= 0.0f)
+        {
+            return false;
+        }
+        if (StringsEqual(space, "window") || StringsEqual(space, "client") || StringsEqual(space, "display_pixels"))
+        {
+            *out_x = x * window_w / backbuffer_w;
+            *out_y = y * window_h / backbuffer_h;
+            return true;
+        }
+        if (StringsEqual(space, "backbuffer"))
+        {
+            *out_x = x;
+            *out_y = y;
+            return true;
+        }
+        if (StringsEqual(space, "viewport"))
+        {
+            *out_x = x - (float)snapshot->m_ViewportX;
+            *out_y = y - viewport_top;
+            return true;
+        }
+        if (StringsEqual(space, "normalized_viewport") && snapshot->m_ViewportWidth > 0 && snapshot->m_ViewportHeight > 0)
+        {
+            *out_x = (x - (float)snapshot->m_ViewportX) / (float)snapshot->m_ViewportWidth;
+            *out_y = (y - viewport_top) / (float)snapshot->m_ViewportHeight;
+            return true;
+        }
+        return false;
+    }
+
+    static void HandleCoordinateConvert(RequestContext* ctx)
+    {
+        RefreshSnapshotForRequest();
+        float x = 0.0f;
+        float y = 0.0f;
+        const char* from_space = RequestGetParam(ctx, "from_space");
+        const char* to_space = RequestGetParam(ctx, "to_space");
+        bool has_x = RequestGetFloatParam(ctx, "point.x", &x) || RequestGetFloatParam(ctx, "x", &x);
+        bool has_y = RequestGetFloatParam(ctx, "point.y", &y) || RequestGetFloatParam(ctx, "y", &y);
+        if (!has_x || !has_y || IsEmpty(from_space) || IsEmpty(to_space))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide numeric x/y and named from_space/to_space");
+            return;
+        }
+        float backbuffer_x = 0.0f;
+        float backbuffer_y = 0.0f;
+        float converted_x = 0.0f;
+        float converted_y = 0.0f;
+        const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
+        if (!PointToBackbuffer(snapshot, from_space, x, y, &backbuffer_x, &backbuffer_y) ||
+            !PointFromBackbuffer(snapshot, to_space, backbuffer_x, backbuffer_y, &converted_x, &converted_y))
+        {
+            RequestSendError(ctx, 400, "unsupported_coordinate_space", "supported spaces are window, client, display_pixels, backbuffer, viewport, and normalized_viewport");
+            return;
+        }
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"point\":{\"x\":");
+        AppendNumber(&response, converted_x);
+        StringBufferAppend(&response, ",\"y\":");
+        AppendNumber(&response, converted_y);
+        StringBufferAppend(&response, "},\"from_space\":");
+        AppendJsonString(&response, from_space);
+        StringBufferAppend(&response, ",\"to_space\":");
+        AppendJsonString(&response, to_space);
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)snapshot->m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleFrame(RequestContext* ctx)
+    {
+        RefreshSnapshotForRequest();
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, ",\"scene_sequence\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
     static bool VerifyReceiptOwner(RequestContext* ctx, const InputReceipt* receipt, const char* client_id, const char* session_id)
     {
         if (receipt && StringsEqual(receipt->m_ClientId, IsEmpty(client_id) ? "anonymous" : client_id) &&
@@ -1267,19 +1814,17 @@ namespace dmAutomationBridge
 
     static void HandleScreenshot(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
         if (!IsScreenshotSupported())
         {
             RequestSendError(ctx, 501, "screenshot_unsupported", "screenshot capture is not supported by the current graphics adapter");
             return;
         }
 
-        char path[1024];
-        if (!BuildScreenshotPath(path, sizeof(path)))
-        {
-            RequestSendError(ctx, 500, "screenshot_path_failed", "failed to create screenshot path");
-            return;
-        }
-        if (!ScheduleScreenshot(path))
+        uint32_t after_frames = 0;
+        RequestGetUIntParamAllowZero(ctx, "after_frames", &after_frames, 600);
+        ScreenshotCapture capture;
+        if (!ScheduleScreenshot(after_frames, &capture))
         {
             RequestSendError(ctx, 409, "screenshot_pending", "a screenshot is already pending");
             return;
@@ -1287,9 +1832,37 @@ namespace dmAutomationBridge
 
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"path\":");
-        AppendJsonString(&response, path);
-        StringBufferAppend(&response, ",\"pending\":true}}\n");
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendScreenshotJson(&response, &capture);
+        response.m_Size--;
+        response.m_Data[response.m_Size] = 0;
+        StringBufferAppend(&response, ",\"accepted_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, ",\"accepted_scene_sequence\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleScreenshotStatus(RequestContext* ctx)
+    {
+        uint64_t capture_id = 0;
+        if (!RequestGetUInt64Param(ctx, "capture_id", &capture_id) && !RequestGetUInt64Param(ctx, "id", &capture_id))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide capture_id");
+            return;
+        }
+        const ScreenshotCapture* capture = FindScreenshotCapture(capture_id);
+        if (!capture)
+        {
+            RequestSendError(ctx, 404, "screenshot_not_found", "screenshot capture id was not found");
+            return;
+        }
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendScreenshotJson(&response, capture);
+        StringBufferAppend(&response, "}\n");
         RequestSendJson(ctx, 200, &response);
     }
 
@@ -1541,6 +2114,8 @@ namespace dmAutomationBridge
         {"/health", "GET", HandleHealth},
         {"/screen", "GET", HandleScreen},
         {"/screen", "PUT", HandleScreenPut},
+        {"/coordinates/convert", "POST", HandleCoordinateConvert},
+        {"/frame", "GET", HandleFrame},
         {"/scene", "GET", HandleScene},
         {"/nodes", "GET", HandleNodes},
         {"/node", "GET", HandleNode},
@@ -1565,7 +2140,8 @@ namespace dmAutomationBridge
         {"/commands", "POST", HandleCommandSubmit},
         {"/commands", "GET", HandleCommandStatus},
         {"/commands", "DELETE", HandleCommandCancel},
-        {"/markers", "POST", HandleMarker}
+        {"/markers", "POST", HandleMarker},
+        {"/screenshot/status", "GET", HandleScreenshotStatus}
     };
 
     void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request)
@@ -1577,29 +2153,34 @@ namespace dmAutomationBridge
 
         if (request->m_ContentLength > 0)
         {
-            bool structured_input = StartsWith(ctx.m_Route, "/input/") && !RequestIsMethod(&ctx, "GET");
-            if (!structured_input)
+            if (request->m_ContentLength > MAX_JSON_REQUEST_BYTES)
             {
-                DrainRequestBody(request);
-                RequestSendError(&ctx, 400, "body_not_supported", "request body is supported only for mutating input endpoints; use query parameters");
+                DiscardRequestBody(request);
+                RequestSendError(&ctx, 413, "json_body_too_large", "JSON request body exceeds the 65536-byte limit");
                 FreeRequestContext(&ctx);
                 return;
             }
-            if (request->m_ContentLength > 32768 || ctx.m_Query.m_Count > 0)
+            const char* content_type = dmWebServer::GetHeader(request, "Content-Type");
+            if (!content_type || !StartsWith(content_type, "application/json"))
             {
-                DrainRequestBody(request);
-                RequestSendError(&ctx, request->m_ContentLength > 32768 ? 413 : 400,
-                                 request->m_ContentLength > 32768 ? "input_too_large" : "bad_request",
-                                 request->m_ContentLength > 32768 ? "JSON input body exceeds 32768 bytes" : "do not mix query parameters with a structured JSON body");
+                free(ReadRequestBody(request));
+                RequestSendError(&ctx, 415, "unsupported_media_type", "request bodies must use application/json");
                 FreeRequestContext(&ctx);
                 return;
             }
-            char* body = ReceiveRequestBody(request, 32768);
-            bool parsed = body && ParseFlatJsonObject(body, &ctx.m_Query);
+            if (RequestIsMethod(&ctx, "GET"))
+            {
+                free(ReadRequestBody(request));
+                RequestSendError(&ctx, 400, "body_not_supported", "GET endpoints do not accept request bodies");
+                FreeRequestContext(&ctx);
+                return;
+            }
+            char* body = ReadRequestBody(request);
+            bool parsed = body && JsonParseRootObject(body, &ctx.m_Query);
             free(body);
             if (!parsed)
             {
-                RequestSendError(&ctx, 400, "bad_json", "expected a flat JSON object containing string, number, or boolean values");
+                RequestSendError(&ctx, 400, "invalid_json", "request body must be a valid JSON object with at most 16 nesting levels");
                 FreeRequestContext(&ctx);
                 return;
             }

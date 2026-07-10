@@ -26,6 +26,8 @@ namespace dmAutomationBridge
     static const uint32_t MAX_APPLICATION_JSON_BYTES = 32768;
     static const uint32_t MAX_APPLICATION_NAME_BYTES = 128;
     static const uint32_t MAX_APPLICATION_JSON_DEPTH = 16;
+    static const uint32_t MAX_JSON_REQUEST_BYTES = 64 * 1024;
+    static const uint32_t MAX_JSON_NESTING = 16;
 
     template <typename T>
     struct Array
@@ -77,6 +79,8 @@ namespace dmAutomationBridge
     struct Node
     {
         char*                m_Id;
+        char*                m_InstanceId;
+        char*                m_LogicalId;
         char*                m_Name;
         char*                m_Type;
         char*                m_Kind;
@@ -93,6 +97,9 @@ namespace dmAutomationBridge
         Bounds               m_Bounds;
         Array<Property>       m_Properties;
         Array<uint32_t>       m_Children;
+        uint64_t              m_CreatedSceneSequence;
+        uint32_t              m_InstanceGeneration;
+        bool                  m_HasInstanceIdentity;
 
         bool  m_HasPosition;
         bool  m_HasSize;
@@ -112,11 +119,34 @@ namespace dmAutomationBridge
         uint32_t         m_BackbufferHeight;
         uint32_t         m_DisplayWidth;
         uint32_t         m_DisplayHeight;
+        float            m_DisplayScale;
         int32_t          m_ViewportX;
         int32_t          m_ViewportY;
         uint32_t         m_ViewportWidth;
         uint32_t         m_ViewportHeight;
         uint64_t         m_Sequence;
+    };
+
+    enum ScreenshotState
+    {
+        SCREENSHOT_NONE,
+        SCREENSHOT_PENDING,
+        SCREENSHOT_COMPLETE,
+        SCREENSHOT_FAILED
+    };
+
+    struct ScreenshotCapture
+    {
+        uint64_t        m_Id;
+        ScreenshotState m_State;
+        uint32_t        m_AfterFrames;
+        uint64_t        m_Frame;
+        uint64_t        m_SceneSequence;
+        uint32_t        m_Width;
+        uint32_t        m_Height;
+        char            m_Path[1024];
+        char            m_Sha256[65];
+        char            m_Failure[128];
     };
 
     enum InputEventType
@@ -305,9 +335,9 @@ namespace dmAutomationBridge
         InputDevice             m_DefaultInputDevice;
         bool                    m_DefaultInputVisualize;
         char                    m_EngineInstanceId[64];
-        bool                    m_ScreenshotPending;
-        uint32_t                m_ScreenshotCounter;
-        char                    m_ScreenshotPath[1024];
+        ScreenshotCapture       m_Screenshot;
+        Array<ScreenshotCapture> m_ScreenshotHistory;
+        uint64_t                m_ScreenshotCounter;
         uint32_t                m_DisplayWidth;
         uint32_t                m_DisplayHeight;
         bool                    m_ApplicationApiEnabled;
@@ -322,7 +352,6 @@ namespace dmAutomationBridge
         uint64_t                m_NextEventSequence;
         uint64_t                m_NextStateRevision;
         uint64_t                m_NextCommandId;
-        char                    m_EngineInstanceId[48];
     };
 
     struct IncludeOptions
@@ -489,6 +518,7 @@ namespace dmAutomationBridge
     bool GetFloatParam(const Array<QueryParam>* query, const char* key, float* value);
     bool GetBoolParam(const Array<QueryParam>* query, const char* key, bool* value);
     bool ContainsCaseInsensitive(const char* haystack, const char* needle);
+    bool ContainsCaseSensitive(const char* haystack, const char* needle);
 
     void InitSnapshot(Snapshot* snapshot);
     void FreeSnapshot(Snapshot* snapshot);
@@ -526,9 +556,11 @@ namespace dmAutomationBridge
     void UpdateInput(float dt);
 
     bool IsScreenshotSupported();
-    bool BuildScreenshotPath(char* path, uint32_t path_size);
-    bool ScheduleScreenshot(const char* path);
+    bool BuildScreenshotPath(uint64_t capture_id, char* path, uint32_t path_size);
+    bool ScheduleScreenshot(uint32_t after_frames, ScreenshotCapture* capture);
     void ProcessPendingScreenshot();
+    void AppendScreenshotJson(StringBuffer* out, const ScreenshotCapture* capture);
+    const ScreenshotCapture* FindScreenshotCapture(uint64_t capture_id);
 
     void InitApplicationBridge(uint32_t event_capacity, bool enabled);
     void FreeApplicationBridge();

@@ -32,6 +32,7 @@ namespace dmAutomationBridge
         FreeString(&bridge->m_ControllerClientId);
         FreeString(&bridge->m_ControllerSessionId);
         FreeApplicationBridge();
+        ArrayFree(&bridge->m_ScreenshotHistory);
     }
 
     static void InitAutomationBridgeContext(AutomationBridgeContext* bridge)

@@ -382,6 +382,15 @@ namespace dmAutomationBridge
         return false;
     }
 
+    bool ContainsCaseSensitive(const char* haystack, const char* needle)
+    {
+        if (IsEmpty(needle))
+        {
+            return true;
+        }
+        return haystack && strstr(haystack, needle) != 0;
+    }
+
 
 }
 

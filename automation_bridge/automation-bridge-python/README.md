@@ -17,7 +17,8 @@ bridge.click(spawner)
 items = bridge.nodes(type="labelc", text_exact="L1", limit=100)
 bridge.drag(bridge.parent(items[0]), bridge.parent(items[1]), duration=0.16)
 
-png = bridge.screenshot(wait=True)
+shot = bridge.screenshot(wait=True)
+print(shot.path, shot.frame, shot.scene_sequence, shot.sha256)
 
 with bridge.log_stream(read_timeout=1.0) as logs:
     print(logs.readline(timeout=1.0))
@@ -56,19 +57,25 @@ It uses a sample fixture whose sprite is offset from the parent game object orig
 `AutomationBridgeClient` is the main entry point.
 
 - Bootstrap: `AutomationBridgeClient(port)`, `from_project(...)`, `from_editor(...)`, and `wait_ready(...)`.
-- Raw API passthrough: `get(path, params=None)`, `post(path, params=None)`, and `put(path, params=None)`.
+- Raw API passthrough: `get(...)`, `post(...)`, `put(...)`, `post_json(...)`, and `put_json(...)`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
 - Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`, `type_text(...)`, `key(...)`, and `bridge.input` queue/status/cancel/flush/configure methods.
 - Application synchronization: `events(...)`, `wait_for_ack(...)`, `states(...)`, `state(...)`, `wait_for_state(...)`, `start_command(...)`, `command_status(...)`, `cancel_command(...)`, `command(...)`, and `mark(...)`.
-- Waits and screenshots: client methods `wait_for_node(...)`, `wait_for_count(...)`, and `screenshot(...)`, plus the module-level `wait_until(...)`.
+- Snapshot safety: `convert_point(...)`, `wait_frames(...)`, `wait_for_appearance(...)`, `wait_for_disappearance(...)`, `observe_node(...)`, and `assert_node(...)`.
+- Screenshots/visual fallback: `screenshot(...)`, `wait_for_stable_frame(...)`, `wait_for_region_change(...)`, and the explicit `VisualClient`/`difference(...)` package.
 - Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
 - Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
 - Profiling: `bridge.profiler.resources()`, `bridge.profiler.remotery(...)`, `bridge.profiler.capture(...)`, and `bridge.profiler.start_recording(...)`.
 
 `EditorClient` exposes editor-oriented helpers for advanced bootstrap flows: `from_project(...)`, `build(...)`, `console_lines()`, `engine_service_port()`, `engine_service_ports()`, `latest_registration_engine_service_ports()`, `latest_registration_has_engine_service_port()`, `last_build_had_engine_service_port()`, `endpoint_registered_count()`, `remotery_url()`, `remotery_urls()`, `latest_registration_remotery_urls()`, `remember_engine_service_port(...)`, and `remember_remotery_url(...)`.
 
-Typed response wrappers include `Node`, `Bounds`, `InputReceipt`, `PointerSession`, `ResourceProfileEntry`, `RemoteryFrame`, `RemoterySample`, `RemoterySampleAggregate`, `RemoteryCapture`, `RemoteryScopeStats`, `RemoteryCounterStats`, `RemoteryProperty`, `RemoteryPropertyFrame`, `RemoteryPropertyEntry`, `RemoteryTimingStats`, `RemoteryValueStats`, and `RemoteryRecording`. `InputController`, `EngineLogStream`, `ProfilerClient`, and `RemoteryClient` are also exported for direct use. These are lightweight snapshots around native engine data; re-query after clicks, drags, or scene changes.
+Typed response wrappers include `Node`, `Bounds`, `InputReceipt`, `PointerSession`,
+`ScreenshotReceipt`, `ObservationReceipt`, `VisualObservation`,
+`ResourceProfileEntry`, and the Remotery types. `InputController`,
+`EngineLogStream`, `ProfilerClient`, `VisualClient`, and `RemoteryClient` are
+also exported for direct use. These are lightweight snapshots around native
+engine data; re-query after clicks, drags, or scene changes.
 
 ## Bootstrap
 
@@ -112,7 +119,26 @@ bridge.resize(1280, 720)
 
 `health()` and `screen()` update `bridge.last_window_size` from the engine response. `scene()` returns the full native scene-tree payload with `count`, `visible_filter`, `screen`, and `root`.
 
-Raw `get()`, `post()`, and `put()` are available for curl-level debugging or endpoints that do not have named wrapper methods yet.
+Raw `get()`, `post()`, and `put()` are available for curl-level debugging.
+`post_json()` and `put_json()` send an `application/json` root object; the
+native bridge enforces a 65,536-byte body and 16-level nesting limit.
+
+Named geometry uses a top-left origin. Convert only spaces the engine can know:
+
+```python
+window_point = bridge.convert_point(
+    (0.5, 0.5),
+    from_space="normalized_viewport",
+    to_space="window",
+)
+```
+
+Supported spaces are `window`, `client`, `display_pixels`, `backbuffer`,
+`viewport`, and `normalized_viewport`. `display_pixels` is scoped to the
+drawable window; public Defold APIs do not expose global monitor or decorated
+outer-window rectangles. World and GUI-layout conversion require an
+application-published transform or the proposed DMSDK APIs in
+[`docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md`](../../docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md).
 
 ## Selectors
 
@@ -126,9 +152,12 @@ detail = bridge.by_id(restart.id)
 item = bridge.parent(labels[0])
 ```
 
-Server-side filters are passed to the extension: `id`, `type`, `name`, `text`, `url`, `automation_id`, `localization_key`, `role`, `visible`, `limit`, and `include`.
-
-Python adds stricter client-side filters: `enabled`, `kind`, `path`, `name_exact`, `text_exact`, `has_bounds`, and `visible_and_enabled`.
+All selectors are applied server-side: substring filters `type`, `name`,
+`text`, and `url`; exact filters `type_exact`, `name_exact`, `text_exact`,
+`url_exact`, `path`, `kind`, `instance_id`, and `logical_id`; boolean filters
+`visible`, `enabled`, `has_bounds`, and `visible_and_enabled`; plus
+semantic exact filters `automation_id`, `localization_key`, and `role`; and
+`case_sensitive`, `limit`, `offset`/`cursor`, and `include`.
 
 `include` may be either a comma-separated string or an iterable:
 
@@ -136,12 +165,23 @@ Python adds stricter client-side filters: `enabled`, `kind`, `path`, `name_exact
 node = bridge.node(name="spawner", include=["bounds", "properties"])
 ```
 
-Native `type`, `name`, `text`, and `url` filters are case-insensitive substring matches. Use `name_exact` and `text_exact` when exact matching matters.
+Native substring filters are case-insensitive unless `case_sensitive=True`.
+Exact filters are always case-sensitive. `count()` requests `limit=0`, so its
+result is complete even when more than 500 nodes match. Page responses report
+`truncated` and `next_cursor`; selector errors include total server matches,
+truncation, frame/sequence, active collections, candidates, and suggestions.
 
 `Node` exposes convenience properties for the native node payload:
 
 ```python
 node.id
+node.snapshot_id
+node.instance_id
+node.instance_generation
+node.logical_id
+node.created_scene_sequence
+node.scene_sequence
+node.engine_frame
 node.name
 node.type
 node.kind
@@ -171,6 +211,11 @@ for child in node.children:
 ```python
 click = bridge.click(node)
 print(click.input_id, click.state, click.start_frame, click.release_frame)
+
+bridge.click(node.id)
+bridge.click(480, 320)
+bridge.click({"center": {"x": 480, "y": 320}})
+bridge.click(node, expected_scene_sequence=node.scene_sequence)
 
 bridge.drag(first_node, second_node, duration=0.16)
 bridge.drag(
@@ -224,7 +269,11 @@ with bridge.pointer((100, 200), lease=2.0) as pointer:
 
 Input waits cancel the active input on interruption by default. Use `bridge.input.wait(receipt, flush_on_interrupt=True)` when interruption should also cancel later inputs from this session. Log reads close their socket and preserve `KeyboardInterrupt`; timeout restoration cannot mask the original exception.
 
-`Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `bridge.by_id(node.id)` or query again.
+`Node.id`/`snapshot_id` hashes the traversal path and is tied to a scene shape.
+Nodes backed by a public Defold game object instance also expose
+`instance_id`, `instance_generation`, `logical_id`, and
+`created_scene_sequence`. Pass `expected_scene_sequence` when an old snapshot
+must fail with `stale_scene` instead of resolving its id against a newer graph.
 
 Pass `expected_scene_sequence=scene["scene_sequence"]` to click/drag/path/pointer/key calls when stale target protection matters. The native endpoint rejects a changed scene with `stale_scene` before resolving node ids, and every receipt records the scene sequence actually used.
 
@@ -245,9 +294,40 @@ wait_until(lambda: bridge.count(type="labelc", text_exact="L2") >= 1)
 
 node = bridge.wait_for_node(name_exact="restart", enabled=True)
 bridge.wait_for_count(2, type="labelc", text_exact="L1")
+bridge.wait_frames(2)
 
-png = bridge.screenshot(wait=True, timeout=5)
+cursor = bridge.scene()["scene_sequence"]
+appeared = bridge.wait_for_appearance(name_exact="result", after_scene_sequence=cursor)
+observed = bridge.observe_node(name_exact="result", minimum_frames=3, identity="logical")
+gone = bridge.wait_for_disappearance(appeared.node.snapshot_id)
+
+shot = bridge.screenshot(after_frames=2, wait=True, timeout=5)
+print(shot.capture_id, shot.path, shot.frame, shot.width, shot.height, shot.sha256)
 ```
+
+Screenshot completion comes from native `/screenshot/status`, not file-size
+polling. The native side writes a temporary PNG, hashes it, atomically renames
+it, then publishes a `complete` receipt. `ScreenshotReceipt` is path-like and
+also provides `exists()`, `stat()`, and `read_bytes()` for compatibility.
+
+Scene/state assertions remain the default:
+
+```python
+bridge.assert_node(name_exact="operation_status", visible=True, enabled=True)
+```
+
+Pixel comparisons are an explicit fallback layer and never affect selectors:
+
+```python
+before = bridge.screenshot()
+changed = bridge.wait_for_region_change(before, region=(100, 100, 300, 200), tolerance=0.01)
+stable = bridge.wait_for_stable_frame(region=(100, 100, 300, 200), consecutive_frames=3)
+```
+
+The metric is normalized mean absolute RGB channel error in native screenshot
+pixels. Alpha is ignored unless `include_alpha=True`; images are never scaled;
+and every consecutive sample is a distinct native capture. Regions are
+top-left viewport pixels.
 
 `wait_until(fn, timeout=..., interval=..., message=...)` polls until `fn()` returns a truthy value. Exceptions raised while polling are retried until timeout, then reported in the final `AssertionError`.
 
@@ -336,7 +416,13 @@ bridge.reboot(
 )
 ```
 
-`bridge.resize(width, height)` calls Automation Bridge's `PUT /screen` endpoint, which sets the native Defold window size, then remembers the returned `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
+`bridge.resize(width, height)` uses a JSON `PUT /screen`, polls for at most
+`wait` seconds, and returns requested dimensions, observed window/client/
+viewport/backbuffer rectangles, `window_matches`, `backbuffer_matches`, and an
+outcome: `already_correct`, `resized`, or
+`requested_not_observed_before_timeout`. A correct backbuffer with a different
+client window is therefore not reported as a successful window resize.
+`bridge.screen()` and `bridge.health()` also update `last_window_size`.
 
 `bridge.reboot(*args)` posts `com.dynamo.system.proto.System$Reboot` to `/post/@system/reboot`. Defold accepts up to six string arguments; pass the same command-line style arguments you would pass to `sys.reboot(...)` or the editor reboot helper. For editor-launched projects, a bare `bridge.reboot()` may restart without the project or this extension, so pass explicit project/bootstrap args when you expect Automation Bridge to return. By default the wrapper waits for the Automation Bridge endpoint to become ready again; pass `wait=False` when rebooting into a target that will not load this extension.
 

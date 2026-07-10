@@ -33,6 +33,8 @@ from automation_bridge import (  # noqa: E402
     RemoteryCapture,
     RemoteryClient,
     RemoteryProtocolError,
+    ScreenshotReceipt,
+    difference,
     wait_until,
 )
 from automation_bridge.client import _encode_system_reboot  # noqa: E402
@@ -85,6 +87,16 @@ def _read_automation_bridge_png(path):
         pixels.extend(raw[offset : offset + stride])
         offset += stride
     return width, height, bytes(pixels)
+
+
+def _rgba_png(width, height, pixels):
+    raw = b"".join(b"\0" + pixels[row * width * 4 : (row + 1) * width * 4] for row in range(height))
+
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
 
 def _point_segment_distance(px, py, start, end):
@@ -244,7 +256,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         result = bridge.resize(640, 480, wait=0)
 
-        self.assertEqual({"width": 640, "height": 480}, result)
+        self.assertEqual((640, 480, "resized"), (result["width"], result["height"], result["outcome"]))
+        self.assertTrue(result["window_matches"])
         self.assertEqual((640, 480), bridge.last_window_size)
         self.assertEqual(
             [
@@ -370,8 +383,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         landscape = bridge.set_landscape(wait=0)
         portrait = bridge.set_portrait(wait=0)
 
-        self.assertEqual({"width": 568, "height": 320}, landscape)
-        self.assertEqual({"width": 320, "height": 568}, portrait)
+        self.assertEqual((568, 320), (landscape["width"], landscape["height"]))
+        self.assertEqual((320, 568), (portrait["width"], portrait["height"]))
         self.assertEqual((320, 568), bridge.last_window_size)
         self.assertEqual(
             [
@@ -643,6 +656,160 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(8.0, update.self.avg_ms)
         self.assertEqual(100, capture.counter("Memory/Used").last_value)
 
+    def test_node_exposes_snapshot_and_generational_identity(self):
+        node = __import__("automation_bridge").Node(
+            {
+                "id": "n:1",
+                "snapshot_id": "n:1",
+                "instance_id": "/item",
+                "instance_generation": 9,
+                "logical_id": "instance:1:g9",
+                "created_scene_sequence": 4,
+                "scene_sequence": 12,
+                "engine_frame": 99,
+            }
+        )
+
+        self.assertEqual("n:1", node.snapshot_id)
+        self.assertEqual("/item", node.instance_id)
+        self.assertEqual(9, node.instance_generation)
+        self.assertEqual("instance:1:g9", node.logical_id)
+        self.assertEqual(4, node.created_scene_sequence)
+        self.assertEqual(12, node.scene_sequence)
+        self.assertEqual(99, node.engine_frame)
+
+    def test_exact_selectors_and_count_stay_server_side(self):
+        class SelectorClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(1)
+                self.requests = []
+
+            def get(self, path, params=None):
+                self.requests.append((path, params))
+                return {
+                    "nodes": [{"id": "n:1", "name": "Play", "enabled": True}],
+                    "matched": 1200,
+                    "truncated": True,
+                    "next_cursor": "10",
+                    "scene_sequence": 5,
+                    "engine_frame": 8,
+                }
+
+        bridge = SelectorClient()
+        nodes = bridge.nodes(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
+        count = bridge.count(name_exact="Play", enabled=True)
+
+        self.assertEqual(1, len(nodes))
+        self.assertEqual(1200, count)
+        self.assertEqual("Play", bridge.requests[0][1]["name_exact"])
+        self.assertNotIn("name", bridge.requests[0][1])
+        self.assertEqual(0, bridge.requests[1][1]["limit"])
+
+    def test_click_forwards_expected_scene_sequence(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
+            AutomationBridgeClient(server.port, timeout=1.0).click(
+                "n:1", wait=0, expected_scene_sequence=42
+            )
+
+        self.assertIn("expected_scene_sequence=42", server.request_line)
+
+    def test_convert_point_uses_json_body(self):
+        response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
+        with FakeHttpServer(response) as server:
+            point = AutomationBridgeClient(server.port, timeout=1.0).convert_point(
+                (0.5, 0.5), "normalized_viewport", "window"
+            )
+
+        self.assertEqual({"x": 400, "y": 300}, point)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertIn(
+            b'{"point":{"x":0.5,"y":0.5},"from_space":"normalized_viewport","to_space":"window"}',
+            server.request_bytes,
+        )
+
+    def test_screenshot_waits_for_native_complete_receipt(self):
+        class ScreenshotClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(1)
+                self.status_calls = 0
+
+            def get(self, path, params=None):
+                if path == "/screenshot":
+                    return {"capture_id": 7, "state": "pending", "path": "/tmp/shot.png"}
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    return {"capture_id": 7, "state": "pending", "path": "/tmp/shot.png"}
+                return {
+                    "capture_id": 7,
+                    "state": "complete",
+                    "path": "/tmp/shot.png",
+                    "engine_frame": 20,
+                    "scene_sequence": 10,
+                    "width": 320,
+                    "height": 200,
+                    "sha256": "abc",
+                }
+
+        receipt = ScreenshotClient().screenshot(timeout=0.2)
+
+        self.assertIsInstance(receipt, ScreenshotReceipt)
+        self.assertEqual((7, 20, 10, 320, 200, "abc"), (
+            receipt.capture_id,
+            receipt.frame,
+            receipt.scene_sequence,
+            receipt.width,
+            receipt.height,
+            receipt.sha256,
+        ))
+
+    def test_wait_frames_uses_native_frame_receipts(self):
+        class FrameClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame = 10
+
+            def get(self, path, params=None):
+                value = self.frame
+                self.frame += 1
+                return {"engine_frame": value, "scene_sequence": value - 2}
+
+        receipt = FrameClient().wait_frames(2, timeout=0.2, interval=0)
+
+        self.assertGreaterEqual(receipt["engine_frame"], 12)
+
+    def test_observe_node_counts_distinct_frames(self):
+        class ObservationClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame = 3
+
+            def maybe_node(self, **selector):
+                node = __import__("automation_bridge").Node(
+                    {
+                        "id": "n:1",
+                        "logical_id": "instance:1:g2",
+                        "scene_sequence": self.frame,
+                        "engine_frame": self.frame,
+                    }
+                )
+                self.frame += 1
+                return node
+
+        receipt = ObservationClient().observe_node(minimum_frames=3, timeout=0.2, interval=0)
+
+        self.assertEqual("instance:1:g2", receipt.identity)
+        self.assertEqual(3, receipt.observed_frames)
+        self.assertEqual((3, 5), (receipt.first_frame, receipt.last_frame))
+
+    def test_visual_difference_uses_normalized_rgb_mean_absolute_error(self):
+        black = _rgba_png(1, 1, bytes((0, 0, 0, 255)))
+        white = _rgba_png(1, 1, bytes((255, 255, 255, 255)))
+        transparent_black = _rgba_png(1, 1, bytes((0, 0, 0, 0)))
+
+        self.assertEqual(1.0, difference(black, white))
+        self.assertEqual(0.0, difference(black, transparent_black))
+        self.assertEqual(0.25, difference(black, transparent_black, include_alpha=True))
+
 
 class FakeEngineClient(AutomationBridgeClient):
     def __init__(self, screen=None, capabilities=None):
@@ -653,8 +820,9 @@ class FakeEngineClient(AutomationBridgeClient):
         self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
 
-    def _request(self, method, path, params=None):
-        self.api_requests.append((method, path, dict(params) if params is not None else None))
+    def _request(self, method, path, params=None, json_body=None):
+        request_values = json_body if json_body is not None else params
+        self.api_requests.append((method, path, dict(request_values) if request_values is not None else None))
         if method == "GET" and path == "/health":
             return {"version": "1", "capabilities": list(self._capabilities), "screen": self._screen}
         if method == "GET" and path == "/screen":
@@ -662,7 +830,7 @@ class FakeEngineClient(AutomationBridgeClient):
         if method == "PUT" and path == "/screen":
             self._screen = {
                 **self._screen,
-                "window": {"width": int(params["width"]), "height": int(params["height"])},
+                "window": {"width": int(request_values["width"]), "height": int(request_values["height"])},
             }
             return self._screen
         raise AssertionError(f"unexpected request: {method} {path} {params}")
@@ -896,6 +1064,8 @@ class FakeHttpServer:
         self.port = 0
         self.request_line = None
         self.request_body = b""
+        self.request_text = ""
+        self.request_bytes = b""
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._thread = None
         self._error = None
@@ -936,7 +1106,9 @@ class FakeHttpServer:
                     if not chunk:
                         break
                     body.extend(chunk)
-                request = request_bytes.decode("iso-8859-1", "replace")
+                self.request_bytes = header_bytes + b"\r\n\r\n" + bytes(body)
+                request = self.request_bytes.decode("iso-8859-1", "replace")
+                self.request_text = request
                 self.request_line = request.splitlines()[0] if request else ""
                 self.request_body = bytes(body)
                 headers = (
@@ -1121,9 +1293,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
                     if self.supports_capability("screen.resize"):
                         resized = self.bridge.resize(1600, 1200, wait=0.3)
-                        self.assertEqual({"width": 1600, "height": 1200}, resized)
+                        self.assertEqual((1600, 1200), (resized["width"], resized["height"]))
+                        self.assertTrue(resized["window_matches"])
                         portrait = self.bridge.set_portrait(wait=0.3)
-                        self.assertEqual({"width": 1200, "height": 1600}, portrait)
+                        self.assertEqual((1200, 1600), (portrait["width"], portrait["height"]))
                     else:
                         print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
@@ -1302,16 +1475,28 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("1", health["version"])
         self.assertIn("scene", health["capabilities"])
         self.assertIn("input.click", health["capabilities"])
+        self.assertIn("scene.pagination", health["capabilities"])
+        self.assertGreaterEqual(health["engine_frame"], 0)
 
         screen = self.bridge.screen()
         self.assertEqual("top-left", screen["coordinates"]["origin"])
+        self.assertEqual("window", screen["coordinates"]["input_space"])
         self.assertGreater(screen["window"]["width"], 0)
         self.assertGreater(screen["window"]["height"], 0)
-        self.assertEqual({"width": 960, "height": 640}, screen["display"])
+        self.assertEqual((960, 640), (screen["display"]["width"], screen["display"]["height"]))
+        self.assertGreater(screen["display_scale"], 0)
+
+        viewport_center = self.bridge.convert_point(
+            (0.5, 0.5), from_space="normalized_viewport", to_space="viewport"
+        )
+        self.assertAlmostEqual(screen["viewport"]["width"] / 2, viewport_center["x"], delta=1)
+        self.assertAlmostEqual(screen["viewport"]["height"] / 2, viewport_center["y"], delta=1)
 
         scene = self.bridge.scene(visible=True, include=["basic", "bounds", "properties"])
         self.assertEqual("main", scene["root"]["name"])
         self.assertGreater(scene["count"], 0)
+        self.assertGreater(scene["scene_sequence"], 0)
+        self.assertIn("snapshot_id", scene["root"])
 
         spawner = self.bridge.node(
             type="goc",
@@ -1323,6 +1508,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
         spawner_detail = self.bridge.by_id(spawner.id)
         self.assertEqual("/spawner", spawner_detail.name)
         self.assertGreaterEqual(len(spawner_detail.children), 2)
+        self.assertIsNotNone(spawner_detail.instance_id)
+        self.assertIsNotNone(spawner_detail.instance_generation)
+        self.assertIsNotNone(spawner_detail.logical_id)
+
+        with self.assertRaises(AutomationBridgeApiError) as stale:
+            self.bridge.click(spawner, wait=0, expected_scene_sequence=0)
+        self.assertEqual("stale_scene", stale.exception.code)
 
         self.assert_game_object_bounds_follow_child_component()
         self.assert_spawned_by_node_click(spawner)
@@ -1354,7 +1546,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual({"panel", "restart", "title"}, enabled_popup_nodes)
 
         screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+        self.assertEqual("complete", screenshot_path.state)
         self.assertGreater(screenshot_path.stat().st_size, 0)
+        self.assertEqual(hashlib.sha256(screenshot_path.read_bytes()).hexdigest(), screenshot_path.sha256)
+        self.assertGreater(screenshot_path.frame, 0)
+        self.assertGreater(screenshot_path.scene_sequence, 0)
 
         restart = next(node for node in gui_nodes if node.name == "restart")
         self.bridge.click(restart, wait=0.4)

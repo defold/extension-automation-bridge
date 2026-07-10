@@ -22,7 +22,12 @@ event_capacity = 256
 
 `event_capacity` is clamped to `16..4096` and defaults to `256`. Release builds expose neither the HTTP bridge nor the `automation_bridge` Lua module.
 
-Simple Automation Bridge endpoints take query parameters. Mutating `/input/*` endpoints also accept a flat `application/json` object (string, number, and boolean values) up to 32768 bytes so correlation ids, text, and waypoint payloads are not constrained by Defold's request-resource length. The Python wrapper uses JSON for all mutations. Other request bodies are rejected with `body_not_supported`; do not mix query parameters and a JSON body.
+Query parameters remain available for curl-friendly requests. `POST` and `PUT`
+also accept a root `application/json` object. JSON bodies are limited to 65,536
+bytes and 16 nesting levels. Structured endpoints consume documented nested
+fields (for example `point.x`/`point.y`); unsupported nested fields are validated
+and ignored by flat v1 operations. Query values win if the same key is present
+in both forms.
 
 ```sh
 ENGINE_PORT=51337
@@ -45,15 +50,26 @@ Error responses use this envelope and an appropriate HTTP status:
 { "ok": false, "error": { "code": "not_found", "message": "..." } }
 ```
 
-Common error codes include `bad_request`, `not_found`, `method_not_allowed`, `body_not_supported`, `input_queue_full`, `input_too_large`, `input_controller_busy`, `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`, `stale_scene`, `screen_resize_failed`, `screenshot_unsupported`, `screenshot_path_failed`, and `screenshot_pending`.
+Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
+`unsupported_media_type`, `not_found`, `method_not_allowed`, `body_not_supported`,
+`stale_scene`, `input_queue_full`, `input_too_large`, `input_controller_busy`,
+`input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`,
+`screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
+and `screenshot_pending`.
 
 ## Coordinates
 
-Input coordinates use top-left screen pixels:
+Input coordinates use top-left `window` pixels. All advertised spaces use a
+top-left origin:
 
 ```json
 {
-  "coordinates": { "origin": "top-left", "units": "screen_pixels" }
+  "coordinates": {
+    "origin": "top-left",
+    "units": "pixels",
+    "input_space": "window",
+    "spaces": ["window", "client", "backbuffer", "viewport", "normalized_viewport"]
+  }
 }
 ```
 
@@ -63,13 +79,22 @@ Game object bounds are projected from configured `display.width` and `display.he
 
 ```json
 {
-  "window": { "width": 1280, "height": 720 },
-  "backbuffer": { "width": 1280, "height": 720 },
-  "display": { "width": 960, "height": 640 },
+  "window": { "x": 0, "y": 0, "width": 1280, "height": 720 },
+  "client": { "x": 0, "y": 0, "width": 1280, "height": 720 },
+  "backbuffer": { "x": 0, "y": 0, "width": 1280, "height": 720 },
+  "display": { "width": 960, "height": 640, "scale": 2 },
+  "project_content": { "x": 0, "y": 0, "width": 960, "height": 640 },
+  "display_pixels": { "x": 0, "y": 0, "width": 1280, "height": 720, "scope": "window_drawable" },
   "viewport": { "x": 0, "y": 0, "width": 1280, "height": 720 },
   "coordinates": { "origin": "top-left", "units": "screen_pixels" }
 }
 ```
+
+`display` is retained for compatibility and describes configured project
+content, not global monitor bounds. `display_pixels` is limited to the drawable
+window because public Defold APIs do not expose monitor or decorated outer-window
+rectangles. See [`docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md`](../docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md)
+for the required upstream API proposal.
 
 ## Nodes
 
@@ -78,6 +103,13 @@ Node responses always include the basic fields:
 ```json
 {
   "id": "n:0123456789abcdef",
+  "snapshot_id": "n:0123456789abcdef",
+  "scene_sequence": 42,
+  "engine_frame": 810,
+  "instance_id": "/player",
+  "instance_generation": 7,
+  "logical_id": "instance:0123456789abcdef:g7",
+  "created_scene_sequence": 12,
   "name": "play",
   "type": "gui_node_box",
   "kind": "gui_node",
@@ -116,7 +148,12 @@ Basic fields are always returned. Unknown include tokens are ignored. `bounds` a
 
 Node `type` examples include `collectionc`, `goc`, component resource types such as `spritec` or `labelc`, and GUI node types such as `gui_node_box` or `gui_node_text`. `kind` is a broader category: `collection`, `game_object`, `component`, `subcomponent`, `gui_node`, or `node`.
 
-Node ids are stable for the current scene shape. Clients should discover nodes with `/nodes`, then use `id` for `/node`, `/input/click`, and `/input/drag`. Re-discover nodes after scene changes.
+`id`/`snapshot_id` hash the traversal path and are stable only for the current
+scene shape. Nodes backed by a public Defold `HInstance` also expose the engine
+identifier, allocation generation, a composed `logical_id`, and the first bridge
+scene sequence that observed that generation. Collection-global qualification is
+not available in public DMSDK yet; use application automation ids when project
+semantics are required. Re-discover snapshot ids after scene changes.
 
 ## Endpoint Reference
 
@@ -141,7 +178,8 @@ curl -fsS "$BASE/health" | python3 -m json.tool
 
 ### `GET /automation-bridge/v1/screen`
 
-Returns window, backbuffer, configured display, viewport, and coordinate convention data.
+Returns named rectangles, display scale, scene sequence, engine frame, and the
+coordinate convention.
 
 ```sh
 curl -fsS "$BASE/screen" | python3 -m json.tool
@@ -149,7 +187,11 @@ curl -fsS "$BASE/screen" | python3 -m json.tool
 
 ### `PUT /automation-bridge/v1/screen`
 
-Sets the native Defold window size and returns updated screen metadata. This endpoint is available when `GET /health` reports the `screen.resize` capability.
+Sets the native Defold window size and returns `requested`, `outcome`,
+`window_matches`, `backbuffer_matches`, all named rectangles, scene sequence,
+and engine frame. Outcomes are `already_correct`, `resized`, or
+`requested_not_observed`. The latter uses HTTP 202 and lets a client poll
+`GET /screen` to impose its own timeout.
 
 Query parameters:
 
@@ -157,7 +199,27 @@ Query parameters:
 
 ```sh
 curl -fsS -X PUT "$BASE/screen?width=1280&height=720" | python3 -m json.tool
+curl -fsS -X PUT -H 'Content-Type: application/json' \
+  -d '{"width":1280,"height":720}' "$BASE/screen" | python3 -m json.tool
 ```
+
+### `POST /automation-bridge/v1/coordinates/convert`
+
+Converts `x`/`y` from `from_space` to `to_space`. Supported spaces are `window`,
+`client`, `display_pixels`, `backbuffer`, `viewport`, and
+`normalized_viewport`. World and GUI-layout transforms are intentionally absent
+until the application publishes them or Defold exposes public transforms.
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"point":{"x":0.5,"y":0.5},"from_space":"normalized_viewport","to_space":"window"}' \
+  "$BASE/coordinates/convert" | python3 -m json.tool
+```
+
+### `GET /automation-bridge/v1/frame`
+
+Returns the current `engine_frame` and `scene_sequence`. Poll this endpoint for
+frame-relative waits; semantic completion should use application state/events.
 
 ### `GET /automation-bridge/v1/scene`
 
@@ -168,7 +230,8 @@ Query parameters:
 - `visible`: optional boolean. Use `1`, `true`, or `yes` for true; any other present value is false.
 - `include`: optional comma-separated include list.
 
-Response `data` includes `count`, `visible_filter`, `screen`, and `root`.
+Response `data` includes `count`, `visible_filter`, `screen`, `scene_sequence`,
+`engine_frame`, and `root`.
 
 ```sh
 curl -fsS "$BASE/scene?visible=1&include=bounds,properties" | python3 -m json.tool
@@ -181,16 +244,17 @@ Searches nodes with simple filters. This is the main discovery endpoint for auto
 Query parameters:
 
 - `id`: exact node id.
-- `type`: case-insensitive substring match.
-- `name`: case-insensitive substring match.
-- `text`: case-insensitive substring match.
-- `url`: case-insensitive substring match.
+- `type`, `name`, `text`, `url`: substring match, case-insensitive by default.
+- `type_exact`, `name_exact`, `text_exact`, `url_exact`: case-sensitive exact match.
+- `path`, `kind`, `instance_id`, `logical_id`: case-sensitive exact match.
 - `automation_id`: exact application-supplied automation id.
 - `localization_key`: exact application-supplied localization key.
 - `role`: exact application-supplied semantic role.
-- `visible`: optional boolean filter.
+- `visible`, `enabled`, `has_bounds`, `visible_and_enabled`: optional boolean filters.
+- `case_sensitive`: make substring filters case-sensitive.
 - `include`: optional comma-separated include list.
 - `limit`: number of returned nodes, clamped to `0..500`. Default is `50`. Use `limit=0` to get counts without node payloads.
+- `offset` or numeric `cursor`: zero-based result offset.
 
 Response `data` includes:
 
@@ -198,6 +262,8 @@ Response `data` includes:
 - `count`: returned node count after `limit`.
 - `matched`: total matching nodes before `limit`.
 - `total`: total nodes in the snapshot.
+- `truncated`, `next_cursor`, and `offset`: explicit pagination state.
+- `scene_sequence`, `engine_frame`, and `active_collections`: selector diagnostics.
 
 ```sh
 curl -fsS "$BASE/nodes?type=labelc&text=Play&visible=1&limit=20" | python3 -m json.tool
@@ -222,7 +288,16 @@ All click, drag, path, pointer, and key actions share one FIFO. Only the first a
 
 Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch. The proposed engine-side fix is specified in [`docs/defold-hid-device-capability-query.md`](../docs/defold-hid-device-capability-query.md).
 
-Accepted input returns HTTP 202 and a lifecycle receipt:
+When resolving a node id, pass `expected_scene_sequence` to reject a changed
+snapshot with HTTP 409 `stale_scene`. Input receipts include the scene sequence
+and engine frame used for resolution.
+
+```sh
+curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef"
+curl -fsS -X POST "$BASE/input/click?x=480&y=320&visualize=0"
+```
+
+Accepted input returns HTTP 202 with this lifecycle receipt in `data`:
 
 ```json
 {
@@ -292,7 +367,10 @@ Use `text` for UTF-8 or `keys` for a brace-wrapped special key such as URL-encod
 
 ### `GET /automation-bridge/v1/screenshot`
 
-Schedules a post-render screenshot and returns the PNG file path. The file is written asynchronously after the next render; wait for the path to exist and have nonzero size before reading it.
+Schedules an atomic post-render PNG capture. `after_frames` may defer capture by
+up to 600 rendered callbacks. The accepted receipt includes a `capture_id` and
+must be completed through the status endpoint; file size polling is not a
+completion protocol.
 
 ```sh
 curl -fsS "$BASE/screenshot" | python3 -m json.tool
@@ -301,8 +379,26 @@ curl -fsS "$BASE/screenshot" | python3 -m json.tool
 Response `data`:
 
 ```json
-{ "path": "/tmp/automation-bridge/screenshot-123-1.png", "pending": true }
+{
+  "capture_id": 7,
+  "state": "pending",
+  "path": "/tmp/automation-bridge/screenshot-123-7.png",
+  "engine_frame": 810,
+  "scene_sequence": 42,
+  "width": 1280,
+  "height": 720,
+  "format": "png",
+  "sha256": null,
+  "failure_reason": null
+}
 ```
+
+### `GET /automation-bridge/v1/screenshot/status`
+
+Takes `capture_id` (or `id`) and returns `pending`, `complete`, or `failed`.
+Completed receipts include capture frame/sequence, dimensions, and SHA-256. The
+PNG is first written to a temporary path and atomically renamed before `complete`
+is visible.
 
 ## Application synchronization
 

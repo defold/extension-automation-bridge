@@ -16,6 +16,8 @@ from .editor import EditorClient
 from .nodes import Bounds, Node
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
+from .receipts import ObservationReceipt, ScreenshotReceipt
+from .visual import VisualClient, VisualObservation, difference
 from .remotery import (
     RemoteryCapture,
     RemoteryClient,
@@ -53,6 +55,7 @@ __all__ = [
     "InputExecutionError",
     "InputReceipt",
     "Node",
+    "ObservationReceipt",
     "ProfilerClient",
     "ProfilerDataError",
     "PointerSession",
@@ -75,6 +78,10 @@ __all__ = [
     "ResourceProfileEntry",
     "SelectorError",
     "StateSnapshot",
+    "ScreenshotReceipt",
+    "VisualClient",
+    "VisualObservation",
+    "difference",
     "parse_resources_data",
     "wait_until",
 ]

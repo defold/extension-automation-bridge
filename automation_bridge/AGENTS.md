@@ -9,10 +9,17 @@
 - Call `GET /health` first. Require `ok: true`, inspect `data.capabilities`, and use `GET /screen` when window/display/viewport metadata matters. When `screen.resize` is present, use `PUT /screen?width=...&height=...` to set the native Defold window size.
 - Coordinates are top-left screen pixels. Prefer node ids over raw coordinates whenever possible.
 - Discover targets with `GET /nodes` or `GET /scene`; fetch details with `GET /node?id=...`.
-- `/nodes` filters: `id`, `type`, `name`, `text`, `url`, `visible`, `include`, and `limit`. `type`/`name`/`text`/`url` are case-insensitive substring matches. Use `limit=0` for counts.
+- `/nodes` applies exact, substring, boolean, identity, and pagination filters
+  server-side. Responses include `matched`, `truncated`, `next_cursor`,
+  `scene_sequence`, and `engine_frame`; use `limit=0` for complete counts.
 - Include data with `include=bounds`, `properties`, `children`, `all`, or a comma-separated combination. Basic node fields are always returned.
 - Node ids are stable only for the current scene shape. Re-discover nodes after clicks, drags, collection changes, or UI updates.
 - Input endpoints: `POST /input/click?id=...` or `x/y`; `POST /input/drag?from_id=...&to_id=...&duration=...` or `x1/y1/x2/y2`; `POST /input/key?text=...` or URL-encoded `keys=%7BKEY_ENTER%7D`.
 - Mouse/touch input visualization is on by default. Use `visualize=0` on click/drag endpoints when the overlay would interfere with diagnostics.
-- `GET /screenshot` schedules capture and returns a file path; wait until that file exists and has nonzero size.
+- `GET /screenshot` returns a capture id. Poll `/screenshot/status` until its
+  atomic receipt is `complete`; do not infer completion from file size.
+- Node ids are snapshot/path ids. Use `logical_id`/instance generation when
+  available, and `expected_scene_sequence` for stale node-target enforcement.
+- Coordinates use named top-left spaces and `/coordinates/convert`; do not infer
+  world, GUI-layout, monitor, or outer-window transforms.
 - Full endpoint details live in `automation_bridge/README.md`.

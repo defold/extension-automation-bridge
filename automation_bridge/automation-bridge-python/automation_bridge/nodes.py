@@ -50,6 +50,40 @@ class Node:
         return self.raw.get("id", "")
 
     @property
+    def snapshot_id(self) -> str:
+        """Return the path-derived identity for this particular scene shape."""
+        return self.raw.get("snapshot_id", self.id)
+
+    @property
+    def instance_id(self) -> Optional[str]:
+        """Return Defold's instance identifier when this node has an HInstance."""
+        return self.raw.get("instance_id")
+
+    @property
+    def instance_generation(self) -> Optional[int]:
+        """Return Defold's allocation generation for the backing instance."""
+        value = self.raw.get("instance_generation")
+        return int(value) if isinstance(value, (int, float)) else None
+
+    @property
+    def logical_id(self) -> Optional[str]:
+        """Return the bridge identity combining instance identifier and generation."""
+        return self.raw.get("logical_id")
+
+    @property
+    def created_scene_sequence(self) -> Optional[int]:
+        value = self.raw.get("created_scene_sequence")
+        return int(value) if isinstance(value, (int, float)) else None
+
+    @property
+    def scene_sequence(self) -> int:
+        return int(self.raw.get("scene_sequence", 0))
+
+    @property
+    def engine_frame(self) -> int:
+        return int(self.raw.get("engine_frame", 0))
+
+    @property
     def name(self) -> str:
         return self.raw.get("name", "")
 
@@ -134,6 +168,7 @@ class Node:
             center_text = f" center=({center['x']},{center['y']})"
         text = f" text={self.text!r}" if self.text is not None else ""
         return (
-            f"id={self.id!r} name={self.name!r} type={self.type!r}{text} automation_id={self.automation_id!r} "
+            f"id={self.id!r} logical_id={self.logical_id!r} name={self.name!r} type={self.type!r}{text} "
+            f"automation_id={self.automation_id!r} "
             f"path={self.path!r} visible={self.visible} enabled={self.enabled}{center_text}"
         )

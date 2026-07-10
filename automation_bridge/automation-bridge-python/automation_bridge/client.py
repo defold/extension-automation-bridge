@@ -1,6 +1,7 @@
 """Dependency-free Python client for the Automation Bridge runtime API."""
 
 import json
+import difflib
 import os
 import signal
 import socket
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .nodes import Node
+from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
 
@@ -354,9 +356,16 @@ def request_json(
     timeout: float = 10.0,
     data: Optional[bytes] = None,
     headers: Optional[Mapping[str, str]] = None,
+    json_body: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[int, JsonDict]:
     """Request JSON and return `(status, object)`."""
-    request = urllib.request.Request(url, data=data, headers=dict(headers or {}), method=method)
+    request_headers = dict(headers or {})
+    if json_body is not None:
+        if data is not None:
+            raise ValueError("request_json accepts either data or json_body, not both")
+        data = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.getcode()
@@ -467,25 +476,29 @@ class AutomationBridgeClient:
 
     _SERVER_FILTERS = {
         "id",
+        "instance_id",
+        "logical_id",
         "type",
+        "type_exact",
         "name",
+        "name_exact",
         "text",
+        "text_exact",
         "url",
+        "url_exact",
+        "path",
+        "enabled",
+        "kind",
+        "has_bounds",
+        "visible_and_enabled",
         "visible",
+        "case_sensitive",
         "automation_id",
         "localization_key",
         "role",
     }
-    _CLIENT_FILTERS = {
-        "enabled",
-        "kind",
-        "path",
-        "name_exact",
-        "text_exact",
-        "has_bounds",
-        "visible_and_enabled",
-    }
-    _SELECTOR_KEYS = _SERVER_FILTERS | _CLIENT_FILTERS | {"include", "limit"}
+    _CLIENT_FILTERS: set = set()
+    _SELECTOR_KEYS = _SERVER_FILTERS | {"include", "limit", "offset", "cursor"}
 
     def __init__(
         self,
@@ -651,23 +664,23 @@ class AutomationBridgeClient:
         return self.get("/scene", params)
 
     def nodes(self, **selector: Any) -> List[Node]:
-        """Return nodes matching server-side and Python-side selector filters."""
+        """Return one server-filtered page of nodes, with exact filters applied natively."""
         nodes, _, _ = self._select_nodes(selector)
         return nodes
 
     def node(self, **selector: Any) -> Node:
         """Return exactly one matching node or raise `SelectorError`."""
-        nodes, server_nodes, selector_text = self._select_nodes(selector)
+        nodes, metadata, selector_text = self._select_nodes(selector)
         if len(nodes) == 1:
             return nodes[0]
-        raise SelectorError(self._selector_error("expected exactly one node", selector_text, nodes, server_nodes))
+        raise SelectorError(self._selector_error("expected exactly one node", selector, selector_text, nodes, metadata))
 
     def maybe_node(self, **selector: Any) -> Optional[Node]:
         """Return zero or one matching node, raising if multiple nodes match."""
-        nodes, server_nodes, selector_text = self._select_nodes(selector)
+        nodes, metadata, selector_text = self._select_nodes(selector)
         if len(nodes) <= 1:
             return nodes[0] if nodes else None
-        raise SelectorError(self._selector_error("expected zero or one node", selector_text, nodes, server_nodes))
+        raise SelectorError(self._selector_error("expected zero or one node", selector, selector_text, nodes, metadata))
 
     def by_id(
         self,
@@ -693,13 +706,8 @@ class AutomationBridgeClient:
         return self.by_id(node.parent_id, include=include)
 
     def count(self, **selector: Any) -> int:
-        """Return the number of nodes matching `selector`."""
+        """Return the complete native match count, independent of page size."""
         self._validate_selector(selector)
-        if self._has_client_filters(selector):
-            selector = dict(selector)
-            selector["limit"] = 500
-            return len(self.nodes(**selector))
-
         params = self._server_params(selector, limit=0)
         return int(self.get("/nodes", params).get("matched", 0))
 
@@ -1033,18 +1041,48 @@ class AutomationBridgeClient:
             {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
         )
 
-    def screenshot(self, wait: bool = True, timeout: float = 5.0) -> Path:
-        """Schedule a screenshot and optionally wait for the PNG file."""
-        response = self.get("/screenshot")
-        path = Path(response["path"])
-        if wait:
-            wait_until(
-                lambda: path.exists() and path.stat().st_size > 0 and path,
-                timeout=timeout,
-                interval=0.1,
-                message=f"screenshot was not written: {path}",
-            )
-        return path
+    def screenshot(self, wait: bool = True, timeout: float = 5.0, after_frames: int = 0) -> ScreenshotReceipt:
+        """Schedule an atomic PNG capture and return its native completion receipt."""
+        if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
+            raise ValueError("after_frames must be an integer from 0 through 600")
+        response = self.get("/screenshot", {"after_frames": after_frames})
+        receipt = ScreenshotReceipt(response)
+        if not wait:
+            return receipt
+        if receipt.capture_id <= 0:
+            raise AutomationBridgeError("native screenshot response did not include a capture_id")
+
+        def completed() -> Optional[ScreenshotReceipt]:
+            current = ScreenshotReceipt(self.get("/screenshot/status", {"capture_id": receipt.capture_id}))
+            if current.state == "failed":
+                raise AutomationBridgeError(
+                    f"screenshot {current.capture_id} failed: {current.failure_reason or 'unknown reason'}"
+                )
+            return current if current.state == "complete" else None
+
+        return wait_until(
+            completed,
+            timeout=timeout,
+            interval=0.02,
+            message=f"screenshot capture {receipt.capture_id} did not complete",
+        )
+
+    def convert_point(
+        self,
+        point: Union[Mapping[str, Any], Sequence[float]],
+        from_space: str,
+        to_space: str,
+    ) -> Mapping[str, Any]:
+        """Convert a top-left-origin point through native window/viewport geometry."""
+        x, y = self._point(point)
+        data = self.post_json(
+            "/coordinates/convert",
+            {"point": {"x": x, "y": y}, "from_space": from_space, "to_space": to_space},
+        )
+        converted = data.get("point")
+        if not isinstance(converted, Mapping):
+            raise AutomationBridgeError("coordinate conversion response did not include a point")
+        return converted
 
     def engine_info(self) -> JsonDict:
         """Return Defold engine service `/info`, including version, platform, sha1, and log port."""
@@ -1110,39 +1148,81 @@ class AutomationBridgeClient:
         return self._last_window_size
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
-        """Resize the Defold window through `PUT /screen` and remember the new size."""
+        """Request a resize and return requested, window, viewport, and outcome data."""
         _validate_screen_size(width, height)
         capabilities = self.health().get("capabilities", [])
         if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
             raise AutomationBridgeError("Automation Bridge endpoint does not advertise the screen.resize capability")
 
-        screen = self.put("/screen", {"width": width, "height": height})
+        response = self.put_json("/screen", {"width": width, "height": height})
+        screen_value = response.get("screen") if isinstance(response, Mapping) else None
+        screen = dict(screen_value) if isinstance(screen_value, Mapping) else dict(response)
         self._remember_window_size(screen)
         if wait:
-            time.sleep(wait)
-            screen = self.screen()
+            deadline = time.monotonic() + wait
+            while time.monotonic() < deadline:
+                screen = self.screen()
+                window = screen.get("window")
+                if isinstance(window, Mapping) and window.get("width") == width and window.get("height") == height:
+                    break
+                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         window = screen.get("window") if isinstance(screen, Mapping) else None
+        observed_width = None
+        observed_height = None
         if isinstance(window, Mapping):
-            screen_width = window.get("width")
-            screen_height = window.get("height")
-            if isinstance(screen_width, int) and isinstance(screen_height, int):
-                width = screen_width
-                height = screen_height
-        return {"width": width, "height": height}
+            observed_width = window.get("width")
+            observed_height = window.get("height")
+        window_matches = observed_width == width and observed_height == height
+        backbuffer = screen.get("backbuffer") if isinstance(screen, Mapping) else None
+        backbuffer_matches = isinstance(backbuffer, Mapping) and backbuffer.get("width") == width and backbuffer.get("height") == height
+        result = dict(response)
+        result.update(
+            {
+                "width": observed_width if isinstance(observed_width, int) else width,
+                "height": observed_height if isinstance(observed_height, int) else height,
+                "requested": {"width": width, "height": height},
+                "screen": screen,
+                "window_matches": window_matches,
+                "backbuffer_matches": backbuffer_matches,
+            }
+        )
+        if not window_matches:
+            result["outcome"] = "requested_not_observed_before_timeout"
+        elif result.get("outcome") == "requested_not_observed":
+            result["outcome"] = "resized"
+        elif "outcome" not in result:
+            result["outcome"] = "resized"
+        return result
 
     def set_portrait(self, wait: float = 0.25) -> JsonDict:
         """Resize to portrait by swapping the last known width and height when needed."""
         width, height = self._known_window_size()
         if width > height:
             return self.resize(height, width, wait=wait)
-        return {"width": width, "height": height}
+        return self._unchanged_resize_result(width, height)
 
     def set_landscape(self, wait: float = 0.25) -> JsonDict:
         """Resize to landscape by swapping the last known width and height when needed."""
         width, height = self._known_window_size()
         if width < height:
             return self.resize(height, width, wait=wait)
-        return {"width": width, "height": height}
+        return self._unchanged_resize_result(width, height)
+
+    def _unchanged_resize_result(self, width: int, height: int) -> JsonDict:
+        screen = self.screen()
+        return {
+            "width": width,
+            "height": height,
+            "requested": {"width": width, "height": height},
+            "outcome": "already_correct",
+            "window_matches": True,
+            "backbuffer_matches": (
+                isinstance(screen.get("backbuffer"), Mapping)
+                and screen["backbuffer"].get("width") == width
+                and screen["backbuffer"].get("height") == height
+            ),
+            "screen": screen,
+        }
 
     def reboot(self, *args: str, wait: bool = True, timeout: Optional[float] = None) -> None:
         """Reboot the engine through `/post/@system/reboot` with up to six command-line args."""
@@ -1279,8 +1359,12 @@ class AutomationBridgeClient:
 
     def wait_for_node(self, timeout: float = 10.0, interval: float = 0.1, **selector: Any) -> Node:
         """Wait until `node(**selector)` succeeds."""
+        def one_node() -> Optional[Node]:
+            nodes, _, _ = self._select_nodes(selector)
+            return nodes[0] if len(nodes) == 1 else None
+
         return wait_until(
-            lambda: self.node(**selector),
+            one_node,
             timeout=timeout,
             interval=interval,
             message=f"node did not appear: {selector}",
@@ -1306,13 +1390,182 @@ class AutomationBridgeClient:
         )
         return expected
 
-    def _request(self, method: str, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
+    def wait_frames(self, count: int, timeout: float = 5.0, interval: float = 0.005) -> JsonDict:
+        """Wait for ``count`` native engine updates and return the final frame receipt."""
+        if not isinstance(count, int) or count < 0:
+            raise ValueError("frame count must be a non-negative integer")
+        initial = self.get("/frame")
+        target = int(initial.get("engine_frame", 0)) + count
+        if count == 0:
+            return initial
+        return wait_until(
+            lambda: (data if int(data.get("engine_frame", 0)) >= target else None)
+            if (data := self.get("/frame"))
+            else None,
+            timeout=timeout,
+            interval=interval,
+            message=f"engine frame did not reach {target}",
+        )
+
+    def wait_for_appearance(
+        self,
+        timeout: float = 10.0,
+        interval: float = 0.02,
+        after_scene_sequence: Optional[int] = None,
+        **selector: Any,
+    ) -> ObservationReceipt:
+        """Wait for a node observed after an optional scene cursor and return frame evidence."""
+        def appeared() -> Optional[ObservationReceipt]:
+            node = self.maybe_node(**selector)
+            if node is None or (after_scene_sequence is not None and node.scene_sequence <= after_scene_sequence):
+                return None
+            identity = node.logical_id or node.snapshot_id
+            return ObservationReceipt(
+                node=node,
+                identity=identity,
+                first_frame=node.engine_frame,
+                last_frame=node.engine_frame,
+                first_scene_sequence=node.scene_sequence,
+                last_scene_sequence=node.scene_sequence,
+                observed_frames=1,
+            )
+
+        return wait_until(
+            appeared,
+            timeout=timeout,
+            interval=interval,
+            message=f"node did not appear after scene sequence {after_scene_sequence}: {selector}",
+        )
+
+    def observe_node(
+        self,
+        minimum_frames: int = 3,
+        timeout: float = 10.0,
+        interval: float = 0.01,
+        identity: str = "logical",
+        **selector: Any,
+    ) -> ObservationReceipt:
+        """Require one node identity across distinct frames and return its observation span."""
+        if minimum_frames <= 0:
+            raise ValueError("minimum_frames must be positive")
+        if identity not in {"logical", "snapshot", "instance"}:
+            raise ValueError("identity must be logical, snapshot, or instance")
+        observation: Dict[str, Any] = {}
+
+        def sample() -> Optional[ObservationReceipt]:
+            node = self.maybe_node(**selector)
+            if node is None:
+                observation.clear()
+                return None
+            node_identity = {
+                "logical": node.logical_id or node.snapshot_id,
+                "snapshot": node.snapshot_id,
+                "instance": node.instance_id or node.snapshot_id,
+            }[identity]
+            if observation.get("identity") != node_identity:
+                observation.update(
+                    identity=node_identity,
+                    node=node,
+                    first_frame=node.engine_frame,
+                    last_frame=node.engine_frame,
+                    first_sequence=node.scene_sequence,
+                    last_sequence=node.scene_sequence,
+                    frames=1,
+                )
+            elif node.engine_frame != observation["last_frame"]:
+                observation["node"] = node
+                observation["last_frame"] = node.engine_frame
+                observation["last_sequence"] = node.scene_sequence
+                observation["frames"] += 1
+            if observation["frames"] < minimum_frames:
+                return None
+            return ObservationReceipt(
+                node=observation["node"],
+                identity=observation["identity"],
+                first_frame=observation["first_frame"],
+                last_frame=observation["last_frame"],
+                first_scene_sequence=observation["first_sequence"],
+                last_scene_sequence=observation["last_sequence"],
+                observed_frames=observation["frames"],
+            )
+
+        return wait_until(
+            sample,
+            timeout=timeout,
+            interval=interval,
+            message=f"node was not observed for {minimum_frames} distinct frames: {selector}",
+        )
+
+    def wait_for_disappearance(
+        self,
+        node_id: str,
+        timeout: float = 10.0,
+        interval: float = 0.02,
+    ) -> ObservationReceipt:
+        """Wait until a snapshot id is absent and return its last and disappearance receipts."""
+        first = self.maybe_node(id=node_id)
+        last = first
+        first_frame = first.engine_frame if first else 0
+        first_sequence = first.scene_sequence if first else 0
+        observed = 1 if first else 0
+
+        def disappeared() -> Optional[ObservationReceipt]:
+            nonlocal last, observed
+            node = self.maybe_node(id=node_id)
+            if node is not None:
+                if last is None or node.engine_frame != last.engine_frame:
+                    observed += 1
+                last = node
+                return None
+            current = self.get("/frame")
+            return ObservationReceipt(
+                node=last,
+                identity=(last.logical_id or last.snapshot_id) if last else node_id,
+                first_frame=first_frame,
+                last_frame=last.engine_frame if last else first_frame,
+                first_scene_sequence=first_sequence,
+                last_scene_sequence=last.scene_sequence if last else first_sequence,
+                observed_frames=observed,
+                disappeared_frame=int(current.get("engine_frame", 0)),
+                disappeared_scene_sequence=int(current.get("scene_sequence", 0)),
+            )
+
+        return wait_until(
+            disappeared,
+            timeout=timeout,
+            interval=interval,
+            message=f"node did not disappear: {node_id}",
+        )
+
+    def assert_node(self, **selector: Any) -> Node:
+        """Assert scene/state-level node properties using native selectors."""
+        return self.node(**selector)
+
+    def wait_for_stable_frame(self, *args: Any, **kwargs: Any):
+        """Delegate pixel stability to the optional ``automation_bridge.visual`` layer."""
+        from .visual import VisualClient
+
+        return VisualClient(self).wait_for_stable_frame(*args, **kwargs)
+
+    def wait_for_region_change(self, *args: Any, **kwargs: Any):
+        """Delegate region differencing to the optional ``automation_bridge.visual`` layer."""
+        from .visual import VisualClient
+
+        return VisualClient(self).wait_for_region_change(*args, **kwargs)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Mapping[str, Any]] = None,
+        json_body: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
         url = self.base_url + path
         encoded_params = self._encoded_params(params)
         if encoded_params:
             url += "?" + urllib.parse.urlencode(encoded_params)
 
-        status, response = request_json(url, method=method, timeout=self.timeout)
+        status, response = request_json(url, method=method, timeout=self.timeout, json_body=json_body)
         if not response.get("ok"):
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
@@ -1407,17 +1660,16 @@ class AutomationBridgeClient:
             return {}
         return {key: _encode_param(value) for key, value in params.items() if value is not None}
 
-    def _select_nodes(self, selector: Mapping[str, Any]) -> Tuple[List[Node], List[Node], str]:
+    def _select_nodes(self, selector: Mapping[str, Any]) -> Tuple[List[Node], JsonDict, str]:
         self._validate_selector(selector)
         limit = selector.get("limit", 50)
-        request_limit = 500 if self._has_client_filters(selector) and limit != 0 else limit
-        params = self._server_params(selector, limit=request_limit)
+        params = self._server_params(selector, limit=limit)
         data = self.get("/nodes", params)
         server_nodes = [Node(node) for node in data.get("nodes", []) if isinstance(node, dict)]
         filtered = [node for node in server_nodes if self._matches_client_filters(node, selector)]
-        if limit is not None:
-            filtered = filtered[: int(limit)]
-        return filtered, server_nodes, self._selector_text(selector)
+        data = dict(data)
+        data["_nodes"] = server_nodes
+        return filtered, data, self._selector_text(selector)
 
     def _server_params(self, selector: Mapping[str, Any], limit: Any) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
@@ -1425,13 +1677,6 @@ class AutomationBridgeClient:
             value = selector.get(key)
             if value is not None:
                 params[key] = value
-
-        if selector.get("name_exact") is not None and "name" not in params:
-            params["name"] = selector["name_exact"]
-        if selector.get("text_exact") is not None and "text" not in params:
-            params["text"] = selector["text_exact"]
-        if selector.get("visible_and_enabled") is True and "visible" not in params:
-            params["visible"] = True
 
         include = selector.get("include")
         if include is None and selector.get("has_bounds") is not None:
@@ -1441,6 +1686,9 @@ class AutomationBridgeClient:
             params["include"] = normalized_include
         if limit is not None:
             params["limit"] = limit
+        for key in ("offset", "cursor"):
+            if selector.get(key) is not None:
+                params[key] = selector[key]
         return params
 
     def _matches_client_filters(self, node: Node, selector: Mapping[str, Any]) -> bool:
@@ -1477,16 +1725,86 @@ class AutomationBridgeClient:
     def _selector_error(
         self,
         prefix: str,
+        selector: Mapping[str, Any],
         selector_text: str,
         nodes: Sequence[Node],
-        candidates: Sequence[Node],
+        metadata: Mapping[str, Any],
     ) -> str:
+        candidates = metadata.get("_nodes", [])
         shown = nodes if nodes else candidates
-        lines = [f"{prefix}; selector: {selector_text}; found {len(nodes)}"]
+        matched = int(metadata.get("matched", len(nodes)))
+        truncated = bool(metadata.get("truncated", False))
+        lines = [
+            f"{prefix}; selector: {selector_text}; returned {len(nodes)}; "
+            f"server matched {matched}; truncated={truncated}; "
+            f"scene_sequence={metadata.get('scene_sequence')}; engine_frame={metadata.get('engine_frame')}"
+        ]
+        active_collections = metadata.get("active_collections")
+        if active_collections:
+            lines.append(f"active collections: {active_collections}")
+        excluded = metadata.get("excluded")
+        if isinstance(excluded, Mapping) and any(excluded.values()):
+            lines.append(
+                "matching nodes excluded by state: "
+                f"visibility={excluded.get('visibility', 0)}, "
+                f"enabled={excluded.get('enabled', 0)}, bounds={excluded.get('bounds', 0)}"
+            )
+        if not shown:
+            shown = self._nearest_selector_nodes(selector)
         if shown:
             lines.append("candidates:")
             lines.extend(f"  {node.compact()}" for node in list(shown)[:10])
+            requested_values = [
+                str(value)
+                for key, value in (
+                    (part.split("=", 1)[0], part.split("=", 1)[1] if "=" in part else "")
+                    for part in selector_text.split(", ")
+                )
+                if key in {"name", "name_exact", "text", "text_exact", "path"}
+            ]
+            choices = [value for node in shown for value in (node.name, node.text or "", node.path) if value]
+            nearest = []
+            for value in requested_values:
+                nearest.extend(difflib.get_close_matches(value.strip("'\""), choices, n=3, cutoff=0.2))
+            if nearest:
+                lines.append(f"nearest name/text/path values: {list(dict.fromkeys(nearest))[:5]}")
+        if matched > 1:
+            lines.append("suggestion: add name_exact, text_exact, path, logical_id, or instance_id")
         return "\n".join(lines)
+
+    def _nearest_selector_nodes(self, selector: Mapping[str, Any], maximum: int = 5000) -> List[Node]:
+        """Fetch bounded complete pages only while formatting a failed direct selector."""
+        candidates: List[Node] = []
+        cursor: Optional[str] = None
+        while len(candidates) < maximum:
+            params: Dict[str, Any] = {"limit": min(500, maximum - len(candidates)), "include": "basic"}
+            if cursor is not None:
+                params["cursor"] = cursor
+            data = self.get("/nodes", params)
+            candidates.extend(Node(raw) for raw in data.get("nodes", []) if isinstance(raw, dict))
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+        requested = [
+            str(selector[key])
+            for key in ("name_exact", "name", "text_exact", "text", "path")
+            if selector.get(key) is not None
+        ]
+        if not requested:
+            return candidates[:10]
+        scored = []
+        for node in candidates:
+            choices = [node.name, node.text or "", node.path]
+            ratios = [
+                difflib.SequenceMatcher(None, expected, choice).ratio()
+                for expected in requested
+                for choice in choices
+                if choice
+            ]
+            score = max(ratios) if ratios else 0.0
+            scored.append((score, node))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [node for _, node in scored[:10]]
 
     @staticmethod
     def _is_node_ref(target: Target) -> bool:
