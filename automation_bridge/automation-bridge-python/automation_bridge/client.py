@@ -621,11 +621,11 @@ class AutomationBridgeClient:
 
     def post_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
         """POST an `application/json` object for structured Automation Bridge operations."""
-        return self._request_json("POST", path, payload)
+        return self._request("POST", path, json_body=payload)
 
     def put_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
         """PUT an `application/json` object for structured Automation Bridge operations."""
-        return self._request_json("PUT", path, payload)
+        return self._request("PUT", path, json_body=payload)
 
     def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
         """PUT an Automation Bridge API path with query parameters and return `data`."""

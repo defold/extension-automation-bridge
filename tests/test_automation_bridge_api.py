@@ -711,7 +711,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 "n:1", wait=0, expected_scene_sequence=42
             )
 
-        self.assertIn("expected_scene_sequence=42", server.request_line)
+        self.assertEqual(42, json.loads(server.request_body)["expected_scene_sequence"])
 
     def test_convert_point_uses_json_body(self):
         response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
@@ -849,7 +849,8 @@ class FakeInputClient(AutomationBridgeClient):
         self.api_requests = []
         self.statuses = list(statuses or [])
 
-    def _request(self, method, path, params=None):
+    def _request(self, method, path, params=None, json_body=None):
+        params = json_body if json_body is not None else params
         params = dict(params) if params is not None else None
         self.api_requests.append((method, path, params))
         if method == "GET" and path == "/input/status":
