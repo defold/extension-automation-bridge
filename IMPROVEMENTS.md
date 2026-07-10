@@ -416,7 +416,7 @@ filters and makes `count()` correct for large scenes.
 ### 17. Add transient-node observation primitives
 
 ```python
-bridge.wait_for_appearance(..., after_scene_sequence=sequence)
+bridge.wait_for_node(..., after_scene_sequence=sequence)
 bridge.wait_for_disappearance(node_id=old.id)
 bridge.observe_node(..., minimum_frames=3)
 ```
@@ -455,12 +455,12 @@ not infer completion from `exists() && size > 0` alone.
 
 ```python
 bridge.wait_frames(2)
-bridge.wait_for_stable_frame(
+bridge.visual.wait_for_stable_frame(
     region=content_region,
     consecutive_frames=3,
     tolerance=0.01,
 )
-bridge.wait_for_region_change(before, region=content_region)
+bridge.visual.wait_for_region_change(before, region=content_region)
 ```
 
 Specify the pixel metric, alpha handling, scaling, consecutive-frame count,
@@ -475,7 +475,7 @@ events/state. Visual stability is the generic fallback.
 Core assertions should use scene/state data:
 
 ```python
-bridge.assert_node(automation_id="operation_status", visible=True)
+bridge.node(automation_id="operation_status", visible=True)
 bridge.wait_for_state("ui.workflow_step", "complete")
 ```
 
@@ -489,7 +489,7 @@ client can remain dependency-free.
 The desired API is still valuable:
 
 ```python
-recording = bridge.record_video(
+recording = bridge.recording.start(
     "session.mp4",
     size=(1080, 1920),
     audio="application",
@@ -645,7 +645,7 @@ The Python wrapper should accept required and optional capabilities:
 
 ```python
 bridge.require("application.events", "application.commands")
-bridge.optional("scene", "screenshot", "input.drag")
+{name: bridge.supports(name) for name in ("scene", "screenshot", "input.drag")}
 ```
 
 CI diagnostics should clearly distinguish unsupported capabilities from

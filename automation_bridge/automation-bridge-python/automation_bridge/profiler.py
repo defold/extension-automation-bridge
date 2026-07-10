@@ -4,6 +4,71 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 from .client import AutomationBridgeError, HttpError, request_raw
+from . import remotery as _remotery
+
+
+# Public profiler vocabulary backed by the internal Remotery protocol module.
+ProfilerError = _remotery.RemoteryError
+ProfilerProtocolError = _remotery.RemoteryProtocolError
+ProfilerTimeoutError = _remotery.RemoteryTimeoutError
+ProfilerConnection = _remotery.RemoteryClient
+ProfilerSampleAggregate = _remotery.RemoterySampleAggregate
+ProfilerTimingStats = _remotery.RemoteryTimingStats
+ProfilerValueStats = _remotery.RemoteryValueStats
+ProfilerCapture = _remotery.RemoteryCapture
+ProfilerRecording = _remotery.RemoteryRecording
+ProfilerSample = _remotery.RemoterySample
+ProfilerFrame = _remotery.RemoteryFrame
+ProfilerProperty = _remotery.RemoteryProperty
+ProfilerPropertyEntry = _remotery.RemoteryPropertyEntry
+ProfilerPropertyFrame = _remotery.RemoteryPropertyFrame
+ProfilerScopeStats = _remotery.RemoteryScopeStats
+ProfilerCounterStats = _remotery.RemoteryCounterStats
+
+_PROFILER_TYPES = {
+    "ProfilerError": ProfilerError,
+    "ProfilerProtocolError": ProfilerProtocolError,
+    "ProfilerTimeoutError": ProfilerTimeoutError,
+    "ProfilerConnection": ProfilerConnection,
+    "ProfilerSampleAggregate": ProfilerSampleAggregate,
+    "ProfilerTimingStats": ProfilerTimingStats,
+    "ProfilerValueStats": ProfilerValueStats,
+    "ProfilerCapture": ProfilerCapture,
+    "ProfilerRecording": ProfilerRecording,
+    "ProfilerSample": ProfilerSample,
+    "ProfilerFrame": ProfilerFrame,
+    "ProfilerProperty": ProfilerProperty,
+    "ProfilerPropertyEntry": ProfilerPropertyEntry,
+    "ProfilerPropertyFrame": ProfilerPropertyFrame,
+    "ProfilerScopeStats": ProfilerScopeStats,
+    "ProfilerCounterStats": ProfilerCounterStats,
+}
+for _public_name, _type in _PROFILER_TYPES.items():
+    _type.__name__ = _public_name
+    _type.__qualname__ = _public_name
+    _type.__module__ = __name__
+
+__all__ = [
+    "ProfilerCapture",
+    "ProfilerClient",
+    "ProfilerConnection",
+    "ProfilerCounterStats",
+    "ProfilerDataError",
+    "ProfilerError",
+    "ProfilerFrame",
+    "ProfilerProperty",
+    "ProfilerPropertyEntry",
+    "ProfilerPropertyFrame",
+    "ProfilerProtocolError",
+    "ProfilerRecording",
+    "ProfilerSample",
+    "ProfilerSampleAggregate",
+    "ProfilerScopeStats",
+    "ProfilerTimeoutError",
+    "ProfilerTimingStats",
+    "ProfilerValueStats",
+    "ResourceProfileEntry",
+]
 
 
 @dataclass(frozen=True)
@@ -26,12 +91,17 @@ class ProfilerDataError(AutomationBridgeError):
 class ProfilerClient:
     """Client for Defold's built-in engine profiler endpoints."""
 
-    def __init__(self, port: int, timeout: float = 10.0, remotery_url: Optional[str] = None):
+    def __init__(self, port: int, timeout: float = 10.0, profiler_url: Optional[str] = None):
         """Create a profiler client for an already-known Defold engine service `port`."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}"
-        self.remotery_url = remotery_url
+        self._remotery_url = profiler_url
+
+    @property
+    def url(self) -> Optional[str]:
+        """Return the discovered profiler stream URL, if one is available."""
+        return self._remotery_url
 
     def resources(self) -> List[ResourceProfileEntry]:
         """Return loaded resources from Defold's `/resources_data` endpoint, largest first."""
@@ -46,27 +116,24 @@ class ProfilerClient:
             )
         return sorted(parse_resources_data(body), key=lambda resource: resource.size, reverse=True)
 
-    def remotery(
+    def connect(
         self,
         port: Optional[int] = None,
         host: Optional[str] = None,
         url: Optional[str] = None,
         path: str = "/rmt",
-    ) -> "RemoteryClient":
-        """Return a Remotery websocket profiler client.
+    ) -> ProfilerConnection:
+        """Return a live engine profiler connection.
 
-        By default this uses the Remotery URL discovered while bootstrapping the
-        Automation Bridge client from editor logs. Pass `url`, or `host`/`port`,
-        to override it.
+        By default this uses the profiler URL discovered while bootstrapping
+        from editor logs. Pass `url`, or `host`/`port`, to override it.
         """
-        from .remotery import DEFAULT_REMOTERY_PORT, RemoteryClient
-
         if url is not None:
-            return RemoteryClient.from_url(url, timeout=self.timeout)
-        if port is None and host is None and self.remotery_url is not None:
-            return RemoteryClient.from_url(self.remotery_url, timeout=self.timeout)
-        return RemoteryClient(
-            port=DEFAULT_REMOTERY_PORT if port is None else port,
+            return ProfilerConnection.from_url(url, timeout=self.timeout)
+        if port is None and host is None and self._remotery_url is not None:
+            return ProfilerConnection.from_url(self._remotery_url, timeout=self.timeout)
+        return ProfilerConnection(
+            port=_remotery.DEFAULT_REMOTERY_PORT if port is None else port,
             host="127.0.0.1" if host is None else host,
             path=path,
             timeout=self.timeout,
@@ -80,10 +147,10 @@ class ProfilerClient:
         thread: Optional[str] = None,
         include_properties: bool = True,
         resolve_names: bool = True,
-    ) -> "RemoteryCapture":
-        """Open Remotery, capture frames/properties, and return aggregate query helpers."""
-        with self.remotery() as remotery:
-            return remotery.capture(
+    ) -> ProfilerCapture:
+        """Capture profiler frames/properties and return aggregate query helpers."""
+        with self.connect() as connection:
+            return connection.capture(
                 frames=frames,
                 warmup_frames=warmup_frames,
                 timeout=timeout,
@@ -100,16 +167,16 @@ class ProfilerClient:
         resolve_names: bool = True,
         read_timeout: float = 0.25,
         max_frames: Optional[int] = None,
-        on_finalize: Optional[Callable[["RemoteryCapture"], None]] = None,
-        on_abort: Optional[Callable[[BaseException, "RemoteryCapture"], None]] = None,
-    ) -> "RemoteryRecording":
-        """Start background Remotery recording until the returned session is stopped.
+        on_finalize: Optional[Callable[[ProfilerCapture], None]] = None,
+        on_abort: Optional[Callable[[BaseException, ProfilerCapture], None]] = None,
+    ) -> ProfilerRecording:
+        """Start background profiling until the returned session is stopped.
 
         Use this when a Python automation script drives gameplay and decides at
         runtime when the interesting performance window is complete. The
-        returned session's `stop()` method returns a `RemoteryCapture`.
+        returned session's `stop()` method returns a `ProfilerCapture`.
         """
-        return self.remotery().start_recording(
+        return self.connect().start_recording(
             warmup_frames=warmup_frames,
             thread=thread,
             include_properties=include_properties,

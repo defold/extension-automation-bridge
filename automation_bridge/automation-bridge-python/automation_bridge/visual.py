@@ -149,6 +149,16 @@ class VisualClient:
     def __init__(self, bridge: Any):
         self.bridge = bridge
 
+    def difference(
+        self,
+        before: Union[ScreenshotReceipt, str, Path, bytes],
+        after: Union[ScreenshotReceipt, str, Path, bytes],
+        region: Optional[Region] = None,
+        include_alpha: bool = False,
+    ) -> float:
+        """Return the normalized pixel difference between two captures."""
+        return difference(before, after, region=region, include_alpha=include_alpha)
+
     def wait_for_stable_frame(
         self,
         region: Optional[Region] = None,

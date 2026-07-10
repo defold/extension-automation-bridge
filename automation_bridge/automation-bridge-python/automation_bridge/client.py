@@ -25,7 +25,7 @@ JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "1.1.0"
+PYTHON_PACKAGE_VERSION = "2.0.0"
 SUPPORTED_API_VERSION_MIN = 1
 SUPPORTED_API_VERSION_MAX = 1
 
@@ -252,16 +252,16 @@ class InputController:
         params["device"] = device
         if visualize is not None:
             params["visualize"] = visualize
-        return self._bridge.put_json("/input/configure", params)
+        return self._bridge._request("PUT", "/input/configure", json_body=params)
 
     def pending(self) -> List[InputReceipt]:
         """Return FIFO-ordered accepted/started input receipts."""
-        data = self._bridge.get("/input/pending")
+        data = self._bridge._request("GET", "/input/pending")
         return [InputReceipt(item) for item in data.get("inputs", [])]
 
     def status(self, input_id: int) -> InputReceipt:
         """Return the current or bounded-history receipt for `input_id`."""
-        return InputReceipt(self._bridge.get("/input/status", {"input_id": input_id}))
+        return InputReceipt(self._bridge._request("GET", "/input/status", {"input_id": input_id}))
 
     def wait(
         self,
@@ -314,13 +314,13 @@ class InputController:
         """Request cancellation, releasing active pointer/key state by default."""
         params = self._bridge._input_params()
         params.update({"input_id": input_id, "release": release})
-        return InputReceipt(self._bridge.post_json("/input/cancel", params))
+        return InputReceipt(self._bridge._request("POST", "/input/cancel", json_body=params))
 
     def flush(self, release: bool = True) -> JsonDict:
         """Cancel this session's active and later queued inputs."""
         params = self._bridge._input_params()
         params["release"] = release
-        return self._bridge.post_json("/input/flush", params)
+        return self._bridge._request("POST", "/input/flush", json_body=params)
 
     def interruption_scope(
         self,
@@ -382,7 +382,7 @@ class PointerSession:
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/move", params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/move", json_body=params))
         return self.receipt
 
     def hold(self, duration: float) -> InputReceipt:
@@ -396,7 +396,7 @@ class PointerSession:
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/hold", params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/hold", json_body=params))
         return self.receipt
 
     def up(self, wait: Union[str, bool] = "released", timeout: float = 10.0) -> InputReceipt:
@@ -404,7 +404,7 @@ class PointerSession:
         self._ensure_open()
         params = self._bridge._input_params(lease=max(5.0, self.lease))
         params.update({"input_id": self.input_id, "pointer_lease": self.lease})
-        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/up", params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/up", json_body=params))
         self.closed = True
         if wait:
             target_state = "released" if wait is True else str(wait)
@@ -581,17 +581,16 @@ class AutomationBridgeClient:
         self,
         port: int,
         timeout: float = 10.0,
-        remotery_url: Optional[str] = None,
+        profiler_url: Optional[str] = None,
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
         required_capabilities: Sequence[str] = (),
-        optional_capabilities: Sequence[str] = (),
     ):
-        """Create a correlated client with optional capability declarations."""
+        """Create a correlated client for an already-known engine service port."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
-        self._remotery_url = remotery_url
+        self._remotery_url = profiler_url
         self._last_window_size: Optional[Tuple[int, int]] = None
         self._last_scene_sequence: Optional[int] = None
         # Defold v1 exposes query-only control endpoints with a bounded resource
@@ -601,7 +600,6 @@ class AutomationBridgeClient:
         self._input_controller = InputController(self)
         self._active_traces: List[Any] = []
         self._required_capabilities = set(required_capabilities)
-        self._optional_capabilities = set(optional_capabilities)
         self._last_health: Optional[JsonDict] = None
 
     @property
@@ -616,7 +614,6 @@ class AutomationBridgeClient:
         build: bool = True,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
-        optional_capabilities: Sequence[str] = (),
     ) -> "AutomationBridgeClient":
         """Build through `editor`, discover the engine port, and wait for health."""
         if build:
@@ -625,22 +622,21 @@ class AutomationBridgeClient:
             editor.build()
 
         def bridge_after_build() -> Optional["AutomationBridgeClient"]:
-            service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
-            registration_ports = editor.latest_registration_engine_service_ports() if hasattr(editor, "latest_registration_engine_service_ports") else []
-            remotery_url = cls._editor_remotery_url(editor, fresh_build=build)
+            service_ports = editor._engine_service_ports()
+            registration_ports = editor._current_registration_engine_service_ports()
+            profiler_url = cls._editor_profiler_url(editor, fresh_build=build)
             for service_port in service_ports:
                 if not service_port:
                     continue
                 try:
                     bridge = cls(
                         service_port,
-                        remotery_url=remotery_url,
+                        profiler_url=profiler_url,
                         required_capabilities=required_capabilities,
-                        optional_capabilities=optional_capabilities,
                     )
                     health = bridge.health()
                     registration_is_authoritative = service_port in registration_ports
-                    if hasattr(editor, "validate_cached_engine_health") and not editor.validate_cached_engine_health(
+                    if not editor._validate_cached_engine_health(
                         service_port,
                         health,
                         fresh_build=build or registration_is_authoritative,
@@ -650,20 +646,18 @@ class AutomationBridgeClient:
                     raise
                 except AutomationBridgeError:
                     continue
-                if hasattr(editor, "remember_engine_service_port"):
-                    identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
-                    editor.remember_engine_service_port(
-                        service_port,
-                        identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
-                        identity.get("project_identity") if isinstance(identity, Mapping) else None,
-                    )
-                if hasattr(editor, "record_lifecycle"):
-                    editor.record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
-                    lifecycle = health.get("lifecycle", {})
-                    if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
-                        editor.record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
-                if remotery_url and hasattr(editor, "remember_remotery_url"):
-                    editor.remember_remotery_url(remotery_url)
+                identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
+                editor._remember_engine_service_port(
+                    service_port,
+                    identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
+                    identity.get("project_identity") if isinstance(identity, Mapping) else None,
+                )
+                editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
+                lifecycle = health.get("lifecycle", {})
+                if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
+                    editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
+                if profiler_url:
+                    editor._remember_remotery_url(profiler_url)
                 return bridge
             return None
 
@@ -733,18 +727,14 @@ class AutomationBridgeClient:
 
     @staticmethod
     def _last_build_missing_engine_service_port(editor: Any) -> bool:
-        if not hasattr(editor, "last_build_had_engine_service_port"):
-            return False
-        return editor.last_build_had_engine_service_port() is False
+        return editor._last_build_had_engine_service_port is False
 
     @staticmethod
-    def _editor_remotery_url(editor: Any, fresh_build: bool) -> Optional[str]:
-        if fresh_build and hasattr(editor, "latest_registration_remotery_urls"):
-            urls = editor.latest_registration_remotery_urls()
+    def _editor_profiler_url(editor: Any, fresh_build: bool) -> Optional[str]:
+        if fresh_build:
+            urls = editor._current_registration_remotery_urls()
             return urls[0] if urls else None
-        if hasattr(editor, "remotery_url"):
-            return editor.remotery_url()
-        return None
+        return editor._remotery_url_value()
 
     @classmethod
     def from_project(
@@ -753,7 +743,6 @@ class AutomationBridgeClient:
         build: bool = True,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
-        optional_capabilities: Sequence[str] = (),
     ) -> "AutomationBridgeClient":
         """Create an editor client from `root`, then connect to the Automation Bridge API."""
         from .editor import EditorClient
@@ -764,7 +753,6 @@ class AutomationBridgeClient:
             build=build,
             timeout=timeout,
             required_capabilities=required_capabilities,
-            optional_capabilities=optional_capabilities,
         )
 
     def wait_ready(
@@ -782,33 +770,20 @@ class AutomationBridgeClient:
             scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
         )
 
-    def get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """GET an Automation Bridge API path and return its `data` object."""
-        return self._request("GET", path, params)
-
-    def post(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """POST an Automation Bridge API path with query parameters and return `data`."""
-        return self._request("POST", path, params)
-
-    def post_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
-        """POST an `application/json` object for structured Automation Bridge operations."""
-        return self._request("POST", path, json_body=payload)
-
-    def put_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
-        """PUT an `application/json` object for structured Automation Bridge operations."""
-        return self._request("PUT", path, json_body=payload)
-
-    def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """PUT an Automation Bridge API path with query parameters and return `data`."""
-        return self._request("PUT", path, params)
-
-    def delete(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
-        """DELETE an Automation Bridge API path and return its `data` object."""
-        return self._request("DELETE", path, params)
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        json: Optional[Mapping[str, Any]] = None,
+    ) -> JsonDict:
+        """Call a raw Automation Bridge path and return its ``data`` object."""
+        return self._request(method.upper(), path, params, json_body=json)
 
     def health(self) -> JsonDict:
         """Return and validate API version, capabilities, identity, and backend data."""
-        data = self.get("/health")
+        data = self._request("GET", "/health")
         self._validate_health(data)
         self._last_health = data
         screen = data.get("screen")
@@ -830,7 +805,7 @@ class AutomationBridgeClient:
     def lifecycle(self) -> JsonDict:
         """Return native runtime lifecycle stages and their monotonic timestamps."""
         self.require("runtime.lifecycle")
-        return self.get("/lifecycle")
+        return self._request("GET", "/lifecycle")
 
     def require(self, *capabilities: str) -> "AutomationBridgeClient":
         """Declare mandatory capabilities and fail clearly when any are unavailable.
@@ -841,12 +816,9 @@ class AutomationBridgeClient:
         self._validate_required_capabilities(self.health())
         return self
 
-    def optional(self, *capabilities: str) -> Dict[str, bool]:
-        """Declare optional capabilities and return their current availability."""
-        self._optional_capabilities.update(capabilities)
-        health = self.health()
-        versions = self._capability_versions(health)
-        return {declaration: self._capability_satisfies(declaration, versions) for declaration in capabilities}
+    def supports(self, capability: str) -> bool:
+        """Return whether the endpoint satisfies one capability declaration."""
+        return self._capability_satisfies(capability, self._capability_versions(self.health()))
 
     def trace_metadata(self) -> JsonDict:
         """Return stable metadata to embed in trace bundles and CI artifacts."""
@@ -911,7 +883,7 @@ class AutomationBridgeClient:
 
     def screen(self) -> JsonDict:
         """Return window, backbuffer, viewport, and coordinate metadata."""
-        data = self.get("/screen")
+        data = self._request("GET", "/screen")
         self._remember_window_size(data)
         return data
 
@@ -927,7 +899,7 @@ class AutomationBridgeClient:
         normalized_include = _normalize_include(include)
         if normalized_include:
             params["include"] = normalized_include
-        return self.get("/scene", params)
+        return self._request("GET", "/scene", params)
 
     def nodes(self, **selector: Any) -> List[Node]:
         """Return one server-filtered page of nodes, with exact filters applied natively."""
@@ -962,7 +934,7 @@ class AutomationBridgeClient:
         normalized_include = _normalize_include(include)
         if normalized_include:
             params["include"] = normalized_include
-        return Node(self.get("/node", params)["node"])
+        return Node(self._request("GET", "/node", params)["node"])
 
     def parent(
         self,
@@ -979,7 +951,7 @@ class AutomationBridgeClient:
         """Return the complete native match count, independent of page size."""
         self._validate_selector(selector)
         params = self._server_params(selector, limit=0)
-        return int(self.get("/nodes", params).get("matched", 0))
+        return int(self._request("GET", "/nodes", params).get("matched", 0))
 
     def click(
         self,
@@ -1007,7 +979,7 @@ class AutomationBridgeClient:
         params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if pointer_id:
             params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self.post_json("/input/click", params))
+        receipt = InputReceipt(self._request("POST", "/input/click", json_body=params))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1052,7 +1024,7 @@ class AutomationBridgeClient:
             params["hold_after"] = hold_after
         if pointer_id:
             params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self.post_json("/input/drag", params))
+        receipt = InputReceipt(self._request("POST", "/input/drag", json_body=params))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1115,7 +1087,7 @@ class AutomationBridgeClient:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self.post_json("/input/drag_path", params))
+        receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=params))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1150,7 +1122,7 @@ class AutomationBridgeClient:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self.post_json("/input/pointer/open", params))
+        receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=params))
         return PointerSession(self, receipt, lease)
 
     def type_text(
@@ -1165,7 +1137,7 @@ class AutomationBridgeClient:
         """Queue FIFO text input and optionally wait for native completion."""
         params = self._input_params()
         params.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self.post_json("/input/key", params))
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1183,7 +1155,7 @@ class AutomationBridgeClient:
         keys = key if key.startswith("{") and key.endswith("}") else f"{{{key}}}"
         params = self._input_params()
         params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self.post_json("/input/key", params))
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1222,7 +1194,7 @@ class AutomationBridgeClient:
 
     def states(self, name: Optional[str] = None) -> JsonDict:
         """Return published JSON states and the latest global revision."""
-        return self.get("/state", {"name": name} if name is not None else None)
+        return self._request("GET", "/state", {"name": name} if name is not None else None)
 
     def state(self, name: str) -> StateSnapshot:
         """Return one published state by its exact application name."""
@@ -1262,8 +1234,8 @@ class AutomationBridgeClient:
                     f"last value={observed!r}, revision={cursor}"
                 )
             safe_wait = min(remaining, max(0.0, float(self.timeout) - 0.1), 1.0)
-            changed = self.get(
-                "/state/wait",
+            changed = self._request(
+                "GET", "/state/wait",
                 {"after_revision": cursor, "timeout_ms": int(safe_wait * 1000), "name": state_name},
             )
             cursor = max(cursor, int(changed.get("revision", cursor)))
@@ -1281,18 +1253,18 @@ class AutomationBridgeClient:
         payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
         if len(payload.encode("utf-8")) > 32768:
             raise ValueError("command JSON payload exceeds 32768 bytes")
-        return self.post(
-            "/commands",
+        return self._request(
+            "POST", "/commands",
             {"name": name, "data": payload, "timeout_ms": max(1, int(timeout * 1000))},
         )
 
     def command_status(self, command_id: int) -> JsonDict:
         """Return command state, JSON result, error, and timestamps."""
-        return self.get("/commands", {"id": int(command_id)})
+        return self._request("GET", "/commands", {"id": int(command_id)})
 
     def cancel_command(self, command_id: int) -> JsonDict:
         """Cancel a queued command; running Lua callbacks are never preempted."""
-        return self.delete("/commands", {"id": int(command_id)})
+        return self._request("DELETE", "/commands", {"id": int(command_id)})
 
     def wait_for_command(self, command_id: int, timeout: float = 30.0, interval: float = 0.02) -> JsonDict:
         """Wait for a command result, cancelling a still-pending command on timeout."""
@@ -1334,8 +1306,8 @@ class AutomationBridgeClient:
             raise ValueError("marker JSON payload exceeds 32768 bytes")
         if recording_timestamp_us is None:
             recording_timestamp_us = time.monotonic_ns() // 1000
-        return self.post(
-            "/markers",
+        return self._request(
+            "POST", "/markers",
             {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
         )
 
@@ -1349,7 +1321,7 @@ class AutomationBridgeClient:
         """Schedule an atomic PNG capture and return its native completion receipt."""
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
-        response = self.get("/screenshot", {"after_frames": after_frames})
+        response = self._request("GET", "/screenshot", {"after_frames": after_frames})
         receipt = ScreenshotReceipt(response)
         if not wait:
             return receipt
@@ -1357,7 +1329,7 @@ class AutomationBridgeClient:
             raise AutomationBridgeError("native screenshot response did not include a capture_id")
 
         def completed() -> Optional[ScreenshotReceipt]:
-            current = ScreenshotReceipt(self.get("/screenshot/status", {"capture_id": receipt.capture_id}))
+            current = ScreenshotReceipt(self._request("GET", "/screenshot/status", {"capture_id": receipt.capture_id}))
             if current.state == "failed":
                 raise AutomationBridgeError(
                     f"screenshot {current.capture_id} failed: {current.failure_reason or 'unknown reason'}"
@@ -1381,8 +1353,8 @@ class AutomationBridgeClient:
     ) -> Mapping[str, Any]:
         """Convert a top-left-origin point through native window/viewport geometry."""
         x, y = self._point(point)
-        data = self.post_json(
-            "/coordinates/convert",
+        data = self._request(
+            "POST", "/coordinates/convert", json_body=
             {"point": {"x": x, "y": y}, "from_space": from_space, "to_space": to_space},
         )
         converted = data.get("point")
@@ -1441,7 +1413,7 @@ class AutomationBridgeClient:
         """Return a client for Defold's built-in engine profiler endpoints."""
         from .profiler import ProfilerClient
 
-        return ProfilerClient(self.port, timeout=self.timeout, remotery_url=self._remotery_url)
+        return ProfilerClient(self.port, timeout=self.timeout, profiler_url=self._remotery_url)
 
     @property
     def gestures(self) -> "GestureGenerator":
@@ -1449,6 +1421,20 @@ class AutomationBridgeClient:
         from .gestures import GestureGenerator
 
         return GestureGenerator(self)
+
+    @property
+    def visual(self) -> "VisualClient":
+        """Return explicit pixel comparison and visual wait helpers."""
+        from .visual import VisualClient
+
+        return VisualClient(self)
+
+    @property
+    def recording(self) -> "RecordingClient":
+        """Return optional video recording helpers."""
+        from .recording import RecordingClient
+
+        return RecordingClient(self)
 
     def trace(
         self,
@@ -1469,65 +1455,9 @@ class AutomationBridgeClient:
             prerequisites=prerequisites,
         )
 
-    def recording_capabilities(self, backend: Optional[Any] = None) -> Any:
-        """Return explicit optional recorder capabilities without starting it."""
-        if backend is None:
-            from .recording import default_backend
-
-            backend = default_backend()
-        return backend.capabilities()
-
-    def recording_permission_diagnostics(self, backend: Optional[Any] = None) -> Mapping[str, Any]:
-        """Return recorder availability and platform permission guidance."""
-        if backend is None:
-            from .recording import default_backend
-
-            backend = default_backend()
-        return backend.permission_diagnostics()
-
-    def record_video(
-        self,
-        path: Union[str, Path],
-        *,
-        size: Optional[Tuple[int, int]] = None,
-        fps: float = 30.0,
-        video_codec: str = "libx264",
-        audio: str = "none",
-        audio_codec: str = "aac",
-        application: Optional[str] = None,
-        window_title: Optional[str] = None,
-        crop: Optional[Union[str, Tuple[int, int, int, int]]] = None,
-        source_rect: Optional[Tuple[int, int, int, int]] = None,
-        exclude_titlebar: bool = False,
-        extra_args: Sequence[str] = (),
-        backend: Optional[Any] = None,
-    ) -> "RecordingSession":
-        """Start an optional platform recording and return its safe session.
-
-        `crop="content"` uses a rectangle advertised by `/screen`. Exact
-        application audio is capability-gated and is never replaced by a
-        microphone recording.
-        """
-        from .recording import RecordingOptions, default_backend
-
-        selected_backend = backend or default_backend()
-        if crop == "content" and source_rect is None:
-            source_rect = self._recording_content_rect(self.screen())
-        options = RecordingOptions(
-            path=Path(path), size=size, fps=fps, video_codec=video_codec,
-            audio=audio, audio_codec=audio_codec, application=application,
-            window_title=window_title, crop=crop, source_rect=source_rect,
-            exclude_titlebar=exclude_titlebar, extra_args=tuple(extra_args),
-        )
-        session = selected_backend.start(options)
-        if hasattr(session, "_trace_callback"):
-            session._trace_callback = self._trace_record
-        self._trace_record("recording_started", {"path": str(path), "options": options})
-        return session
-
     @property
-    def remotery_url(self) -> Optional[str]:
-        """Return the Remotery websocket URL discovered while bootstrapping, if known."""
+    def profiler_url(self) -> Optional[str]:
+        """Return the profiler stream URL discovered while bootstrapping, if known."""
         return self._remotery_url
 
     @property
@@ -1542,7 +1472,7 @@ class AutomationBridgeClient:
         if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
             raise AutomationBridgeError("Automation Bridge endpoint does not advertise the screen.resize capability")
 
-        response = self.put_json("/screen", {"width": width, "height": height})
+        response = self._request("PUT", "/screen", json_body={"width": width, "height": height})
         screen_value = response.get("screen") if isinstance(response, Mapping) else None
         screen = dict(screen_value) if isinstance(screen_value, Mapping) else dict(response)
         self._remember_window_size(screen)
@@ -1639,20 +1569,17 @@ class AutomationBridgeClient:
 
     @classmethod
     def _close_candidate_engine_ports(cls, editor: Any) -> None:
-        service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
+        service_ports = editor._engine_service_ports()
         for service_port in service_ports:
             if not service_port:
                 continue
-            if hasattr(editor, "record_lifecycle"):
-                editor.record_lifecycle("previous_engine_closing", port=service_port)
+            editor._record_lifecycle("previous_engine_closing", port=service_port)
             try:
                 cls(service_port, timeout=1.0).close_engine(timeout=1.0)
             except AutomationBridgeError as exc:
-                if hasattr(editor, "record_lifecycle"):
-                    editor.record_lifecycle("previous_engine_close_failed", port=service_port, error=str(exc))
+                editor._record_lifecycle("previous_engine_close_failed", port=service_port, error=str(exc))
                 continue
-            if hasattr(editor, "record_lifecycle"):
-                editor.record_lifecycle("previous_engine_closed", port=service_port)
+            editor._record_lifecycle("previous_engine_closed", port=service_port)
 
     def _wait_until_unavailable(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1755,19 +1682,25 @@ class AutomationBridgeClient:
         self,
         timeout: float = 10.0,
         interval: float = 0.1,
+        after_scene_sequence: Optional[int] = None,
         retry_exceptions: RetryExceptions = (SelectorError,),
         **selector: Any,
     ) -> Node:
-        """Wait for one node, retrying only caller-approved exception types."""
+        """Wait for one node, optionally requiring a newer scene sequence."""
         def one_node() -> Optional[Node]:
             nodes, _, _ = self._select_nodes(selector)
-            return nodes[0] if len(nodes) == 1 else None
+            if len(nodes) != 1:
+                return None
+            node = nodes[0]
+            if after_scene_sequence is not None and node.scene_sequence <= after_scene_sequence:
+                return None
+            return node
 
         return wait_until(
             one_node,
             timeout=timeout,
             interval=interval,
-            message=f"node did not appear: {selector}",
+            message=f"node did not appear after scene sequence {after_scene_sequence}: {selector}",
             retry_exceptions=retry_exceptions,
             scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
         )
@@ -1795,47 +1728,17 @@ class AutomationBridgeClient:
         """Wait for ``count`` native engine updates and return the final frame receipt."""
         if not isinstance(count, int) or count < 0:
             raise ValueError("frame count must be a non-negative integer")
-        initial = self.get("/frame")
+        initial = self._request("GET", "/frame")
         target = int(initial.get("engine_frame", 0)) + count
         if count == 0:
             return initial
         return wait_until(
             lambda: (data if int(data.get("engine_frame", 0)) >= target else None)
-            if (data := self.get("/frame"))
+            if (data := self._request("GET", "/frame"))
             else None,
             timeout=timeout,
             interval=interval,
             message=f"engine frame did not reach {target}",
-        )
-
-    def wait_for_appearance(
-        self,
-        timeout: float = 10.0,
-        interval: float = 0.02,
-        after_scene_sequence: Optional[int] = None,
-        **selector: Any,
-    ) -> ObservationReceipt:
-        """Wait for a node observed after an optional scene cursor and return frame evidence."""
-        def appeared() -> Optional[ObservationReceipt]:
-            node = self.maybe_node(**selector)
-            if node is None or (after_scene_sequence is not None and node.scene_sequence <= after_scene_sequence):
-                return None
-            identity = node.logical_id or node.snapshot_id
-            return ObservationReceipt(
-                node=node,
-                identity=identity,
-                first_frame=node.engine_frame,
-                last_frame=node.engine_frame,
-                first_scene_sequence=node.scene_sequence,
-                last_scene_sequence=node.scene_sequence,
-                observed_frames=1,
-            )
-
-        return wait_until(
-            appeared,
-            timeout=timeout,
-            interval=interval,
-            message=f"node did not appear after scene sequence {after_scene_sequence}: {selector}",
         )
 
     def observe_node(
@@ -1918,7 +1821,7 @@ class AutomationBridgeClient:
                     observed += 1
                 last = node
                 return None
-            current = self.get("/frame")
+            current = self._request("GET", "/frame")
             return ObservationReceipt(
                 node=last,
                 identity=(last.logical_id or last.snapshot_id) if last else node_id,
@@ -1937,22 +1840,6 @@ class AutomationBridgeClient:
             interval=interval,
             message=f"node did not disappear: {node_id}",
         )
-
-    def assert_node(self, **selector: Any) -> Node:
-        """Assert scene/state-level node properties using native selectors."""
-        return self.node(**selector)
-
-    def wait_for_stable_frame(self, *args: Any, **kwargs: Any):
-        """Delegate pixel stability to the optional ``automation_bridge.visual`` layer."""
-        from .visual import VisualClient
-
-        return VisualClient(self).wait_for_stable_frame(*args, **kwargs)
-
-    def wait_for_region_change(self, *args: Any, **kwargs: Any):
-        """Delegate region differencing to the optional ``automation_bridge.visual`` layer."""
-        from .visual import VisualClient
-
-        return VisualClient(self).wait_for_region_change(*args, **kwargs)
 
     def _request(
         self,
@@ -2120,7 +2007,7 @@ class AutomationBridgeClient:
         self._validate_selector(selector)
         limit = selector.get("limit", 50)
         params = self._server_params(selector, limit=limit)
-        data = self.get("/nodes", params)
+        data = self._request("GET", "/nodes", params)
         server_nodes = [Node(node) for node in data.get("nodes", []) if isinstance(node, dict)]
         filtered = [node for node in server_nodes if self._matches_client_filters(node, selector)]
         data = dict(data)
@@ -2236,7 +2123,7 @@ class AutomationBridgeClient:
             params: Dict[str, Any] = {"limit": min(500, maximum - len(candidates)), "include": "basic"}
             if cursor is not None:
                 params["cursor"] = cursor
-            data = self.get("/nodes", params)
+            data = self._request("GET", "/nodes", params)
             candidates.extend(Node(raw) for raw in data.get("nodes", []) if isinstance(raw, dict))
             cursor = data.get("next_cursor")
             if not cursor:

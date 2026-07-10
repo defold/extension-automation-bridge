@@ -61,6 +61,54 @@ class RecordingOptions:
     extra_args: Tuple[str, ...] = ()
 
 
+class RecordingClient:
+    """Optional video-recording tools scoped beneath an Automation Bridge client."""
+
+    def __init__(self, bridge: Any):
+        self.bridge = bridge
+
+    def capabilities(self, backend: Optional[Any] = None) -> RecordingCapabilities:
+        """Return recorder capabilities without starting capture."""
+        return (backend or default_backend()).capabilities()
+
+    def permission_diagnostics(self, backend: Optional[Any] = None) -> Mapping[str, Any]:
+        """Return recorder availability and platform permission guidance."""
+        return (backend or default_backend()).permission_diagnostics()
+
+    def start(
+        self,
+        path: Union[str, Path],
+        *,
+        size: Optional[Tuple[int, int]] = None,
+        fps: float = 30.0,
+        video_codec: str = "libx264",
+        audio: str = "none",
+        audio_codec: str = "aac",
+        application: Optional[str] = None,
+        window_title: Optional[str] = None,
+        crop: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+        source_rect: Optional[Tuple[int, int, int, int]] = None,
+        exclude_titlebar: bool = False,
+        extra_args: Sequence[str] = (),
+        backend: Optional[Any] = None,
+    ) -> "RecordingSession":
+        """Start optional platform recording and return its safe session."""
+        selected_backend = backend or default_backend()
+        if crop == "content" and source_rect is None:
+            source_rect = self.bridge._recording_content_rect(self.bridge.screen())
+        options = RecordingOptions(
+            path=Path(path), size=size, fps=fps, video_codec=video_codec,
+            audio=audio, audio_codec=audio_codec, application=application,
+            window_title=window_title, crop=crop, source_rect=source_rect,
+            exclude_titlebar=exclude_titlebar, extra_args=tuple(extra_args),
+        )
+        session = selected_backend.start(options)
+        if hasattr(session, "_trace_callback"):
+            session._trace_callback = self.bridge._trace_record
+        self.bridge._trace_record("recording_started", {"path": str(path), "options": options})
+        return session
+
+
 @dataclass
 class RecordingMetadata:
     """Requested and observed properties of a finalized recording."""

@@ -24,13 +24,13 @@ def main() -> None:
         spawner = bridge.node(type="goc", name_exact="/spawner", visible=True)
         bridge.click(spawner, expected_scene_sequence=spawner.scene_sequence)
 
-        observation = bridge.wait_for_appearance(
+        appeared = bridge.wait_for_node(
             type="labelc",
             text_exact="L1",
             after_scene_sequence=max(scene["scene_sequence"], spawner.scene_sequence),
         )
         stable = bridge.observe_node(
-            logical_id=observation.node.logical_id,
+            logical_id=appeared.logical_id,
             minimum_frames=2,
         )
 

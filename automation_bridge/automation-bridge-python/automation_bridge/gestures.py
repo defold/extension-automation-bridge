@@ -176,8 +176,3 @@ class GestureGenerator:
         if self._client is not None and hasattr(self._client, "_trace_record"):
             self._client._trace_record("generated_path", trace_value)
         return result
-
-
-def generate_drag(*args: Any, **kwargs: Any) -> Mapping[str, Any]:
-    """Generate a deterministic drag without constructing a client."""
-    return GestureGenerator().generate_drag(*args, **kwargs)

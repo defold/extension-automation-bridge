@@ -12,16 +12,14 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import (  # noqa: E402
-    AutomationBridgeClient,
+from automation_bridge import AutomationBridgeClient  # noqa: E402
+from automation_bridge.gestures import GestureConstraintError, GestureGenerator  # noqa: E402
+from automation_bridge.recording import (  # noqa: E402
     FFmpegRecordingBackend,
-    GestureConstraintError,
-    GestureGenerator,
     RecordingOptions,
-    TraceError,
-    TraceSession,
     UnsupportedRecordingCapability,
 )
+from automation_bridge.trace import TraceError, TraceSession  # noqa: E402
 
 
 class GestureGeneratorTest(unittest.TestCase):
@@ -146,7 +144,7 @@ class _TraceClient:
     def screenshot(self, wait=True):
         raise RuntimeError("screenshot unavailable")
 
-    def post(self, path, params=None):
+    def request(self, method, path, *, params=None, json=None):
         self.posts.append((path, params))
         return {"accepted": True}
 
@@ -213,7 +211,7 @@ class ClientToolingTest(unittest.TestCase):
         backend = _CapturingBackend()
         client = AutomationBridgeClient(1)
         client.screen = lambda: {"rectangles": {"content_display_pixels": {"x": 3, "y": 4, "width": 640, "height": 480}}}
-        session = client.record_video("capture.mp4", crop="content", backend=backend)
+        session = client.recording.start("capture.mp4", crop="content", backend=backend)
         self.assertEqual("session", session)
         self.assertEqual((3, 4, 640, 480), backend.options.source_rect)
 
@@ -221,7 +219,7 @@ class ClientToolingTest(unittest.TestCase):
         backend = _CapturingBackend()
         client = AutomationBridgeClient(1)
         client.screen = lambda: {"viewport": {"x": 3, "y": 4, "width": 640, "height": 480}}
-        client.record_video("capture.mp4", crop="content", backend=backend)
+        client.recording.start("capture.mp4", crop="content", backend=backend)
         self.assertIsNone(backend.options.source_rect)
 
     def test_active_trace_automatically_records_input_request_and_receipt(self):

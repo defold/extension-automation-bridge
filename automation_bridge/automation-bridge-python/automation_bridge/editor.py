@@ -43,7 +43,7 @@ class EditorClient:
 
     def build(self, timeout: float = 60.0) -> None:
         """Build/run the project and wait until the Automation Bridge HTTP endpoint registers."""
-        self.record_lifecycle("editor_build_started")
+        self._record_lifecycle("editor_build_started")
         previous_lines = self.console_lines()
         previous_registration_count = self._endpoint_registered_count(previous_lines)
         previous_registration_ports = self._latest_registration_engine_service_ports(previous_lines)
@@ -53,13 +53,13 @@ class EditorClient:
         try:
             _, response = request_json(f"{self.base_url}/command/build", method="POST", timeout=timeout)
         except Exception as exc:
-            self.record_lifecycle("editor_build_failed", error=str(exc))
+            self._record_lifecycle("editor_build_failed", error=str(exc))
             raise
         if not response.get("success"):
             issues = response.get("issues", [])
-            self.record_lifecycle("editor_build_failed", issues=issues)
+            self._record_lifecycle("editor_build_failed", issues=issues)
             raise AutomationBridgeError(f"Defold build failed: {issues}")
-        self.record_lifecycle("editor_build_completed")
+        self._record_lifecycle("editor_build_completed")
 
         try:
             wait_until(
@@ -72,10 +72,10 @@ class EditorClient:
                 message="Defold build completed, but Automation Bridge endpoint did not register",
             )
         except AssertionError as exc:
-            self.record_lifecycle("new_engine_registration_failed", error=str(exc))
+            self._record_lifecycle("new_engine_registration_failed", error=str(exc))
             raise AutomationBridgeError(str(exc)) from exc
-        self.record_lifecycle("new_engine_registered")
-        self._last_build_had_engine_service_port = self.latest_registration_has_engine_service_port()
+        self._record_lifecycle("new_engine_registered")
+        self._last_build_had_engine_service_port = self._latest_registration_has_engine_service_port()
         time.sleep(0.2)
 
     def console_lines(self) -> list:
@@ -85,34 +85,34 @@ class EditorClient:
 
     def engine_service_port(self) -> Optional[int]:
         """Return the service port before endpoint registration, or the cached reused port."""
-        ports = self.engine_service_ports()
+        ports = self._engine_service_ports()
         return ports[0] if ports else None
 
-    def engine_service_ports(self) -> list:
+    def _engine_service_ports(self) -> list:
         """Return candidate engine service ports from current logs, then the cached port."""
-        candidates = self.latest_registration_engine_service_ports()
+        candidates = self._current_registration_engine_service_ports()
 
         if self._engine_service_port is not None:
             self._append_port_candidate(candidates, self._engine_service_port)
         return candidates
 
-    def latest_registration_engine_service_ports(self) -> list:
+    def _current_registration_engine_service_ports(self) -> list:
         """Return ports logged before the latest Automation Bridge endpoint registration only."""
         return self._latest_registration_engine_service_ports(self.console_lines())
 
-    def remotery_url(self) -> Optional[str]:
+    def _remotery_url_value(self) -> Optional[str]:
         """Return the Remotery websocket URL from current logs, then the cached URL."""
-        urls = self.remotery_urls()
+        urls = self._remotery_urls()
         return urls[0] if urls else None
 
-    def remotery_urls(self) -> list:
+    def _remotery_urls(self) -> list:
         """Return candidate Remotery websocket URLs from current logs, then the cached URL."""
-        candidates = self.latest_registration_remotery_urls()
+        candidates = self._current_registration_remotery_urls()
         if self._remotery_url is not None:
             self._append_unique_candidate(candidates, self._remotery_url)
         return candidates
 
-    def latest_registration_remotery_urls(self) -> list:
+    def _current_registration_remotery_urls(self) -> list:
         """Return Remotery websocket URLs logged before the latest endpoint registration only."""
         return self._latest_registration_remotery_urls(self.console_lines())
 
@@ -141,21 +141,13 @@ class EditorClient:
                 cls._append_unique_candidate(candidates, match.group(1))
         return candidates
 
-    def latest_registration_has_engine_service_port(self) -> bool:
+    def _latest_registration_has_engine_service_port(self) -> bool:
         """Return whether the latest endpoint registration had a fresh port nearby."""
-        return bool(self.latest_registration_engine_service_ports())
-
-    def last_build_had_engine_service_port(self) -> Optional[bool]:
-        """Return whether the last `build()` saw a fresh port before registration."""
-        return self._last_build_had_engine_service_port
+        return bool(self._current_registration_engine_service_ports())
 
     @staticmethod
     def _endpoint_registered_count(lines: list) -> int:
         return sum(1 for line in lines if _AUTOMATION_BRIDGE_ENDPOINT_TEXT in line)
-
-    def endpoint_registered_count(self) -> int:
-        """Return the number of Automation Bridge endpoint registrations in the editor console."""
-        return self._endpoint_registered_count(self.console_lines())
 
     def _has_fresh_endpoint_registration(self, previous_count: int, previous_ports: list) -> bool:
         lines = self.console_lines()
@@ -179,7 +171,7 @@ class EditorClient:
         start_index = previous_endpoint_index + 1 if previous_endpoint_index is not None else 0
         return lines[start_index:endpoint_index]
 
-    def remember_engine_service_port(
+    def _remember_engine_service_port(
         self,
         port: int,
         engine_instance_id: Optional[str] = None,
@@ -195,7 +187,7 @@ class EditorClient:
         }
         self._write_cached_engine_identity(self._cached_engine_identity)
 
-    def validate_cached_engine_health(self, port: int, health: dict, fresh_build: bool = False) -> bool:
+    def _validate_cached_engine_health(self, port: int, health: dict, fresh_build: bool = False) -> bool:
         """Reject a cached-only port when it now belongs to a different engine/project.
 
         Fresh editor registrations are authoritative and replace the cache. When attaching
@@ -210,16 +202,16 @@ class EditorClient:
         cached_project = cached.get("project_identity")
         current_project = identity.get("project_identity")
         if cached_project and current_project and cached_project != current_project:
-            self.record_lifecycle("cached_port_rejected", port=port, reason="project_identity_mismatch")
+            self._record_lifecycle("cached_port_rejected", port=port, reason="project_identity_mismatch")
             return False
         cached_instance = cached.get("engine_instance_id")
         current_instance = identity.get("engine_instance_id")
         if not fresh_build and cached_instance and current_instance != cached_instance:
-            self.record_lifecycle("cached_port_rejected", port=port, reason="engine_instance_mismatch")
+            self._record_lifecycle("cached_port_rejected", port=port, reason="engine_instance_mismatch")
             return False
         return True
 
-    def record_lifecycle(self, stage: str, **details: object) -> None:
+    def _record_lifecycle(self, stage: str, **details: object) -> None:
         """Record an observable editor/bootstrap lifecycle transition."""
         event = {"stage": stage, "state": "completed", "monotonic": time.monotonic()}
         event.update(details)
@@ -230,7 +222,7 @@ class EditorClient:
         """Return a copy of editor/bootstrap lifecycle events observed by this client."""
         return [dict(event) for event in self._lifecycle_events]
 
-    def remember_remotery_url(self, url: str) -> None:
+    def _remember_remotery_url(self, url: str) -> None:
         """Remember the Remotery websocket URL for reused-engine builds."""
         self._remotery_url = url
         self._write_cached_remotery_url(url)

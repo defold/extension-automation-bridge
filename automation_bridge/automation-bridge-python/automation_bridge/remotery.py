@@ -44,26 +44,26 @@ def _best_effort(callback: Callable[[], Any]) -> None:
 
 
 class RemoteryError(AutomationBridgeError):
-    """Base class for Remotery profiler client errors."""
+    """Base class for profiler connection errors."""
 
     pass
 
 
 class RemoteryProtocolError(RemoteryError):
-    """Raised when Remotery returns malformed or unexpected websocket data."""
+    """Raised when the profiler returns malformed or unexpected stream data."""
 
     pass
 
 
 class RemoteryTimeoutError(RemoteryError):
-    """Raised when Remotery does not produce data before the requested timeout."""
+    """Raised when the profiler does not produce data before the requested timeout."""
 
     pass
 
 
 @dataclass(frozen=True)
 class RemoterySampleAggregate:
-    """Totals for all samples sharing one Remotery sample name hash."""
+    """Totals for all samples sharing one profiler sample name hash."""
 
     name_hash: int
     name: Optional[str]
@@ -91,7 +91,7 @@ class RemoterySampleAggregate:
 
 @dataclass(frozen=True)
 class RemoteryTimingStats:
-    """Timing distribution for a set of Remotery samples."""
+    """Timing distribution for a set of profiler samples."""
 
     count: int
     total_us: int
@@ -146,7 +146,7 @@ class RemoteryTimingStats:
 
 @dataclass(frozen=True)
 class RemoteryValueStats:
-    """Numeric distribution for Remotery counters/properties."""
+    """Numeric distribution for profiler counters/properties."""
 
     count: int
     total: float
@@ -183,7 +183,7 @@ class RemoteryScopeStats:
 
 @dataclass(frozen=True)
 class RemoteryCounterStats:
-    """Cross-frame statistics for one Remotery property/counter path."""
+    """Cross-frame statistics for one profiler property/counter path."""
 
     path: str
     name: str
@@ -196,7 +196,7 @@ class RemoteryCounterStats:
 
 @dataclass(frozen=True)
 class RemoterySample:
-    """One node in a Remotery `SMPL` sample tree."""
+    """One node in a profiler sample tree."""
 
     name_hash: int
     name: Optional[str]
@@ -240,7 +240,7 @@ class RemoterySample:
 
 @dataclass(frozen=True)
 class RemoteryFrame:
-    """One Remotery sample tree captured from one profiled thread."""
+    """One sample tree captured from a profiled thread."""
 
     thread_name: str
     root: RemoterySample
@@ -324,7 +324,7 @@ class RemoteryFrame:
 
 @dataclass(frozen=True)
 class RemoteryProperty:
-    """One property/counter row from a Remotery `PSNP` snapshot."""
+    """One property/counter row from a profiler snapshot."""
 
     name_hash: int
     name: Optional[str]
@@ -344,7 +344,7 @@ class RemoteryProperty:
 
 @dataclass(frozen=True)
 class RemoteryPropertyEntry:
-    """One Remotery property/counter with its resolved tree path."""
+    """One profiler property/counter with its resolved tree path."""
 
     path: str
     property: RemoteryProperty
@@ -356,7 +356,7 @@ class RemoteryPropertyEntry:
 
     @property
     def type(self) -> str:
-        """Return the Remotery property type name."""
+        """Return the profiler property type name."""
         return self.property.type
 
     @property
@@ -367,7 +367,7 @@ class RemoteryPropertyEntry:
 
 @dataclass(frozen=True)
 class RemoteryPropertyFrame:
-    """One Remotery `PSNP` property/counter snapshot."""
+    """One profiler property/counter snapshot."""
 
     property_frame: int
     properties: Tuple[RemoteryProperty, ...]
@@ -407,7 +407,7 @@ class RemoteryPropertyFrame:
 
 @dataclass(frozen=True)
 class RemoteryCapture:
-    """A multi-frame Remotery capture with query helpers for scopes and counters."""
+    """A multi-frame profiler capture with query helpers for scopes and counters."""
 
     frames: Tuple[RemoteryFrame, ...]
     property_frames: Tuple[RemoteryPropertyFrame, ...] = ()
@@ -476,9 +476,9 @@ class RemoteryCapture:
         matches = self.scopes(thread=thread, include_root=include_root)
         matches = [item for item in matches if item.path == selector or item.name == selector]
         if not matches:
-            raise RemoteryError(f"no Remotery scope matched {selector!r}")
+            raise RemoteryError(f"no profiler scope matched {selector!r}")
         if len(matches) > 1:
-            raise RemoteryError(f"multiple Remotery scopes matched {selector!r}; use scopes() with a path or thread")
+            raise RemoteryError(f"multiple profiler scopes matched {selector!r}; use scopes() with a path or thread")
         return matches[0]
 
     def counters(
@@ -528,14 +528,14 @@ class RemoteryCapture:
         """Return exactly one counter/property matching `selector` by path or name."""
         matches = [item for item in self.counters() if item.path == selector or item.name == selector]
         if not matches:
-            raise RemoteryError(f"no Remotery counter matched {selector!r}")
+            raise RemoteryError(f"no profiler counter matched {selector!r}")
         if len(matches) > 1:
-            raise RemoteryError(f"multiple Remotery counters matched {selector!r}; use counters() with a path")
+            raise RemoteryError(f"multiple profiler counters matched {selector!r}; use counters() with a path")
         return matches[0]
 
 
 class RemoteryRecording:
-    """Background Remotery recording that can be stopped at an arbitrary time."""
+    """Background profiler recording that can be stopped at an arbitrary time."""
 
     def __init__(
         self,
@@ -553,7 +553,7 @@ class RemoteryRecording:
         """Create a recording session for `client`.
 
         Use `start()` to begin collecting frames on a background thread and
-        `stop()` to return a `RemoteryCapture` for the frames collected so far.
+        `stop()` returns a `ProfilerCapture` for the frames collected so far.
         """
         if warmup_frames < 0:
             raise ValueError("warmup_frames must be non-negative")
@@ -611,9 +611,9 @@ class RemoteryRecording:
             return len(self._property_frames)
 
     def start(self) -> "RemoteryRecording":
-        """Start recording Remotery frames on a background thread."""
+        """Start recording profiler frames on a background thread."""
         if self._thread is not None:
-            raise RemoteryError("Remotery recording is already started")
+            raise RemoteryError("profiler recording is already started")
         was_connected = self._client.connected
         if not was_connected:
             self._client.start()
@@ -688,7 +688,7 @@ class RemoteryRecording:
             _best_effort(lambda: thread.join(timeout=timeout))
 
     def snapshot(self) -> RemoteryCapture:
-        """Return a `RemoteryCapture` for frames collected so far without stopping."""
+        """Return a `ProfilerCapture` for frames collected so far without stopping."""
         with self._lock:
             return RemoteryCapture(frames=tuple(self._sample_frames), property_frames=tuple(self._property_frames))
 
@@ -735,7 +735,7 @@ class RemoteryRecording:
 
 
 class RemoteryClient:
-    """Client for Defold's Remotery websocket profiler stream.
+    """Client for Defold's live profiler stream.
 
     Use `start()` to open `ws://host:port/rmt`, `get_frame()` or
     `get_properties()` to read one Remotery message, `capture()` to aggregate a
@@ -750,7 +750,7 @@ class RemoteryClient:
         host: str = "127.0.0.1",
         path: str = "/rmt",
     ):
-        """Create a Remotery client for an already-running Defold engine."""
+        """Create a profiler connection for an already-running Defold engine."""
         self.host = host
         self.port = int(port)
         self.timeout = timeout
@@ -762,12 +762,12 @@ class RemoteryClient:
 
     @classmethod
     def from_url(cls, url: str, timeout: float = 10.0) -> "RemoteryClient":
-        """Create a Remotery client from a `ws://host:port/rmt` URL."""
+        """Create a profiler connection from a `ws://host:port/rmt` URL."""
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "ws":
-            raise RemoteryError(f"unsupported Remotery URL scheme: {parsed.scheme!r}")
+            raise RemoteryError(f"unsupported profiler URL scheme: {parsed.scheme!r}")
         if parsed.hostname is None or parsed.port is None:
-            raise RemoteryError(f"Remotery URL must include host and port: {url!r}")
+            raise RemoteryError(f"profiler URL must include host and port: {url!r}")
         path = parsed.path or "/rmt"
         if parsed.query:
             path = f"{path}?{parsed.query}"
@@ -789,11 +789,11 @@ class RemoteryClient:
 
     @property
     def sample_names(self) -> Mapping[int, str]:
-        """Return the currently resolved Remotery sample-name map."""
+        """Return the currently resolved profiler sample-name map."""
         return dict(self._sample_names)
 
     def start(self) -> "RemoteryClient":
-        """Open the Remotery websocket connection and reset captured state."""
+        """Open the profiler stream connection and reset captured state."""
         self.stop()
         self._pending_messages.clear()
         self._sample_names = {_ROOT_PROPERTY_NAME_HASH: _ROOT_PROPERTY_NAME}
@@ -809,7 +809,7 @@ class RemoteryClient:
         return self
 
     def stop(self) -> None:
-        """Close the Remotery websocket connection."""
+        """Close the profiler stream connection."""
         sock = self._socket
         self._socket = None
         if sock is None:
@@ -829,7 +829,7 @@ class RemoteryClient:
         thread: Optional[str] = None,
         resolve_names: bool = True,
     ) -> RemoteryFrame:
-        """Read and return one Remotery `SMPL` frame.
+        """Read and return one profiler sample frame.
 
         When `resolve_names` is true, unresolved sample hashes are requested from
         the Remotery string table before returning. Name resolution is best
@@ -895,7 +895,7 @@ class RemoteryClient:
         timeout: Optional[float] = None,
         resolve_names: bool = True,
     ) -> RemoteryPropertyFrame:
-        """Read and return one Remotery `PSNP` property/counter snapshot."""
+        """Read and return one profiler property/counter snapshot."""
         deadline = _deadline(self.timeout if timeout is None else timeout)
         while True:
             message_id, body = self._next_message(deadline)
@@ -1018,7 +1018,7 @@ class RemoteryClient:
         try:
             sock.sendall(request)
         except OSError as exc:
-            raise RemoteryError(f"failed to send Remotery websocket handshake: {exc}") from exc
+            raise RemoteryError(f"failed to send profiler stream handshake: {exc}") from exc
 
         response = self._recv_until(b"\r\n\r\n", _deadline(self.timeout)).decode("iso-8859-1", "replace")
         lines = response.split("\r\n")
@@ -1057,7 +1057,7 @@ class RemoteryClient:
 
             if opcode == 0x8:
                 self.stop()
-                raise RemoteryProtocolError("websocket closed by Remotery")
+                raise RemoteryProtocolError("profiler stream was closed by the engine")
             if opcode == 0x9:
                 self._send_frame(0xA, payload)
                 continue
@@ -1073,7 +1073,7 @@ class RemoteryClient:
         try:
             self._send_frame(0x1, text.encode("utf-8"))
         except OSError as exc:
-            raise RemoteryError(f"failed to send Remotery websocket data: {exc}") from exc
+            raise RemoteryError(f"failed to send profiler stream data: {exc}") from exc
 
     def _send_frame(self, opcode: int, payload: bytes, sock: Optional[socket.socket] = None) -> None:
         target = self._require_socket() if sock is None else sock
@@ -1103,20 +1103,20 @@ class RemoteryClient:
         while len(data) < size:
             remaining = _remaining(deadline)
             if remaining is not None and remaining <= 0:
-                raise RemoteryTimeoutError("timed out waiting for Remotery websocket data")
+                raise RemoteryTimeoutError("timed out waiting for profiler stream data")
             sock.settimeout(remaining)
             try:
                 chunk = sock.recv(size - len(data))
             except socket.timeout as exc:
-                raise RemoteryTimeoutError("timed out waiting for Remotery websocket data") from exc
+                raise RemoteryTimeoutError("timed out waiting for profiler stream data") from exc
             if not chunk:
-                raise RemoteryProtocolError("Remotery websocket disconnected")
+                raise RemoteryProtocolError("profiler stream disconnected")
             data.extend(chunk)
         return bytes(data)
 
     def _require_socket(self) -> socket.socket:
         if self._socket is None:
-            raise RemoteryError("Remotery websocket is not started; call start() first")
+            raise RemoteryError("profiler stream is not started; call start() first")
         return self._socket
 
 
@@ -1131,7 +1131,7 @@ class _Reader:
     def read_bytes(self, size: int, label: str) -> bytes:
         end = self.offset + size
         if end > len(self.data):
-            raise RemoteryProtocolError(f"truncated Remotery data while reading {label}")
+            raise RemoteryProtocolError(f"truncated profiler data while reading {label}")
         value = self.data[self.offset:end]
         self.offset = end
         return value

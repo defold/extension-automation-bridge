@@ -86,7 +86,7 @@ class EventStream:
 
     def __init__(self, client: "AutomationBridgeClient", from_cursor: Union[str, int] = "now"):
         self.client = client
-        cursor_data = client.get("/events/cursor")
+        cursor_data = client.request("GET", "/events/cursor")
         if from_cursor == "now":
             self.cursor = int(cursor_data["cursor"])
         elif from_cursor == "oldest":
@@ -118,9 +118,9 @@ class EventStream:
         if limit < 1 or limit > 256:
             raise ValueError("limit must be between 1 and 256")
         safe_wait = min(timeout, max(0.0, float(self.client.timeout) - 0.1), 30.0)
-        data = self.client.get(
-            "/events",
-            {"cursor": self.cursor, "timeout_ms": int(safe_wait * 1000), "limit": limit},
+        data = self.client.request(
+            "GET", "/events",
+            params={"cursor": self.cursor, "timeout_ms": int(safe_wait * 1000), "limit": limit},
         )
         if data.get("overflow"):
             raise EventBufferOverflow(

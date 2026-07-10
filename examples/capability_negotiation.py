@@ -7,10 +7,12 @@ bridge = AutomationBridgeClient.from_project(
     ".",
     build=True,
     required_capabilities=["runtime.health", "runtime.lifecycle"],
-    optional_capabilities=["scene", "screenshot", "input.drag"],
 )
 
-available = bridge.optional("scene", "screenshot", "input.drag")
+available = {
+    capability: bridge.supports(capability)
+    for capability in ("scene", "screenshot", "input.drag")
+}
 print(available)
 print(bridge.trace_metadata())
 print(bridge.lifecycle())

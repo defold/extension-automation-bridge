@@ -19,12 +19,12 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
+import automation_bridge as automation_bridge_package  # noqa: E402
 from automation_bridge import (  # noqa: E402
     AutomationBridgeApiError,
     AutomationBridgeClient,
     AutomationBridgeError,
     EditorClient,
-    EngineLogStream,
     EventBufferOverflow,
     EventStream,
     IncompatibleApiVersionError,
@@ -33,18 +33,20 @@ from automation_bridge import (  # noqa: E402
     Node,
     ProfilerClient,
     ProfilerDataError,
-    RemoteryCapture,
-    RemoteryClient,
-    RemoteryProtocolError,
-    RemoteryRecording,
     ScreenshotReceipt,
     UnsupportedCapabilityError,
     WaitTimeoutError,
-    difference,
     wait_until,
 )
-from automation_bridge.client import _encode_system_reboot  # noqa: E402
-from automation_bridge.profiler import parse_resources_data  # noqa: E402
+from automation_bridge.client import EngineLogStream, _encode_system_reboot  # noqa: E402
+from automation_bridge.profiler import (  # noqa: E402
+    ProfilerCapture,
+    ProfilerConnection,
+    ProfilerProtocolError,
+    ProfilerRecording,
+    parse_resources_data,
+)
+from automation_bridge.visual import difference  # noqa: E402
 from automation_bridge.remotery import (  # noqa: E402
     build_message,
     build_sample_name,
@@ -136,6 +138,19 @@ def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
+    def test_public_surface_excludes_removed_aliases_and_backend_types(self):
+        bridge = AutomationBridgeClient(1)
+        removed_client_names = {
+            "get", "post", "put", "delete", "post_json", "put_json",
+            "optional", "assert_node", "wait_for_appearance",
+            "wait_for_stable_frame", "wait_for_region_change", "record_video",
+            "recording_capabilities", "recording_permission_diagnostics",
+        }
+        self.assertTrue(all(not hasattr(bridge, name) for name in removed_client_names))
+        self.assertFalse(hasattr(Node({"parent": "root"}), "parent"))
+        self.assertFalse(any(name.startswith("Remotery") for name in automation_bridge_package.__all__))
+        self.assertLessEqual(len(automation_bridge_package.__all__), 24)
+
     def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
         class ScriptedClient:
             timeout = 10.0
@@ -143,7 +158,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            def get(self, path, params=None):
+            def request(self, method, path, *, params=None, json=None):
                 self.requests.append((path, params))
                 if path == "/events/cursor":
                     return {"cursor": 5, "oldest_cursor": 2}
@@ -173,7 +188,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         class OverflowClient:
             timeout = 10.0
 
-            def get(self, path, params=None):
+            def request(self, method, path, *, params=None, json=None):
                 if path == "/events/cursor":
                     return {"cursor": 20, "oldest_cursor": 10}
                 return {"events": [], "next_cursor": 10, "oldest_cursor": 10, "latest_cursor": 20, "overflow": True}
@@ -272,14 +287,15 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         bridge = FakeEngineClient(capabilities=["runtime.health", "scene"])
         bridge._capability_versions_data = {"scene": "2"}
 
-        self.assertEqual({"scene>=2": True, "scene>=3": False}, bridge.optional("scene>=2", "scene>=3"))
+        self.assertTrue(bridge.supports("scene>=2"))
+        self.assertFalse(bridge.supports("scene>=3"))
 
     def test_trace_metadata_records_native_and_python_versions(self):
         bridge = FakeEngineClient(capabilities=["runtime.health"])
 
         metadata = bridge.trace_metadata()
 
-        self.assertEqual("1.1.0", metadata["python_package_version"])
+        self.assertEqual("2.0.0", metadata["python_package_version"])
         self.assertEqual("1.1.0", metadata["native_version"])
         self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
 
@@ -288,7 +304,10 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         bridge._backend = {"headless": True, "graphics": False, "hid": False}
 
         health = bridge.health()
-        optional = bridge.optional("application.events", "scene", "screenshot", "input.drag")
+        optional = {
+            capability: bridge.supports(capability)
+            for capability in ("application.events", "scene", "screenshot", "input.drag")
+        }
 
         self.assertTrue(health["backend"]["headless"])
         self.assertEqual(
@@ -307,7 +326,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
             editor = EditorClient(root, port=12345)
 
-            accepted = editor.validate_cached_engine_health(
+            accepted = editor._validate_cached_engine_health(
                 43210,
                 {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
                 fresh_build=False,
@@ -327,7 +346,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
             editor = EditorClient(root, port=12345)
 
-            accepted = editor.validate_cached_engine_health(
+            accepted = editor._validate_cached_engine_health(
                 43210,
                 {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
                 fresh_build=True,
@@ -575,18 +594,18 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(bridge.health_calls, 2)
 
-    def test_fresh_build_ignores_cached_remotery_url(self):
+    def test_fresh_build_ignores_cached_profiler_url(self):
         class FakeEditor:
-            def latest_registration_remotery_urls(self):
+            def _current_registration_remotery_urls(self):
                 return []
 
-            def remotery_url(self):
+            def _remotery_url_value(self):
                 return "ws://127.0.0.1:17815/rmt"
 
-        self.assertIsNone(AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=True))
+        self.assertIsNone(AutomationBridgeClient._editor_profiler_url(FakeEditor(), fresh_build=True))
         self.assertEqual(
             "ws://127.0.0.1:17815/rmt",
-            AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=False),
+            AutomationBridgeClient._editor_profiler_url(FakeEditor(), fresh_build=False),
         )
 
     def test_engine_log_stream_reads_lines(self):
@@ -656,20 +675,20 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
 
     def test_profiler_accessor_uses_engine_port(self):
-        bridge = AutomationBridgeClient(12345, timeout=3.0, remotery_url="ws://127.0.0.1:17816/rmt")
+        bridge = AutomationBridgeClient(12345, timeout=3.0, profiler_url="ws://127.0.0.1:17816/rmt")
 
         profiler = bridge.profiler
 
         self.assertIsInstance(profiler, ProfilerClient)
         self.assertEqual(12345, profiler.port)
         self.assertEqual(3.0, profiler.timeout)
-        self.assertEqual("ws://127.0.0.1:17816/rmt", profiler.remotery_url)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", profiler.url)
 
-        remotery = profiler.remotery()
+        connection = profiler.connect()
 
-        self.assertEqual("127.0.0.1", remotery.host)
-        self.assertEqual(17816, remotery.port)
-        self.assertEqual("/rmt", remotery.path)
+        self.assertEqual("127.0.0.1", connection.host)
+        self.assertEqual(17816, connection.port)
+        self.assertEqual("/rmt", connection.path)
 
     def test_profiler_resources_requests_resources_data(self):
         payload = _resources_payload()
@@ -718,14 +737,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ProfilerDataError, "truncated profiler data"):
             parse_resources_data(payload)
 
-    def test_profiler_remotery_accessor_uses_remotery_port(self):
+    def test_profiler_connection_uses_requested_port(self):
         profiler = ProfilerClient(12345, timeout=3.0)
 
-        remotery = profiler.remotery(port=23456)
+        connection = profiler.connect(port=23456)
 
-        self.assertIsInstance(remotery, RemoteryClient)
-        self.assertEqual(23456, remotery.port)
-        self.assertEqual(3.0, remotery.timeout)
+        self.assertIsInstance(connection, ProfilerConnection)
+        self.assertEqual(23456, connection.port)
+        self.assertEqual(3.0, connection.timeout)
 
     def test_editor_latest_registration_remotery_urls(self):
         lines = [
@@ -758,7 +777,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         names = {1: "Frame", 2: "Update"}
         first = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=7000), names)
         second = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=9000, root_duration_us=18000), names)
-        capture = RemoteryCapture(frames=(first, second))
+        capture = ProfilerCapture(frames=(first, second))
 
         update = capture.scope("Frame/Update")
 
@@ -780,7 +799,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         names = {100: "Memory", 101: "Used"}
         first = parse_property_frame(_remotery_property_frame_body(property_frame=1, used=100), names)
         second = parse_property_frame(_remotery_property_frame_body(property_frame=2, used=140), names)
-        capture = RemoteryCapture(frames=(), property_frames=(first, second))
+        capture = ProfilerCapture(frames=(), property_frames=(first, second))
 
         used = capture.counter("Memory/Used")
 
@@ -821,14 +840,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             + _remotery_property(202, 2002, 0, 3, 1.5, previous_value=1, previous_value_frame=6)
         )
 
-        with self.assertRaisesRegex(RemoteryProtocolError, "invalid integer value"):
+        with self.assertRaisesRegex(ProfilerProtocolError, "invalid integer value"):
             parse_property_frame(body, {202: "Fractional"})
 
     def test_remotery_client_get_frame_resolves_sample_names(self):
         sample_message = build_message("SMPL", _remotery_sample_frame_body())
         with FakeRemoteryServer(sample_message, {1: "Frame", 2: "Update"}) as server:
-            with RemoteryClient(port=server.port, timeout=1.0) as remotery:
-                frame = remotery.get_frame(timeout=1.0)
+            with ProfilerConnection(port=server.port, timeout=1.0) as profiler:
+                frame = profiler.get_frame(timeout=1.0)
 
         self.assertEqual({"GSMP1", "GSMP2"}, set(server.client_messages))
         self.assertEqual("Frame", frame.root.name)
@@ -842,7 +861,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         ]
         names = {1: "Frame", 2: "Update", 100: "Memory", 101: "Used"}
         with FakeRemoteryServer(messages, names) as server:
-            profiler = ProfilerClient(12345, timeout=1.0, remotery_url=f"ws://127.0.0.1:{server.port}/rmt")
+            profiler = ProfilerClient(12345, timeout=1.0, profiler_url=f"ws://127.0.0.1:{server.port}/rmt")
             recording = profiler.start_recording(read_timeout=0.05)
             try:
                 wait_until(
@@ -888,7 +907,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 super().__init__(1)
                 self.requests = []
 
-            def get(self, path, params=None):
+            def _request(self, method, path, params=None, json_body=None):
                 self.requests.append((path, params))
                 return {
                     "nodes": [{"id": "n:1", "name": "Play", "enabled": True}],
@@ -937,7 +956,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 super().__init__(1)
                 self.status_calls = 0
 
-            def get(self, path, params=None):
+            def _request(self, method, path, params=None, json_body=None):
                 if path == "/screenshot":
                     return {"capture_id": 7, "state": "pending", "path": "/tmp/shot.png"}
                 self.status_calls += 1
@@ -972,7 +991,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 super().__init__(1)
                 self.frame = 10
 
-            def get(self, path, params=None):
+            def _request(self, method, path, params=None, json_body=None):
                 value = self.frame
                 self.frame += 1
                 return {"engine_frame": value, "scene_sequence": value - 2}
@@ -1038,7 +1057,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             hook_causes.append(cause)
             raise RuntimeError("hook failed")
 
-        recording = RemoteryRecording(
+        recording = ProfilerRecording(
             client,
             close_on_stop=True,
             on_abort=failing_abort_hook,
@@ -1060,7 +1079,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 pass
 
         captures = []
-        recording = RemoteryRecording(
+        recording = ProfilerRecording(
             RecordingClient(),
             close_on_stop=True,
             on_finalize=captures.append,
@@ -1085,7 +1104,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 raise KeyboardInterrupt("finalization stop")
 
         aborts = []
-        recording = RemoteryRecording(
+        recording = ProfilerRecording(
             FailingClient(),
             close_on_stop=True,
             on_abort=lambda cause, capture: aborts.append(cause),
@@ -1601,7 +1620,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             remotery_port = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_PORT")
             if remotery_url is None and remotery_port:
                 remotery_url = f"ws://127.0.0.1:{remotery_port}/rmt"
-            cls.bridge = AutomationBridgeClient(int(port), remotery_url=remotery_url)
+            cls.bridge = AutomationBridgeClient(int(port), profiler_url=remotery_url)
             cls.bridge.wait_ready()
             return
 
@@ -1710,8 +1729,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
-        if self.editor is None and self.bridge.remotery_url is None:
-            raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for Remotery tests")
+        if self.editor is None and self.bridge.profiler_url is None:
+            raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for profiler tests")
         self.reset_if_popup_is_visible()
         spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
         observations = []
@@ -1797,8 +1816,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     def record_sprite_counter(self, observations, label):
         scene_count = self.bridge.count(type="spritec")
-        with self.bridge.profiler.remotery() as remotery:
-            counter_value = self.wait_for_sprite_counter(remotery, scene_count)
+        with self.bridge.profiler.connect() as profiler:
+            counter_value = self.wait_for_sprite_counter(profiler, scene_count)
         self.assertEqual(scene_count, counter_value, label)
         observations.append((label, scene_count, counter_value))
 

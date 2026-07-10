@@ -100,13 +100,9 @@ class Node:
         return self.raw.get("path", "")
 
     @property
-    def parent(self) -> Optional[str]:
-        return self.raw.get("parent")
-
-    @property
     def parent_id(self) -> Optional[str]:
         """Return the parent node id, if this snapshot has one."""
-        return self.parent
+        return self.raw.get("parent")
 
     @property
     def text(self) -> Optional[str]:

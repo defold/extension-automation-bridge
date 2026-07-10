@@ -260,7 +260,7 @@ class TraceSession:
             if method != "POST" or not isinstance(path_value, str) or not path_value.startswith("/input/"):
                 continue
             try:
-                client.post(path_value, payload.get("params"))
+                client.request("POST", path_value, params=payload.get("params"))
                 replayed += 1
             except BaseException as error:
                 failures.append({"sequence": item.get("sequence"), "error": repr(error)})
