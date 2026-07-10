@@ -647,9 +647,9 @@ namespace dmAutomationBridge
             return true;
         }
         uint64_t expected = 0;
-        if (!RequestGetUInt64Param(ctx, "expected_scene_sequence", &expected) || expected == 0)
+        if (!RequestGetUInt64Param(ctx, "expected_scene_sequence", &expected))
         {
-            RequestSendError(ctx, 400, "bad_request", "expected_scene_sequence must be a positive integer");
+            RequestSendError(ctx, 400, "bad_request", "expected_scene_sequence must be an unsigned integer");
             return false;
         }
         if (expected != g_AutomationBridge.m_Snapshot.m_Sequence)
