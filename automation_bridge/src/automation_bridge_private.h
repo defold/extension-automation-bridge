@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dmsdk/dlib/mutex.h>
 
 namespace dmAutomationBridge
 {
@@ -22,6 +23,9 @@ namespace dmAutomationBridge
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;
     static const float MAX_INPUT_DURATION = 60.0f;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
+    static const uint32_t MAX_APPLICATION_JSON_BYTES = 32768;
+    static const uint32_t MAX_APPLICATION_NAME_BYTES = 128;
+    static const uint32_t MAX_APPLICATION_JSON_DEPTH = 16;
 
     template <typename T>
     struct Array
@@ -81,6 +85,9 @@ namespace dmAutomationBridge
         char*                m_Text;
         char*                m_Url;
         char*                m_Resource;
+        char*                m_AutomationId;
+        char*                m_LocalizationKey;
+        char*                m_Role;
         bool                 m_Visible;
         bool                 m_Enabled;
         Bounds               m_Bounds;
@@ -216,6 +223,65 @@ namespace dmAutomationBridge
         uint64_t m_LastRenderTime;
     };
 
+    struct BridgeEvent
+    {
+        uint64_t m_Sequence;
+        uint64_t m_Frame;
+        uint64_t m_SceneSequence;
+        uint64_t m_NativeTimestampUs;
+        uint64_t m_RecordingTimestampUs;
+        bool     m_HasRecordingTimestamp;
+        char*    m_Type;
+        char*    m_Name;
+        char*    m_DataJson;
+    };
+
+    struct PublishedState
+    {
+        char*    m_Name;
+        char*    m_ValueJson;
+        uint64_t m_Revision;
+        uint64_t m_Frame;
+        uint64_t m_NativeTimestampUs;
+    };
+
+    struct CommandHandler
+    {
+        char*                      m_Name;
+        dmScript::LuaCallbackInfo* m_Callback;
+    };
+
+    enum CommandState
+    {
+        COMMAND_PENDING,
+        COMMAND_RUNNING,
+        COMMAND_COMPLETED,
+        COMMAND_FAILED,
+        COMMAND_CANCELLED,
+        COMMAND_TIMED_OUT
+    };
+
+    struct CommandInvocation
+    {
+        uint64_t     m_Id;
+        CommandState m_State;
+        char*        m_Name;
+        char*        m_ArgumentsJson;
+        char*        m_ResultJson;
+        char*        m_Error;
+        uint64_t     m_AcceptedTimestampUs;
+        uint64_t     m_CompletedTimestampUs;
+        uint64_t     m_DeadlineTimestampUs;
+    };
+
+    struct NodeAnnotation
+    {
+        char* m_NodeUrl;
+        char* m_AutomationId;
+        char* m_LocalizationKey;
+        char* m_Role;
+    };
+
     struct AutomationBridgeContext
     {
         bool                    m_Initialized;
@@ -244,6 +310,19 @@ namespace dmAutomationBridge
         char                    m_ScreenshotPath[1024];
         uint32_t                m_DisplayWidth;
         uint32_t                m_DisplayHeight;
+        bool                    m_ApplicationApiEnabled;
+        bool                    m_CommandExecuting;
+        dmMutex::HMutex         m_ApplicationMutex;
+        Array<BridgeEvent>      m_Events;
+        Array<PublishedState>   m_PublishedStates;
+        Array<CommandHandler>   m_CommandHandlers;
+        Array<CommandInvocation> m_CommandInvocations;
+        Array<NodeAnnotation>   m_NodeAnnotations;
+        uint32_t                m_EventCapacity;
+        uint64_t                m_NextEventSequence;
+        uint64_t                m_NextStateRevision;
+        uint64_t                m_NextCommandId;
+        char                    m_EngineInstanceId[48];
     };
 
     struct IncludeOptions
@@ -417,6 +496,7 @@ namespace dmAutomationBridge
     const Node* FindNodeById(const char* id);
     void AppendNodeJson(StringBuffer* out, const Snapshot* snapshot, const Node* node, const IncludeOptions* include, bool recursive, bool visible_only);
     void AppendScreenJson(StringBuffer* out, const Snapshot* snapshot);
+    void ApplyNodeAnnotation(Node* node);
 
     void FreeInputReceipt(InputReceipt* receipt);
     void FreeInputEvent(InputEvent* event);
@@ -449,6 +529,23 @@ namespace dmAutomationBridge
     bool BuildScreenshotPath(char* path, uint32_t path_size);
     bool ScheduleScreenshot(const char* path);
     void ProcessPendingScreenshot();
+
+    void InitApplicationBridge(uint32_t event_capacity, bool enabled);
+    void FreeApplicationBridge();
+    void FinalizeApplicationLua();
+    void RegisterApplicationLua(lua_State* L);
+    void UpdateApplicationBridge();
+    bool EmitBridgeEvent(const char* type, const char* name, const char* data_json, uint64_t recording_timestamp_us, bool has_recording_timestamp);
+    bool EmitBridgeEventWithReceipt(const char* type, const char* name, const char* data_json, uint64_t recording_timestamp_us, bool has_recording_timestamp, uint64_t* event_sequence, uint64_t* native_timestamp_us);
+    uint64_t GetEventNextCursor();
+    uint64_t GetEventOldestCursor();
+    uint32_t AppendEventPageJson(StringBuffer* out, uint64_t cursor, uint32_t limit, bool* overflow, uint64_t* next_cursor);
+    uint64_t GetStateRevision();
+    uint32_t AppendPublishedStatesJson(StringBuffer* out, const char* name, uint64_t after_revision);
+    bool SubmitCommand(const char* name, const char* arguments_json, uint32_t timeout_ms, uint64_t* command_id, const char** error);
+    bool AppendCommandJson(StringBuffer* out, uint64_t command_id);
+    bool CancelCommand(uint64_t command_id, const char** error);
+    bool AddTimelineMarker(const char* name, const char* data_json, uint64_t recording_timestamp_us, bool has_recording_timestamp, uint64_t* event_sequence, uint64_t* native_timestamp_us);
 
     void RegisterWebEndpoint(dmExtension::AppParams* params);
     void UnregisterWebEndpoint();

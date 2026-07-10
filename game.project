@@ -12,6 +12,10 @@ high_dpi = 1
 [android]
 input_method = HiddenInputField
 
+[automation_bridge]
+application_api = 1
+event_capacity = 256
+
 [physics]
 gravity_y = -1000.0
 scale = 0.01
@@ -33,4 +37,3 @@ clear_color_blue = 0.5
 
 [label]
 max_count = 256
-

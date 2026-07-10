@@ -296,7 +296,8 @@ namespace dmAutomationBridge
         return true;
     }
 
-    static bool RequestGetUInt64Param(const RequestContext* ctx, const char* key, uint64_t* value, bool allow_zero = false)
+    static bool RequestGetUInt64Param(const RequestContext* ctx, const char* key, uint64_t* value,
+                                      uint64_t max_value = 0xffffffffffffffffULL, bool allow_zero = true)
     {
         const char* text = GetParam(&ctx->m_Query, key);
         if (IsEmpty(text) || !isdigit((unsigned char)text[0]))
@@ -305,7 +306,7 @@ namespace dmAutomationBridge
         }
         char* end = 0;
         unsigned long long parsed = strtoull(text, &end, 10);
-        if (!end || *end != 0 || (!allow_zero && parsed == 0))
+        if (!end || *end != 0 || parsed > max_value || (!allow_zero && parsed == 0))
         {
             return false;
         }
@@ -398,7 +399,7 @@ namespace dmAutomationBridge
             return true;
         }
         uint64_t expected = 0;
-        if (!RequestGetUInt64Param(ctx, "expected_scene_sequence", &expected))
+        if (!RequestGetUInt64Param(ctx, "expected_scene_sequence", &expected) || expected == 0)
         {
             RequestSendError(ctx, 400, "bad_request", "expected_scene_sequence must be a positive integer");
             return false;
@@ -433,7 +434,7 @@ namespace dmAutomationBridge
 #else
         AppendJsonString(&response, "unknown");
 #endif
-        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\"");
+        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"events.cursor\",\"events.long_poll\",\"timeline.markers\"");
         if (DefoldPrivateApiCanSetWindowSize())
         {
             StringBufferAppend(&response, ",\"screen.resize\"");
@@ -442,6 +443,10 @@ namespace dmAutomationBridge
         if (IsInputDeviceSupported(INPUT_DEVICE_TOUCH))
         {
             StringBufferAppend(&response, ",\"input.device.touch\"");
+        }
+        if (g_AutomationBridge.m_ApplicationApiEnabled)
+        {
+            StringBufferAppend(&response, ",\"application.events\",\"application.state\",\"application.commands\",\"application.acknowledgements\",\"application.annotations\"");
         }
         if (IsScreenshotSupported())
         {
@@ -462,6 +467,8 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, ",\"devices\":{\"auto\":true,\"mouse\":true,\"touch\":");
         StringBufferAppend(&response, IsInputDeviceSupported(INPUT_DEVICE_TOUCH) ? "true" : "false");
         StringBufferAppend(&response, "}}");
+        StringBufferAppend(&response, ",\"application_api_enabled\":");
+        StringBufferAppend(&response, g_AutomationBridge.m_ApplicationApiEnabled ? "true" : "false");
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -559,6 +566,21 @@ namespace dmAutomationBridge
         }
         value = RequestGetParam(ctx, "url");
         if (value && !ContainsCaseInsensitive(node->m_Url, value))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "automation_id");
+        if (value && !StringsEqual(node->m_AutomationId, value))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "localization_key");
+        if (value && !StringsEqual(node->m_LocalizationKey, value))
+        {
+            return false;
+        }
+        value = RequestGetParam(ctx, "role");
+        if (value && !StringsEqual(node->m_Role, value))
         {
             return false;
         }
@@ -688,7 +710,7 @@ namespace dmAutomationBridge
         const char* pointer_text = RequestGetParam(ctx, "pointer_id");
         if (!IsEmpty(pointer_text))
         {
-            if (!RequestGetUInt64Param(ctx, "pointer_id", &pointer_value, true) || pointer_value > 0xffffffffU)
+            if (!RequestGetUInt64Param(ctx, "pointer_id", &pointer_value, 0xffffffffU))
             {
                 RequestSendError(ctx, 400, "bad_request", "pointer_id must be an unsigned 32-bit integer");
                 return false;
@@ -1001,7 +1023,7 @@ namespace dmAutomationBridge
 
     static bool GetInputId(RequestContext* ctx, uint64_t* input_id)
     {
-        if (!RequestGetUInt64Param(ctx, "input_id", input_id))
+        if (!RequestGetUInt64Param(ctx, "input_id", input_id) || *input_id == 0)
         {
             RequestSendError(ctx, 400, "bad_request", "input_id must be a positive integer");
             return false;
@@ -1271,6 +1293,222 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static void HandleEventCursor(RequestContext* ctx)
+    {
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"cursor\":");
+        AppendNumber(&response, (double)GetEventNextCursor());
+        StringBufferAppend(&response, ",\"oldest_cursor\":");
+        AppendNumber(&response, (double)GetEventOldestCursor());
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleEvents(RequestContext* ctx)
+    {
+        uint64_t cursor = GetEventOldestCursor();
+        const char* cursor_text = RequestGetParam(ctx, "cursor");
+        if (!IsEmpty(cursor_text) && !RequestGetUInt64Param(ctx, "cursor", &cursor))
+        {
+            RequestSendError(ctx, 400, "bad_cursor", "cursor must be an unsigned integer");
+            return;
+        }
+        uint64_t timeout_ms_64 = 0;
+        const char* timeout_text = RequestGetParam(ctx, "timeout_ms");
+        if (!IsEmpty(timeout_text) && !RequestGetUInt64Param(ctx, "timeout_ms", &timeout_ms_64, 30000))
+        {
+            RequestSendError(ctx, 400, "bad_timeout", "timeout_ms must be between 0 and 30000");
+            return;
+        }
+        uint64_t limit_64 = 100;
+        const char* limit_text = RequestGetParam(ctx, "limit");
+        if (!IsEmpty(limit_text) && (!RequestGetUInt64Param(ctx, "limit", &limit_64, 256) || limit_64 == 0))
+        {
+            RequestSendError(ctx, 400, "bad_limit", "limit must be between 1 and 256");
+            return;
+        }
+
+        uint64_t deadline = dmTime::GetTime() + timeout_ms_64 * 1000;
+        StringBuffer page;
+        uint32_t count = 0;
+        bool overflow = false;
+        uint64_t next_cursor = cursor;
+        do
+        {
+            StringBufferInit(&page);
+            count = AppendEventPageJson(&page, cursor, (uint32_t)limit_64, &overflow, &next_cursor);
+            if (count || overflow || dmTime::GetTime() >= deadline) break;
+            StringBufferFree(&page);
+            dmTime::Sleep(10000);
+        } while (true);
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        StringBufferAppend(&response, page.m_Data);
+        StringBufferAppend(&response, "}\n");
+        StringBufferFree(&page);
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleState(RequestContext* ctx)
+    {
+        StringBuffer page;
+        StringBufferInit(&page);
+        AppendPublishedStatesJson(&page, RequestGetParam(ctx, "name"), 0);
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        StringBufferAppend(&response, page.m_Data);
+        StringBufferAppend(&response, "}\n");
+        StringBufferFree(&page);
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleStateWait(RequestContext* ctx)
+    {
+        uint64_t after_revision = 0;
+        if (!RequestGetUInt64Param(ctx, "after_revision", &after_revision))
+        {
+            RequestSendError(ctx, 400, "bad_revision", "after_revision is required and must be an unsigned integer");
+            return;
+        }
+        uint64_t timeout_ms = 0;
+        const char* timeout_text = RequestGetParam(ctx, "timeout_ms");
+        if (!IsEmpty(timeout_text) && !RequestGetUInt64Param(ctx, "timeout_ms", &timeout_ms, 30000))
+        {
+            RequestSendError(ctx, 400, "bad_timeout", "timeout_ms must be between 0 and 30000");
+            return;
+        }
+        uint64_t deadline = dmTime::GetTime() + timeout_ms * 1000;
+        StringBuffer page;
+        uint32_t count = 0;
+        do
+        {
+            StringBufferInit(&page);
+            count = AppendPublishedStatesJson(&page, RequestGetParam(ctx, "name"), after_revision);
+            if (count || dmTime::GetTime() >= deadline) break;
+            StringBufferFree(&page);
+            dmTime::Sleep(10000);
+        } while (true);
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        StringBufferAppend(&response, page.m_Data);
+        StringBufferAppend(&response, "}\n");
+        StringBufferFree(&page);
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleCommandSubmit(RequestContext* ctx)
+    {
+        const char* name = RequestGetParam(ctx, "name");
+        const char* data = RequestGetParam(ctx, "data");
+        if (!data) data = "{}";
+        uint64_t timeout_ms = 30000;
+        const char* timeout_text = RequestGetParam(ctx, "timeout_ms");
+        if (!IsEmpty(timeout_text) && (!RequestGetUInt64Param(ctx, "timeout_ms", &timeout_ms, 300000) || timeout_ms == 0))
+        {
+            RequestSendError(ctx, 400, "bad_timeout", "timeout_ms must be between 1 and 300000");
+            return;
+        }
+        uint64_t command_id = 0;
+        const char* error = 0;
+        if (!SubmitCommand(name, data, (uint32_t)timeout_ms, &command_id, &error))
+        {
+            RequestSendError(ctx, 400, "command_rejected", error);
+            return;
+        }
+        StringBuffer event_data;
+        StringBufferInit(&event_data);
+        StringBufferAppend(&event_data, "{\"command_id\":"); AppendNumber(&event_data, (double)command_id);
+        StringBufferAppend(&event_data, ",\"name\":"); AppendJsonString(&event_data, name);
+        StringBufferAppend(&event_data, "}");
+        EmitBridgeEvent("command", "command.accepted", event_data.m_Data, 0, false);
+        StringBufferFree(&event_data);
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"command_id\":");
+        AppendNumber(&response, (double)command_id);
+        StringBufferAppend(&response, ",\"state\":\"pending\"}}\n");
+        RequestSendJson(ctx, 202, &response);
+    }
+
+    static void HandleCommandStatus(RequestContext* ctx)
+    {
+        uint64_t command_id = 0;
+        if (!RequestGetUInt64Param(ctx, "id", &command_id) || command_id == 0)
+        {
+            RequestSendError(ctx, 400, "bad_command_id", "id must be a positive integer");
+            return;
+        }
+        StringBuffer command;
+        StringBufferInit(&command);
+        if (!AppendCommandJson(&command, command_id))
+        {
+            StringBufferFree(&command);
+            RequestSendError(ctx, 404, "command_not_found", "command id was not found");
+            return;
+        }
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        StringBufferAppend(&response, command.m_Data);
+        StringBufferAppend(&response, "}\n");
+        StringBufferFree(&command);
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleCommandCancel(RequestContext* ctx)
+    {
+        uint64_t command_id = 0;
+        if (!RequestGetUInt64Param(ctx, "id", &command_id) || command_id == 0)
+        {
+            RequestSendError(ctx, 400, "bad_command_id", "id must be a positive integer");
+            return;
+        }
+        const char* error = 0;
+        if (!CancelCommand(command_id, &error))
+        {
+            RequestSendError(ctx, 409, "command_not_cancellable", error);
+            return;
+        }
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"command_id\":");
+        AppendNumber(&response, (double)command_id);
+        StringBufferAppend(&response, ",\"state\":\"cancelled\"}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleMarker(RequestContext* ctx)
+    {
+        const char* name = RequestGetParam(ctx, "name");
+        const char* data = RequestGetParam(ctx, "data");
+        if (!data) data = "{}";
+        uint64_t recording_timestamp_us = 0;
+        bool has_recording_timestamp = RequestGetUInt64Param(ctx, "recording_timestamp_us", &recording_timestamp_us);
+        uint64_t event_sequence = 0;
+        uint64_t native_timestamp_us = 0;
+        if (!AddTimelineMarker(name, data, recording_timestamp_us, has_recording_timestamp, &event_sequence, &native_timestamp_us))
+        {
+            RequestSendError(ctx, 400, "marker_rejected", "marker name or JSON data is invalid");
+            return;
+        }
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"event_sequence\":");
+        AppendNumber(&response, (double)event_sequence);
+        StringBufferAppend(&response, ",\"name\":"); AppendJsonString(&response, name);
+        StringBufferAppend(&response, ",\"native_timestamp_us\":"); AppendNumber(&response, (double)native_timestamp_us);
+        StringBufferAppend(&response, ",\"recording_timestamp_us\":");
+        if (has_recording_timestamp) AppendNumber(&response, (double)recording_timestamp_us); else StringBufferAppend(&response, "null");
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
     static void SendMethodNotAllowed(RequestContext* ctx, const char* methods)
     {
         StringBuffer response;
@@ -1319,7 +1557,15 @@ namespace dmAutomationBridge
         {"/input/pointer/move", "POST", HandlePointerMove},
         {"/input/pointer/hold", "POST", HandlePointerHold},
         {"/input/pointer/up", "POST", HandlePointerUp},
-        {"/screenshot", "GET", HandleScreenshot}
+        {"/screenshot", "GET", HandleScreenshot},
+        {"/events/cursor", "GET", HandleEventCursor},
+        {"/events", "GET", HandleEvents},
+        {"/state", "GET", HandleState},
+        {"/state/wait", "GET", HandleStateWait},
+        {"/commands", "POST", HandleCommandSubmit},
+        {"/commands", "GET", HandleCommandStatus},
+        {"/commands", "DELETE", HandleCommandCancel},
+        {"/markers", "POST", HandleMarker}
     };
 
     void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request)

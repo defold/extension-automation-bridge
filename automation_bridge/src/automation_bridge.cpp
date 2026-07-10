@@ -31,6 +31,7 @@ namespace dmAutomationBridge
         ArrayFree(&bridge->m_InputHistory);
         FreeString(&bridge->m_ControllerClientId);
         FreeString(&bridge->m_ControllerSessionId);
+        FreeApplicationBridge();
     }
 
     static void InitAutomationBridgeContext(AutomationBridgeContext* bridge)
@@ -78,8 +79,10 @@ namespace dmAutomationBridge
             }
         }
         g_AutomationBridge.m_LastTime = dmTime::GetTime();
-        dmSnPrintf(g_AutomationBridge.m_EngineInstanceId, sizeof(g_AutomationBridge.m_EngineInstanceId),
-                   "engine-%llu", (unsigned long long)g_AutomationBridge.m_LastTime);
+        int32_t event_capacity = params->m_ConfigFile ? dmConfigFile::GetInt(params->m_ConfigFile, "automation_bridge.event_capacity", 256) : 256;
+        event_capacity = event_capacity < 16 ? 16 : (event_capacity > 4096 ? 4096 : event_capacity);
+        bool application_api_enabled = params->m_ConfigFile && dmConfigFile::GetInt(params->m_ConfigFile, "automation_bridge.application_api", 0) == 1;
+        InitApplicationBridge((uint32_t)event_capacity, application_api_enabled);
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);
         dmExtension::RegisterCallback(dmExtension::CALLBACK_PRE_RENDER, PreRender);
@@ -91,6 +94,7 @@ namespace dmAutomationBridge
     {
         g_AutomationBridge.m_GraphicsContext = (dmGraphics::HContext)ExtensionParamsGetContextByName((ExtensionParams*)params, "graphics");
         DefoldPrivateApiInitialize(params);
+        RegisterApplicationLua(params->m_L);
         dmLogInfo("Registered %s extension", LIB_NAME);
         return dmExtension::RESULT_OK;
     }
@@ -107,6 +111,7 @@ namespace dmAutomationBridge
     static dmExtension::Result Finalize(dmExtension::Params* params)
     {
         (void)params;
+        FinalizeApplicationLua();
         return dmExtension::RESULT_OK;
     }
 
@@ -124,6 +129,7 @@ namespace dmAutomationBridge
         ++g_AutomationBridge.m_Frame;
 
         UpdateInput(dt);
+        UpdateApplicationBridge();
 
         return dmExtension::RESULT_OK;
     }

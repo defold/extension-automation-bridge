@@ -207,6 +207,9 @@ namespace dmAutomationBridge
         FreeString(&node->m_Text);
         FreeString(&node->m_Url);
         FreeString(&node->m_Resource);
+        FreeString(&node->m_AutomationId);
+        FreeString(&node->m_LocalizationKey);
+        FreeString(&node->m_Role);
         for (uint32_t i = 0; i < node->m_Properties.m_Count; ++i)
         {
             FreeProperty(&node->m_Properties.m_Data[i]);
@@ -491,6 +494,8 @@ namespace dmAutomationBridge
             SetString(&node.m_Name, buffer);
         }
 
+        ApplyNodeAnnotation(&node);
+
         const char* safe_segment = IsEmpty(node.m_Name) ? node.m_Type : node.m_Name;
         char segment[128];
         dmSnPrintf(segment, sizeof(segment), "%s[%u]", safe_segment, sibling_index);
@@ -682,6 +687,21 @@ namespace dmAutomationBridge
         {
             StringBufferAppend(out, ",\"resource\":");
             AppendJsonString(out, node->m_Resource);
+        }
+        if (!IsEmpty(node->m_AutomationId))
+        {
+            StringBufferAppend(out, ",\"automation_id\":");
+            AppendJsonString(out, node->m_AutomationId);
+        }
+        if (!IsEmpty(node->m_LocalizationKey))
+        {
+            StringBufferAppend(out, ",\"localization_key\":");
+            AppendJsonString(out, node->m_LocalizationKey);
+        }
+        if (!IsEmpty(node->m_Role))
+        {
+            StringBufferAppend(out, ",\"role\":");
+            AppendJsonString(out, node->m_Role);
         }
 
         if (include->m_Bounds)
