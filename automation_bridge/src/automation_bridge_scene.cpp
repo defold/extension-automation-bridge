@@ -522,7 +522,10 @@ namespace dmAutomationBridge
         dmSnPrintf(id, sizeof(id), "n:%016llx", (unsigned long long)id_hash);
         SetString(&node.m_Id, id);
 
-        if (scene_node->m_Instance)
+        // Collection roots only initialize m_Collection. The remaining union-like
+        // SceneNode fields are unspecified, so m_Instance must only be read for
+        // node kinds that Defold documents as carrying an instance.
+        if (scene_node->m_Type != dmGameObject::SCENE_NODE_TYPE_COLLECTION && scene_node->m_Instance)
         {
             dmhash_t instance_identifier = dmGameObject::GetIdentifier(scene_node->m_Instance);
             node.m_InstanceGeneration = dmGameObject::GetGeneration(scene_node->m_Instance);
@@ -633,6 +636,7 @@ namespace dmAutomationBridge
         if (g_AutomationBridge.m_Register)
         {
             dmGameObject::SceneNode root;
+            memset(&root, 0, sizeof(root));
             if (dmGameObject::TraverseGetRoot(g_AutomationBridge.m_Register, &root))
             {
                 DefoldPrivateApiResetSnapshotCamera();
