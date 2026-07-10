@@ -32,6 +32,36 @@ events, semantic metadata, state, commands, and acknowledgements should be
 optional capabilities layered on top of the zero-configuration inspection and
 input API. No domain-specific workflow should be built into the library.
 
+## Implementation status on `improvements`
+
+All 31 recommendations have been implemented to the boundary of Defold's
+current public APIs. The Python API, native HTTP/Lua contracts, capability
+rules, examples, failure modes, and optional dependencies are documented in
+[`automation_bridge/README.md`](automation_bridge/README.md) and
+[`automation_bridge/automation-bridge-python/README.md`](automation_bridge/automation-bridge-python/README.md).
+
+| Backlog items | Delivered result |
+| --- | --- |
+| 1-6 | FIFO input ownership, ids and native receipts, continuous paths, leased pointer sessions, cancellation/flush/status, and explicit device selection |
+| 7-10 | Bounded cursor-based events plus opt-in Lua state, commands, acknowledgements, and semantic annotations |
+| 11-13 | Scene/frame correlation, stale-snapshot guards, named coordinate conversion, and bounded JSON request bodies |
+| 14-18 | Snapshot and generational identity, server-side semantic/exact selectors, pagination, transient observation, and diagnostic selector failures |
+| 19-21 | Atomic screenshot receipts, native frame waits, dependency-free pixel stability/change helpers, and scene/state-first assertion layering |
+| 22-23 | Optional platform recording companion with explicit capability failures and native timeline markers independent of recording |
+| 24-27 | Interruption-safe cleanup, deterministic gesture generation, trace bundles with best-effort replay, and observation-rich wait errors |
+| 28-31 | Precise resize outcomes, engine identity/lifecycle data, versioned capability negotiation, stale-engine rejection, and reduced-backend capability handling |
+
+Where Defold does not expose enough stable public API to implement a truthful,
+portable contract, the bridge reports the reduced capability instead of
+guessing or relying on private engine layout. The missing engine contracts and
+their proposed implementations are specified in:
+
+- [`docs/defold-hid-device-capability-query.md`](docs/defold-hid-device-capability-query.md)
+- [`docs/input-action-correlation.md`](docs/input-action-correlation.md)
+- [`docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md`](docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md)
+- [`docs/defold-headless-lifecycle-api.md`](docs/defold-headless-lifecycle-api.md)
+- [`docs/recording-platform-contract.md`](docs/recording-platform-contract.md)
+
 ## Findings in the current implementation
 
 These details materially affect priority and API design:
