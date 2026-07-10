@@ -6,7 +6,8 @@
 - Base URL: `http://127.0.0.1:<engine_service_port>/automation-bridge/v1`.
 - No Lua setup is required for v1; the API is available when Defold's engine service web server is running.
 - Requests use query parameters only, not JSON bodies. Success shape is `{ "ok": true, "data": ... }`; errors use `{ "ok": false, "error": { "code": ..., "message": ... } }`.
-- Call `GET /health` first. Require `ok: true`, inspect `data.capabilities`, and use `GET /screen` when window/display/viewport metadata matters. When `screen.resize` is present, use `PUT /screen?width=...&height=...` to set the native Defold window size.
+- Call `GET /health` first. Require `ok: true`, validate `data.version`, inspect `data.capability_versions`, and retain `data.identity.engine_instance_id` when caching a port. Use `GET /lifecycle` for native registration/health/scene-ready stages. Use `GET /screen` only when the `screen` capability exists; when `screen.resize` is present, use `PUT /screen?width=...&height=...` to set the native Defold window size.
+- Capabilities are backend-driven. Routes whose graphics, game-object, window, or HID context is absent return `501 unsupported_capability`; health/lifecycle remain the attachment contract.
 - Coordinates are top-left screen pixels. Prefer node ids over raw coordinates whenever possible.
 - Discover targets with `GET /nodes` or `GET /scene`; fetch details with `GET /node?id=...`.
 - `/nodes` applies exact, substring, boolean, identity, and pagination filters

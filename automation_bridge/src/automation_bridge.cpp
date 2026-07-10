@@ -5,6 +5,12 @@
 
 #include <dmsdk/sdk.h>
 
+#if defined(DM_PLATFORM_WINDOWS)
+#include <windows.h>
+#elif defined(DM_PLATFORM_OSX) || defined(DM_PLATFORM_LINUX) || defined(DM_PLATFORM_ANDROID) || defined(DM_PLATFORM_IOS)
+#include <unistd.h>
+#endif
+
 #define MODULE_NAME AutomationBridge
 #define LIB_NAME "automation_bridge"
 
@@ -44,6 +50,53 @@ namespace dmAutomationBridge
         bridge->m_DefaultInputVisualize = true;
         bridge->m_DisplayWidth = 960;
         bridge->m_DisplayHeight = 640;
+        bridge->m_ProcessId = -1;
+    }
+
+    static int64_t GetPortableProcessId()
+    {
+#if defined(DM_PLATFORM_WINDOWS)
+        return (int64_t)GetCurrentProcessId();
+#elif defined(DM_PLATFORM_OSX) || defined(DM_PLATFORM_LINUX) || defined(DM_PLATFORM_ANDROID) || defined(DM_PLATFORM_IOS)
+        return (int64_t)getpid();
+#else
+        return -1;
+#endif
+    }
+
+    static void FormatIdentity(char* output, uint32_t output_size, const char* prefix, uint64_t hash)
+    {
+        dmSnPrintf(output, output_size, "%s:%016llx", prefix, (unsigned long long)hash);
+    }
+
+    static void InitializeIdentity(dmExtension::AppParams* params)
+    {
+        AutomationBridgeContext* bridge = &g_AutomationBridge;
+        bridge->m_StartWallTime = dmTime::GetTime();
+        bridge->m_StartMonotonicTime = dmTime::GetMonotonicTime();
+        bridge->m_ProcessId = GetPortableProcessId();
+
+        char instance_seed[128];
+        dmSnPrintf(instance_seed, sizeof(instance_seed), "%llu:%llu:%p",
+                   (unsigned long long)bridge->m_StartWallTime,
+                   (unsigned long long)bridge->m_StartMonotonicTime,
+                   (void*)bridge);
+        FormatIdentity(bridge->m_EngineInstanceId, sizeof(bridge->m_EngineInstanceId), "engine", dmHashString64(instance_seed));
+
+        const char* title = "";
+        const char* version = "";
+        const char* bootstrap = "";
+        if (params->m_ConfigFile)
+        {
+            title = dmConfigFile::GetString(params->m_ConfigFile, "project.title", "");
+            version = dmConfigFile::GetString(params->m_ConfigFile, "project.version", "");
+            bootstrap = dmConfigFile::GetString(params->m_ConfigFile, "bootstrap.main_collection", "");
+        }
+        FormatIdentity(bridge->m_ProjectIdentity, sizeof(bridge->m_ProjectIdentity), "project", dmHashString64(title));
+
+        char build_seed[1024];
+        dmSnPrintf(build_seed, sizeof(build_seed), "%s\n%s\n%s", title, version, bootstrap);
+        FormatIdentity(bridge->m_BuildIdentity, sizeof(bridge->m_BuildIdentity), "config", dmHashString64(build_seed));
     }
 
     static ExtensionResult PreRender(ExtensionParams* params)
@@ -64,6 +117,7 @@ namespace dmAutomationBridge
     {
         FreeAutomationBridgeContext(&g_AutomationBridge);
         InitAutomationBridgeContext(&g_AutomationBridge);
+        InitializeIdentity(params);
         g_AutomationBridge.m_Register = dmEngine::GetGameObjectRegister(params);
         g_AutomationBridge.m_HidContext = dmEngine::GetHIDContext(params);
         if (params->m_ConfigFile)

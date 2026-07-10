@@ -55,7 +55,8 @@ Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `stale_scene`, `input_queue_full`, `input_too_large`, `input_controller_busy`,
 `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`,
 `screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
-and `screenshot_pending`.
+`screenshot_pending`, and `unsupported_capability`. The latter names a feature
+omitted by the current graphics, game-object, window, or HID backend.
 
 ## Coordinates
 
@@ -167,6 +168,11 @@ Response `data` includes:
 - `debug`: `true`.
 - `platform`: `macos`, `windows`, `linux`, `android`, `ios`, or `unknown`.
 - `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `screen.resize`, `input.click`, `input.drag`, `input.drag_path`, `input.pointer`, `input.receipts`, `input.queue`, `input.controller`, device capabilities, and, when supported, `screenshot`.
+- `capability_versions`: capability-to-version map for feature negotiation.
+- `native_version`, `api_version_min`, and `api_version_max`: native package and API compatibility information.
+- `identity`: opaque engine instance, process id where portable, wall/monotonic start timestamps, hashed project identity, and hashed build-configuration identity.
+- `backend`: graphics, HID, and headless availability.
+- `lifecycle`: runtime registration, health, and initial-scene stages.
 - `screen`: current screen metadata.
 - `scene_sequence`: snapshot sequence number.
 - `engine_frame` and `engine_instance_id`: native temporal and process-instance correlation.
@@ -175,6 +181,28 @@ Response `data` includes:
 ```sh
 curl -fsS "$BASE/health" | python3 -m json.tool
 ```
+
+The raw title, bootstrap path, executable path, and user paths are not returned.
+`build_identity` is currently a non-secret configuration fingerprint rather than a
+resource-content digest. The missing public Defold build/headless/lifecycle APIs are
+specified in [`docs/defold-headless-lifecycle-api.md`](../docs/defold-headless-lifecycle-api.md).
+
+### `GET /automation-bridge/v1/lifecycle`
+
+Returns ordered runtime stages with native monotonic timestamps. The
+`initial_scene_ready` stage appears once a scene root is available.
+
+```sh
+curl -fsS "$BASE/lifecycle" | python3 -m json.tool
+```
+
+## Capability-Driven Backends
+
+Health and lifecycle are independent of scene, graphics, screenshots, windows, and
+HID. Capabilities are advertised only when their backing context exists. Calling an
+omitted route returns `501 unsupported_capability`, so CI can distinguish an unsupported
+backend from a transient runtime failure. True `DM_HEADLESS` registration still needs
+the public Defold debug transport proposed in the specification linked above.
 
 ### `GET /automation-bridge/v1/screen`
 

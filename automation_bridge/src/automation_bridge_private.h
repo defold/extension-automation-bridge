@@ -18,6 +18,7 @@ namespace dmAutomationBridge
 {
     static const char* API_PREFIX = "/automation-bridge/v1";
     static const char* API_VERSION = "1";
+    static const char* NATIVE_VERSION = "1.1.0";
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_INPUT_HISTORY = 256;
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;
@@ -352,6 +353,14 @@ namespace dmAutomationBridge
         uint64_t                m_NextEventSequence;
         uint64_t                m_NextStateRevision;
         uint64_t                m_NextCommandId;
+        char                    m_ProjectIdentity[32];
+        char                    m_BuildIdentity[32];
+        uint64_t                m_StartWallTime;
+        uint64_t                m_StartMonotonicTime;
+        uint64_t                m_RegisteredMonotonicTime;
+        uint64_t                m_FirstHealthMonotonicTime;
+        uint64_t                m_SceneReadyMonotonicTime;
+        int64_t                 m_ProcessId;
     };
 
     struct IncludeOptions

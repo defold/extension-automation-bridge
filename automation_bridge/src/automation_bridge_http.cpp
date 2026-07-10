@@ -660,14 +660,167 @@ namespace dmAutomationBridge
         return true;
     }
 
+    static bool HasSceneCapability()
+    {
+        return g_AutomationBridge.m_Register != 0;
+    }
+
+    static bool HasScreenCapability()
+    {
+        return g_AutomationBridge.m_GraphicsContext != 0;
+    }
+
+    static bool HasInputCapability()
+    {
+        return g_AutomationBridge.m_HidContext != 0;
+    }
+
+    static void AppendCapability(StringBuffer* names, StringBuffer* versions, bool* first, const char* name, const char* version = "1")
+    {
+        if (!*first)
+        {
+            StringBufferAppend(names, ",");
+            StringBufferAppend(versions, ",");
+        }
+        AppendJsonString(names, name);
+        AppendJsonString(versions, name);
+        StringBufferAppend(versions, ":");
+        AppendJsonString(versions, version);
+        *first = false;
+    }
+
+    static void AppendCapabilitiesJson(StringBuffer* out)
+    {
+        StringBuffer names;
+        StringBuffer versions;
+        StringBufferInit(&names);
+        StringBufferInit(&versions);
+        bool first = true;
+        AppendCapability(&names, &versions, &first, "runtime.health");
+        AppendCapability(&names, &versions, &first, "runtime.lifecycle");
+        AppendCapability(&names, &versions, &first, "diagnostics.metadata");
+        if (HasSceneCapability())
+        {
+            AppendCapability(&names, &versions, &first, "scene");
+            AppendCapability(&names, &versions, &first, "nodes");
+            AppendCapability(&names, &versions, &first, "node");
+            AppendCapability(&names, &versions, &first, "scene.pagination");
+            AppendCapability(&names, &versions, &first, "scene.identity");
+        }
+        if (HasScreenCapability())
+        {
+            AppendCapability(&names, &versions, &first, "screen");
+            AppendCapability(&names, &versions, &first, "coordinates.convert");
+            if (DefoldPrivateApiCanSetWindowSize())
+            {
+                AppendCapability(&names, &versions, &first, "screen.resize");
+            }
+        }
+        if (HasInputCapability())
+        {
+            AppendCapability(&names, &versions, &first, "input.click");
+            AppendCapability(&names, &versions, &first, "input.drag");
+            AppendCapability(&names, &versions, &first, "input.drag_path");
+            AppendCapability(&names, &versions, &first, "input.pointer");
+            AppendCapability(&names, &versions, &first, "input.key");
+            AppendCapability(&names, &versions, &first, "input.receipts");
+            AppendCapability(&names, &versions, &first, "input.queue");
+            AppendCapability(&names, &versions, &first, "input.controller");
+            AppendCapability(&names, &versions, &first, "input.device.mouse");
+            if (IsInputDeviceSupported(INPUT_DEVICE_TOUCH))
+            {
+                AppendCapability(&names, &versions, &first, "input.device.touch");
+            }
+        }
+        AppendCapability(&names, &versions, &first, "events.cursor");
+        AppendCapability(&names, &versions, &first, "events.long_poll");
+        AppendCapability(&names, &versions, &first, "timeline.markers");
+        AppendCapability(&names, &versions, &first, "frame.wait");
+        if (g_AutomationBridge.m_ApplicationApiEnabled)
+        {
+            AppendCapability(&names, &versions, &first, "application.events");
+            AppendCapability(&names, &versions, &first, "application.state");
+            AppendCapability(&names, &versions, &first, "application.commands");
+            AppendCapability(&names, &versions, &first, "application.acknowledgements");
+            AppendCapability(&names, &versions, &first, "application.annotations");
+        }
+        if (IsScreenshotSupported())
+        {
+            AppendCapability(&names, &versions, &first, "screenshot");
+        }
+        StringBufferAppend(out, "[ ");
+        StringBufferAppend(out, names.m_Data ? names.m_Data : "");
+        StringBufferAppend(out, "],\"capability_versions\":{");
+        StringBufferAppend(out, versions.m_Data ? versions.m_Data : "");
+        StringBufferAppend(out, "}");
+        StringBufferFree(&names);
+        StringBufferFree(&versions);
+    }
+
+    static void AppendTimestamp(StringBuffer* out, uint64_t value)
+    {
+        char number[32];
+        dmSnPrintf(number, sizeof(number), "%llu", (unsigned long long)value);
+        StringBufferAppend(out, number);
+    }
+
+    static void AppendLifecycleStage(StringBuffer* out, const char* stage, uint64_t timestamp, bool* first)
+    {
+        if (!timestamp)
+        {
+            return;
+        }
+        if (!*first)
+        {
+            StringBufferAppend(out, ",");
+        }
+        StringBufferAppend(out, "{\"stage\":");
+        AppendJsonString(out, stage);
+        StringBufferAppend(out, ",\"state\":\"completed\",\"monotonic_us\":");
+        AppendTimestamp(out, timestamp);
+        StringBufferAppend(out, "}");
+        *first = false;
+    }
+
+    static void UpdateLifecycleForRequest()
+    {
+        uint64_t now = dmTime::GetMonotonicTime();
+        if (!g_AutomationBridge.m_FirstHealthMonotonicTime)
+        {
+            g_AutomationBridge.m_FirstHealthMonotonicTime = now;
+        }
+        if (!g_AutomationBridge.m_SceneReadyMonotonicTime &&
+            g_AutomationBridge.m_Snapshot.m_Root >= 0 &&
+            (uint32_t)g_AutomationBridge.m_Snapshot.m_Root < g_AutomationBridge.m_Snapshot.m_Nodes.m_Count)
+        {
+            g_AutomationBridge.m_SceneReadyMonotonicTime = now;
+        }
+    }
+
+    static void AppendLifecycleJson(StringBuffer* out)
+    {
+        StringBufferAppend(out, "{\"current_stage\":");
+        AppendJsonString(out, g_AutomationBridge.m_SceneReadyMonotonicTime ? "initial_scene_ready" : "bridge_healthy");
+        StringBufferAppend(out, ",\"events\":[");
+        bool first = true;
+        AppendLifecycleStage(out, "engine_started", g_AutomationBridge.m_StartMonotonicTime, &first);
+        AppendLifecycleStage(out, "new_engine_registered", g_AutomationBridge.m_RegisteredMonotonicTime, &first);
+        AppendLifecycleStage(out, "bridge_healthy", g_AutomationBridge.m_FirstHealthMonotonicTime, &first);
+        AppendLifecycleStage(out, "initial_scene_ready", g_AutomationBridge.m_SceneReadyMonotonicTime, &first);
+        StringBufferAppend(out, "]}");
+    }
+
     static void HandleHealth(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
+        UpdateLifecycleForRequest();
 
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"version\":");
         AppendJsonString(&response, API_VERSION);
+        StringBufferAppend(&response, ",\"api_version_min\":\"1\",\"api_version_max\":\"1\",\"native_version\":");
+        AppendJsonString(&response, NATIVE_VERSION);
         StringBufferAppend(&response, ",\"debug\":true,\"platform\":");
 #if defined(DM_PLATFORM_OSX)
         AppendJsonString(&response, "macos");
@@ -682,26 +835,36 @@ namespace dmAutomationBridge
 #else
         AppendJsonString(&response, "unknown");
 #endif
-        StringBufferAppend(&response, ",\"capabilities\":[\"scene\",\"nodes\",\"node\",\"events.cursor\",\"events.long_poll\",\"timeline.markers\"");
-        if (DefoldPrivateApiCanSetWindowSize())
+        StringBufferAppend(&response, ",\"backend\":{\"headless\":false,\"graphics\":");
+        StringBufferAppend(&response, HasScreenCapability() ? "true" : "false");
+        StringBufferAppend(&response, ",\"hid\":");
+        StringBufferAppend(&response, HasInputCapability() ? "true" : "false");
+        StringBufferAppend(&response, "},\"capabilities\":");
+        AppendCapabilitiesJson(&response);
+        StringBufferAppend(&response, ",\"identity\":{\"engine_instance_id\":");
+        AppendJsonString(&response, g_AutomationBridge.m_EngineInstanceId);
+        StringBufferAppend(&response, ",\"engine_instance_scope\":\"application_start\"");
+        StringBufferAppend(&response, ",\"process_id\":");
+        if (g_AutomationBridge.m_ProcessId >= 0)
         {
-            StringBufferAppend(&response, ",\"screen.resize\"");
+            AppendNumber(&response, (double)g_AutomationBridge.m_ProcessId);
         }
-        StringBufferAppend(&response, ",\"input.click\",\"input.drag\",\"input.drag_path\",\"input.pointer\",\"input.key\",\"input.receipts\",\"input.queue\",\"input.controller\",\"input.device.mouse\"");
-        if (IsInputDeviceSupported(INPUT_DEVICE_TOUCH))
+        else
         {
-            StringBufferAppend(&response, ",\"input.device.touch\"");
+            StringBufferAppend(&response, "null");
         }
-        if (g_AutomationBridge.m_ApplicationApiEnabled)
-        {
-            StringBufferAppend(&response, ",\"application.events\",\"application.state\",\"application.commands\",\"application.acknowledgements\",\"application.annotations\"");
-        }
-        if (IsScreenshotSupported())
-        {
-            StringBufferAppend(&response, ",\"screenshot\"");
-        }
-        StringBufferAppend(&response, ",\"scene.pagination\",\"scene.identity\",\"coordinates.convert\",\"frame.wait\"");
-        StringBufferAppend(&response, "],\"screen\":");
+        StringBufferAppend(&response, ",\"start_wall_time_us\":");
+        AppendTimestamp(&response, g_AutomationBridge.m_StartWallTime);
+        StringBufferAppend(&response, ",\"start_monotonic_time_us\":");
+        AppendTimestamp(&response, g_AutomationBridge.m_StartMonotonicTime);
+        StringBufferAppend(&response, ",\"project_identity\":");
+        AppendJsonString(&response, g_AutomationBridge.m_ProjectIdentity);
+        StringBufferAppend(&response, ",\"build_identity\":");
+        AppendJsonString(&response, g_AutomationBridge.m_BuildIdentity);
+        StringBufferAppend(&response, ",\"build_identity_kind\":\"project_configuration_fingerprint\"");
+        StringBufferAppend(&response, "},\"lifecycle\":");
+        AppendLifecycleJson(&response);
+        StringBufferAppend(&response, ",\"screen\":");
         AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
         StringBufferAppend(&response, ",\"scene_sequence\":");
         AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
@@ -722,8 +885,25 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static void HandleLifecycle(RequestContext* ctx)
+    {
+        RefreshSnapshotForRequest();
+        UpdateLifecycleForRequest();
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendLifecycleJson(&response);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
     static void HandleScreen(RequestContext* ctx)
     {
+        if (!HasScreenCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "screen is unavailable because the runtime has no graphics context");
+            return;
+        }
         RefreshSnapshotForRequest();
 
         StringBuffer response;
@@ -742,6 +922,11 @@ namespace dmAutomationBridge
 
     static void HandleScreenPut(RequestContext* ctx)
     {
+        if (!HasScreenCapability() || !DefoldPrivateApiCanSetWindowSize())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "screen.resize is unavailable on this platform/backend");
+            return;
+        }
         uint32_t width = 0;
         uint32_t height = 0;
         if (!RequestGetUIntParam(ctx, "width", &width, MAX_SCREEN_DIMENSION) ||
@@ -789,6 +974,11 @@ namespace dmAutomationBridge
 
     static void HandleScene(RequestContext* ctx)
     {
+        if (!HasSceneCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "scene inspection is unavailable because the runtime has no game-object register");
+            return;
+        }
         RefreshSnapshotForRequest();
 
         IncludeOptions include = ParseInclude(ctx, false, true);
@@ -953,6 +1143,11 @@ namespace dmAutomationBridge
 
     static void HandleNodes(RequestContext* ctx)
     {
+        if (!HasSceneCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "nodes is unavailable because the runtime has no game-object register");
+            return;
+        }
         RefreshSnapshotForRequest();
 
         IncludeOptions include = ParseInclude(ctx, false, false);
@@ -1050,6 +1245,11 @@ namespace dmAutomationBridge
 
     static void HandleNode(RequestContext* ctx)
     {
+        if (!HasSceneCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "node is unavailable because the runtime has no game-object register");
+            return;
+        }
         RefreshSnapshotForRequest();
 
         const char* id = RequestGetParam(ctx, "id");
@@ -1108,6 +1308,11 @@ namespace dmAutomationBridge
 
     static bool GetInputOptions(RequestContext* ctx, InputDevice* device, uint32_t* pointer_id, bool* visualize)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input injection is unavailable because the runtime has no HID context");
+            return false;
+        }
         *device = g_AutomationBridge.m_DefaultInputDevice;
         const char* device_text = RequestGetParam(ctx, "device");
         if (!IsEmpty(device_text) && !ParseInputDevice(device_text, device))
@@ -1268,6 +1473,11 @@ namespace dmAutomationBridge
     }
     static void HandleClick(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input.click is unavailable because the runtime has no HID context");
+            return;
+        }
         RefreshSnapshotForRequest();
         if (!ValidateExpectedScene(ctx)) return;
         float x = 0.0f;
@@ -1297,6 +1507,11 @@ namespace dmAutomationBridge
 
     static void HandleDrag(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input.drag is unavailable because the runtime has no HID context");
+            return;
+        }
         RefreshSnapshotForRequest();
         if (!ValidateExpectedScene(ctx)) return;
         float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
@@ -1412,6 +1627,11 @@ namespace dmAutomationBridge
 
     static void HandleKey(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input.key is unavailable because the runtime has no HID context");
+            return;
+        }
         RefreshSnapshotForRequest();
         if (!ValidateExpectedScene(ctx)) return;
         const char* value = RequestGetParam(ctx, "keys");
@@ -1624,6 +1844,11 @@ namespace dmAutomationBridge
 
     static void HandleInputCancel(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input cancellation is unavailable because the runtime has no HID context");
+            return;
+        }
         uint64_t input_id = 0;
         if (!GetInputId(ctx, &input_id)) return;
         const char* client_id = 0, *session_id = 0, *request_id = 0;
@@ -1648,6 +1873,11 @@ namespace dmAutomationBridge
 
     static void HandleInputFlush(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input flush is unavailable because the runtime has no HID context");
+            return;
+        }
         const char* client_id = 0, *session_id = 0, *request_id = 0;
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
@@ -1667,6 +1897,11 @@ namespace dmAutomationBridge
 
     static void HandleInputConfigure(RequestContext* ctx)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input configuration is unavailable because the runtime has no HID context");
+            return;
+        }
         const char* client_id = 0, *session_id = 0, *request_id = 0;
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
@@ -1728,6 +1963,11 @@ namespace dmAutomationBridge
     static bool PreparePointerCommand(RequestContext* ctx, uint64_t* input_id, float* pointer_lease,
                                       const char** client_id, const char** session_id)
     {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "pointer input is unavailable because the runtime has no HID context");
+            return false;
+        }
         if (!GetInputId(ctx, input_id)) return false;
         const char* request_id = 0;
         float controller_lease = 5.0f;
@@ -2112,6 +2352,7 @@ namespace dmAutomationBridge
 
     static const RouteDefinition ROUTES[] = {
         {"/health", "GET", HandleHealth},
+        {"/lifecycle", "GET", HandleLifecycle},
         {"/screen", "GET", HandleScreen},
         {"/screen", "PUT", HandleScreenPut},
         {"/coordinates/convert", "POST", HandleCoordinateConvert},
@@ -2244,6 +2485,7 @@ namespace dmAutomationBridge
         if (result == dmWebServer::RESULT_OK || result == dmWebServer::RESULT_HANDLER_ALREADY_REGISTRED)
         {
             g_AutomationBridge.m_WebHandlerRegistered = true;
+            g_AutomationBridge.m_RegisteredMonotonicTime = dmTime::GetMonotonicTime();
             dmLogInfo("Automation Bridge endpoint registered at `%s`", API_PREFIX);
         }
         else

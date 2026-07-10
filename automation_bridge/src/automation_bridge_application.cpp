@@ -250,7 +250,10 @@ namespace dmAutomationBridge
         g_AutomationBridge.m_NextStateRevision = 1;
         g_AutomationBridge.m_NextCommandId = 1;
         g_AutomationBridge.m_ApplicationMutex = dmMutex::New();
-        dmSnPrintf(g_AutomationBridge.m_EngineInstanceId, sizeof(g_AutomationBridge.m_EngineInstanceId), "engine:%016llx", (unsigned long long)dmTime::GetTime());
+        if (IsEmpty(g_AutomationBridge.m_EngineInstanceId))
+        {
+            dmSnPrintf(g_AutomationBridge.m_EngineInstanceId, sizeof(g_AutomationBridge.m_EngineInstanceId), "engine:%016llx", (unsigned long long)dmTime::GetTime());
+        }
     }
 
     void FinalizeApplicationLua()
