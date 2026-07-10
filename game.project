@@ -28,7 +28,7 @@ title = extension-automation-bridge
 
 [library]
 include_dirs = automation_bridge
-defold_min_version = 1.12.4
+defold_min_version = 1.13.1
 
 [render]
 clear_color_red = 0.5
@@ -37,3 +37,4 @@ clear_color_blue = 0.5
 
 [label]
 max_count = 256
+
