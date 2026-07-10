@@ -52,6 +52,11 @@ PYTHONPATH=automation_bridge/automation-bridge-python python3 examples/gameobjec
 
 It uses a sample fixture whose sprite is offset from the parent game object origin, so it fails if parent game-object bounds collapse to the raw Defold world position.
 
+An interruption-safe input/recording example is available as
+`examples/interruption_safe.py`; it demonstrates session flushing, screenshot
+and native input waits, structured timeout diagnostics, and profiler
+finalization/abort hooks.
+
 ## Public API Surface
 
 `AutomationBridgeClient` is the main entry point.
@@ -73,9 +78,10 @@ It uses a sample fixture whose sprite is offset from the parent game object orig
 Typed response wrappers include `Node`, `Bounds`, `InputReceipt`, `PointerSession`,
 `ScreenshotReceipt`, `ObservationReceipt`, `VisualObservation`,
 `ResourceProfileEntry`, and the Remotery types. `InputController`,
-`EngineLogStream`, `ProfilerClient`, `VisualClient`, and `RemoteryClient` are
-also exported for direct use. These are lightweight snapshots around native
-engine data; re-query after clicks, drags, or scene changes.
+`InputInterruptionScope`, `EngineLogStream`, `ProfilerClient`, `VisualClient`,
+`RemoteryClient`, `FinalizationHooks`, and `WaitTimeoutError` are also exported
+for direct use. These are lightweight snapshots around native engine data;
+re-query after clicks, drags, or scene changes.
 
 ## Bootstrap
 
@@ -267,7 +273,17 @@ with bridge.pointer((100, 200), lease=2.0) as pointer:
     pointer.move((300, 220), duration=0.3, easing="ease_out")
 ```
 
-Input waits cancel the active input on interruption by default. Use `bridge.input.wait(receipt, flush_on_interrupt=True)` when interruption should also cancel later inputs from this session. Log reads close their socket and preserve `KeyboardInterrupt`; timeout restoration cannot mask the original exception.
+Input waits cancel the active input on interruption by default. `click()`, `drag()`, `drag_path()`, `type_text()`, and `key()` expose `cancel_on_interrupt` and `flush_on_interrupt`; use the latter when interruption should also cancel later inputs from this session. Cleanup always requests `release=True`, so the native queue releases an active mouse button or key and cancels an active touch contact.
+
+When an interruption may occur after a non-waiting input call—for example in an application event wait or screenshot wait—wrap the complete operation in a session cleanup scope:
+
+```python
+with bridge.input.interruption_scope():
+    bridge.drag(item, target, wait=False)
+    wait_for_application_event()
+```
+
+The scope flushes this client's active and later queued actions only when an exception leaves the block. Native controller and pointer leases remain the last-resort release mechanism if the Python process exits without running cleanup. Log reads close their socket and preserve `KeyboardInterrupt`; socket closure and timeout-restoration failures cannot mask the original exception.
 
 `Node.id`/`snapshot_id` hashes the traversal path and is tied to a scene shape.
 Nodes backed by a public Defold game object instance also expose
@@ -288,7 +304,7 @@ bridge.drag(item, (480, 320))
 ## Waits and Screenshots
 
 ```python
-from automation_bridge import wait_until
+from automation_bridge import AutomationBridgeError, WaitTimeoutError, wait_until
 
 wait_until(lambda: bridge.count(type="labelc", text_exact="L2") >= 1)
 
@@ -329,7 +345,18 @@ pixels. Alpha is ignored unless `include_alpha=True`; images are never scaled;
 and every consecutive sample is a distinct native capture. Regions are
 top-left viewport pixels.
 
-`wait_until(fn, timeout=..., interval=..., message=...)` polls until `fn()` returns a truthy value. Exceptions raised while polling are retried until timeout, then reported in the final `AssertionError`.
+`wait_until(fn, timeout=..., interval=..., message=...)` polls until `fn()` returns a truthy value. By default exceptions escape immediately, which keeps `TypeError`, `AttributeError`, and other programming mistakes from being hidden until timeout. Explicitly list transient failures that are safe to retry:
+
+```python
+result = wait_until(
+    read_application_state,
+    retry_exceptions=(AutomationBridgeError,),
+    predicate=lambda state: state.get("ready") is True,
+    timeout=10,
+)
+```
+
+On timeout, `WaitTimeoutError` (an `AssertionError` subclass) reports and exposes `.last_value`, `.elapsed`, `.attempts`, `.scene_sequence`, and `.last_exception`. A result mapping containing `scene_sequence` is detected automatically; client wait helpers also report the most recent native scene sequence. `predicate=` separates success from truthiness, which is useful when waiting for zero or another false-valued observation. `KeyboardInterrupt` and cancellation exceptions are never retried unless a caller explicitly and inadvisably lists their types.
 
 ## Race-free application synchronization
 
@@ -517,7 +544,17 @@ print(update.total.avg_ms, update.total.median_ms, update.total.p99_ms)
 When the script does not know the frame count in advance, start a background recording, drive gameplay, then stop it when the scenario reaches the point you care about:
 
 ```python
-recording = bridge.profiler.start_recording(thread="Main")
+def recording_finished(capture):
+    print("captured", len(capture.frames), "frames")
+
+def recording_aborted(cause, partial_capture):
+    print("recording interrupted:", cause, "salvaged", len(partial_capture.frames), "frames")
+
+recording = bridge.profiler.start_recording(
+    thread="Main",
+    on_finalize=recording_finished,
+    on_abort=recording_aborted,
+)
 try:
     start = bridge.node(name_exact="start", visible_and_enabled=True)
     bridge.click(start)
@@ -530,7 +567,9 @@ for scope in capture.scopes(contains="update", sort="self_p95_ms")[:10]:
     print(scope.path, scope.self.avg_ms, scope.self.p95_ms)
 ```
 
-`start_recording()` reads Remotery on a background thread until `recording.stop()` returns a `RemoteryCapture`. Use `recording.snapshot()` to inspect frames collected so far without stopping, and `recording.frame_count`, `recording.property_frame_count`, and `recording.running` for progress checks. Do not call `get_frame()`, `get_properties()`, or `capture()` on the same `RemoteryClient` while a recording is running.
+`start_recording()` reads Remotery on a background thread until `recording.stop()` returns a `RemoteryCapture`. `recording.abort(cause)` closes the stream and returns a partial capture without surfacing a background-reader error. As a context manager, normal exit finalizes while exceptional exit aborts; hook or socket-cleanup failures cannot replace the exception already leaving the block. Use `recording.snapshot()` to inspect frames collected so far without stopping, and `recording.frame_count`, `recording.property_frame_count`, and `recording.running` for progress checks. Do not call `get_frame()`, `get_properties()`, or `capture()` on the same `RemoteryClient` while a recording is running.
+
+`FinalizationHooks` exposes the same `finalize(artifact)` / `abort(cause, artifact, suppress=...)` callback contract for trace and diagnostic-bundle implementations. Trace cleanup should pass `suppress=True` only when preserving an original interruption; explicit finalization failures should remain visible.
 
 Custom scopes and counters must be emitted by the running Defold app before Python can read them. In Lua, wrap same-frame work with `profiler.scope_begin("my_scope")` and `profiler.scope_end()`. In C++ code that includes `<dmsdk/dlib/profile.h>`, use `DM_PROFILE("MyCppScope")` for scopes and `DM_PROPERTY_GROUP(MyMetrics, "...", 0)`, `DM_PROPERTY_U32(MyCounter, 0, PROFILE_PROPERTY_NONE, "...", MyMetrics)`, then `DM_PROPERTY_SET_U32(MyCounter, value)` or `DM_PROPERTY_ADD_U32(MyCounter, delta)` for counters exposed through `capture.counters(...)`.
 
@@ -562,3 +601,4 @@ All custom errors inherit from `AutomationBridgeError`.
 - `RemoteryError`: base class for Remotery websocket connection, timeout, and protocol errors.
 - `RemoteryProtocolError`: malformed or unexpected Remotery websocket data.
 - `RemoteryTimeoutError`: Remotery did not produce requested data before timeout.
+- `WaitTimeoutError`: a polling condition timed out; structured observation fields are available on the exception.

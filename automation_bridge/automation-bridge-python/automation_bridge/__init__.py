@@ -8,11 +8,13 @@ from .client import (
     HttpError,
     InputController,
     InputExecutionError,
+    InputInterruptionScope,
     InputReceipt,
     PointerSession,
     SelectorError,
 )
 from .editor import EditorClient
+from .lifecycle import FinalizationHooks
 from .nodes import Bounds, Node
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
@@ -36,7 +38,7 @@ from .remotery import (
     RemoteryTimeoutError,
     RemoteryValueStats,
 )
-from .waits import wait_until
+from .waits import WaitTimeoutError, wait_until
 
 
 __all__ = [
@@ -50,9 +52,11 @@ __all__ = [
     "EventBufferOverflow",
     "EventStream",
     "EditorClient",
+    "FinalizationHooks",
     "HttpError",
     "InputController",
     "InputExecutionError",
+    "InputInterruptionScope",
     "InputReceipt",
     "Node",
     "ObservationReceipt",
@@ -82,6 +86,7 @@ __all__ = [
     "VisualClient",
     "VisualObservation",
     "difference",
+    "WaitTimeoutError",
     "parse_resources_data",
     "wait_until",
 ]

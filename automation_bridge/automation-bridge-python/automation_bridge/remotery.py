@@ -12,9 +12,10 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 from .client import AutomationBridgeError
+from .lifecycle import FinalizationHooks
 
 
 DEFAULT_REMOTERY_PORT = 17815
@@ -32,6 +33,14 @@ _PROPERTY_TYPES = {
 NumericValue = Union[int, float, bool]
 _ROOT_PROPERTY_NAME_HASH = 0
 _ROOT_PROPERTY_NAME = "Root Property"
+
+
+def _best_effort(callback: Callable[[], Any]) -> None:
+    """Run finalization without replacing an exception already in flight."""
+    try:
+        callback()
+    except BaseException:
+        pass
 
 
 class RemoteryError(AutomationBridgeError):
@@ -538,6 +547,8 @@ class RemoteryRecording:
         read_timeout: float = 0.25,
         max_frames: Optional[int] = None,
         close_on_stop: Optional[bool] = None,
+        on_finalize: Optional[Callable[[RemoteryCapture], None]] = None,
+        on_abort: Optional[Callable[[BaseException, RemoteryCapture], None]] = None,
     ):
         """Create a recording session for `client`.
 
@@ -558,6 +569,7 @@ class RemoteryRecording:
         self._read_timeout = read_timeout
         self._max_frames = max_frames
         self._close_on_stop = close_on_stop
+        self.hooks = FinalizationHooks(on_finalize=on_finalize, on_abort=on_abort)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -566,6 +578,7 @@ class RemoteryRecording:
         self._accepted_frames = 0
         self._error: Optional[BaseException] = None
         self._capture: Optional[RemoteryCapture] = None
+        self._finalized: Optional[str] = None
 
     def __enter__(self) -> "RemoteryRecording":
         if self._thread is None:
@@ -573,7 +586,11 @@ class RemoteryRecording:
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.stop()
+        if exc_type is None:
+            self.stop()
+            return
+        cause = exc if isinstance(exc, BaseException) else RuntimeError(str(exc_type))
+        _best_effort(lambda: self.abort(cause))
 
     @property
     def running(self) -> bool:
@@ -608,7 +625,51 @@ class RemoteryRecording:
         return self
 
     def stop(self, timeout: float = 2.0) -> RemoteryCapture:
-        """Stop recording and return a `RemoteryCapture` for collected frames."""
+        """Finalize recording and run ``on_finalize`` with the capture.
+
+        If stopping itself is interrupted, the websocket is closed and
+        ``on_abort`` is called best-effort before the original exception is
+        re-raised. Repeated calls return the already finalized capture.
+        """
+        if self._capture is not None and self._finalized is not None:
+            return self._capture
+        try:
+            self._finish_reader(timeout)
+            if self._error is not None:
+                raise self._error
+        except BaseException as exc:
+            self._emergency_close(timeout)
+            self._capture = self.snapshot()
+            self._finalized = "aborted"
+            self.hooks.abort(exc, self._capture, suppress=True)
+            raise
+
+        self._capture = self.snapshot()
+        self._finalized = "finalized"
+        self.hooks.finalize(self._capture)
+        return self._capture
+
+    def abort(
+        self,
+        cause: Optional[BaseException] = None,
+        timeout: float = 2.0,
+    ) -> RemoteryCapture:
+        """Abort recording, close its stream, and run ``on_abort``.
+
+        Background reader errors are intentionally not raised from this path;
+        callers use it while another exception is already in flight. An
+        explicitly supplied ``cause`` is passed to the hook.
+        """
+        if self._capture is not None and self._finalized is not None:
+            return self._capture
+        self._emergency_close(timeout)
+        self._capture = self.snapshot()
+        self._finalized = "aborted"
+        abort_cause = cause or RemoteryError("recording aborted")
+        self.hooks.abort(abort_cause, self._capture)
+        return self._capture
+
+    def _finish_reader(self, timeout: float) -> None:
         self._stop_event.set()
         thread = self._thread
         if thread is not None:
@@ -618,10 +679,13 @@ class RemoteryRecording:
                 thread.join(timeout=timeout)
         if self._close_on_stop:
             self._client.stop()
-        if self._error is not None:
-            raise self._error
-        self._capture = self.snapshot()
-        return self._capture
+
+    def _emergency_close(self, timeout: float) -> None:
+        self._stop_event.set()
+        _best_effort(self._client.stop)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            _best_effort(lambda: thread.join(timeout=timeout))
 
     def snapshot(self) -> RemoteryCapture:
         """Return a `RemoteryCapture` for frames collected so far without stopping."""
@@ -713,7 +777,10 @@ class RemoteryClient:
         return self.start()
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        self.stop()
+        if exc_type is None:
+            self.stop()
+        else:
+            _best_effort(self.stop)
 
     @property
     def connected(self) -> bool:
@@ -736,8 +803,8 @@ class RemoteryClient:
             raise RemoteryError(f"failed to connect to {self.url}: {exc}") from exc
         try:
             self._handshake()
-        except Exception:
-            self.stop()
+        except BaseException:
+            _best_effort(self.stop)
             raise
         return self
 
@@ -800,6 +867,8 @@ class RemoteryClient:
         read_timeout: float = 0.25,
         max_frames: Optional[int] = None,
         close_on_stop: Optional[bool] = None,
+        on_finalize: Optional[Callable[[RemoteryCapture], None]] = None,
+        on_abort: Optional[Callable[[BaseException, RemoteryCapture], None]] = None,
     ) -> RemoteryRecording:
         """Start background recording and return a session stopped by `stop()`.
 
@@ -817,6 +886,8 @@ class RemoteryClient:
             read_timeout=read_timeout,
             max_frames=max_frames,
             close_on_stop=close_on_stop,
+            on_finalize=on_finalize,
+            on_abort=on_abort,
         ).start()
 
     def get_properties(

@@ -12,6 +12,7 @@ import unittest
 import urllib.parse
 import zlib
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +34,9 @@ from automation_bridge import (  # noqa: E402
     RemoteryCapture,
     RemoteryClient,
     RemoteryProtocolError,
+    RemoteryRecording,
     ScreenshotReceipt,
+    WaitTimeoutError,
     difference,
     wait_until,
 )
@@ -365,6 +368,49 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
         self.assertTrue(cancel[2]["release"])
 
+    def test_active_drag_interrupt_can_flush_later_input_without_masking(self):
+        class CleanupFailureClient(FakeInputClient):
+            cleanup_attempted = False
+
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/input/flush":
+                    self.cleanup_attempted = True
+                    raise RuntimeError("cleanup failed")
+                return super()._request(method, path, params, json_body=json_body)
+
+        bridge = CleanupFailureClient(statuses=[KeyboardInterrupt("stop")])
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
+            bridge.drag(
+                (0, 0),
+                (10, 10),
+                duration=0.1,
+                device="touch",
+                flush_on_interrupt=True,
+            )
+
+        self.assertTrue(bridge.cleanup_attempted)
+
+    def test_held_key_interrupt_requests_release(self):
+        bridge = FakeInputClient(statuses=[KeyboardInterrupt("key stop")])
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "key stop"):
+            bridge.key("KEY_ENTER", wait="released")
+
+        cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
+        self.assertTrue(cancel[2]["release"])
+
+    def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaises(KeyboardInterrupt):
+            with bridge.input.interruption_scope():
+                bridge.drag((0, 0), (10, 10), duration=0.1, wait=False)
+                wait_until(lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+        flush = next(request for request in bridge.api_requests if request[1] == "/input/flush")
+        self.assertTrue(flush[2]["release"])
+
     def test_pointer_context_exception_requests_cancel(self):
         bridge = FakeInputClient()
 
@@ -376,6 +422,19 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertIn("/input/pointer/open", [path for _, path, _ in bridge.api_requests])
         self.assertIn("/input/pointer/move", [path for _, path, _ in bridge.api_requests])
         self.assertIn("/input/cancel", [path for _, path, _ in bridge.api_requests])
+
+    def test_held_pointer_interrupt_survives_cancel_failure(self):
+        class CancelFailureClient(FakeInputClient):
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/input/cancel":
+                    raise RuntimeError("cancel failed")
+                return super()._request(method, path, params, json_body=json_body)
+
+        bridge = CancelFailureClient()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
+            with bridge.pointer((10, 20), lease=2.0):
+                raise KeyboardInterrupt("stop")
 
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
@@ -440,6 +499,56 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             with EngineLogStream("127.0.0.1", server.port, timeout=1.0, read_timeout=1.0) as logs:
                 self.assertEqual("INFO:TEST: hello", logs.readline(timeout=1.0))
                 self.assertEqual("WARNING:TEST: done", logs.readline(timeout=1.0))
+
+    def test_engine_log_interrupt_closes_stream_and_preserves_interrupt(self):
+        class InterruptingSocket:
+            def __init__(self):
+                self.timeout = None
+                self.closed = False
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def recv(self, size):
+                raise KeyboardInterrupt("log stop")
+
+            def close(self):
+                self.closed = True
+                raise RuntimeError("close failed")
+
+        stream = EngineLogStream.__new__(EngineLogStream)
+        stream._socket = InterruptingSocket()
+        stream._buffer = bytearray()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "log stop"):
+            stream.readline(timeout=0.1)
+
+        self.assertIsNone(stream._socket)
+
+    def test_log_timeout_restore_tolerates_concurrent_socket_close(self):
+        class ClosingSocket:
+            def __init__(self):
+                self.set_calls = 0
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.set_calls += 1
+                if self.set_calls == 2:
+                    raise OSError("already closed")
+
+            def recv(self, size):
+                return b""
+
+        stream = EngineLogStream.__new__(EngineLogStream)
+        stream._socket = ClosingSocket()
+        stream._buffer = bytearray()
+
+        self.assertIsNone(stream.readline(timeout=0.1))
 
     def test_read_logs_collects_future_lines(self):
         bridge = FakeEngineClient()
@@ -809,6 +918,141 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(1.0, difference(black, white))
         self.assertEqual(0.0, difference(black, transparent_black))
         self.assertEqual(0.25, difference(black, transparent_black, include_alpha=True))
+
+    def test_recording_context_abort_hook_cannot_mask_interrupt(self):
+        class RecordingClient:
+            connected = True
+
+            def __init__(self):
+                self.stopped = 0
+
+            def stop(self):
+                self.stopped += 1
+
+        class IdleThread:
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                pass
+
+        client = RecordingClient()
+        hook_causes = []
+
+        def failing_abort_hook(cause, capture):
+            hook_causes.append(cause)
+            raise RuntimeError("hook failed")
+
+        recording = RemoteryRecording(
+            client,
+            close_on_stop=True,
+            on_abort=failing_abort_hook,
+        )
+        recording._thread = IdleThread()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "recording stop"):
+            with recording:
+                raise KeyboardInterrupt("recording stop")
+
+        self.assertEqual("recording stop", str(hook_causes[0]))
+        self.assertEqual(1, client.stopped)
+
+    def test_recording_finalize_hook_receives_capture(self):
+        class RecordingClient:
+            connected = True
+
+            def stop(self):
+                pass
+
+        captures = []
+        recording = RemoteryRecording(
+            RecordingClient(),
+            close_on_stop=True,
+            on_finalize=captures.append,
+        )
+
+        capture = recording.stop()
+
+        self.assertIs(capture, captures[0])
+
+    def test_interrupt_during_recorder_finalization_preserves_interrupt(self):
+        class FailingClient:
+            connected = True
+
+            def stop(self):
+                raise RuntimeError("socket close failed")
+
+        class InterruptingThread:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                raise KeyboardInterrupt("finalization stop")
+
+        aborts = []
+        recording = RemoteryRecording(
+            FailingClient(),
+            close_on_stop=True,
+            on_abort=lambda cause, capture: aborts.append(cause),
+        )
+        recording._thread = InterruptingThread()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "finalization stop"):
+            recording.stop()
+
+        self.assertEqual("finalization stop", str(aborts[0]))
+
+    def test_screenshot_wait_interrupt_escapes_immediately(self):
+        bridge = FakeInputClient()
+        bridge._request = lambda *args, **kwargs: {
+            "capture_id": 7,
+            "state": "pending",
+            "path": "/tmp/not-written.png",
+        }
+
+        with mock.patch("automation_bridge.client.wait_until", side_effect=KeyboardInterrupt("capture stop")):
+            with self.assertRaisesRegex(KeyboardInterrupt, "capture stop"):
+                bridge.screenshot(wait=True)
+
+    def test_wait_timeout_reports_last_observation_and_scene(self):
+        values = iter([{"ready": False, "scene_sequence": 7}, {"ready": False, "scene_sequence": 8}])
+        with mock.patch("automation_bridge.waits.time.monotonic", side_effect=[10.0, 10.0, 10.5]), mock.patch(
+            "automation_bridge.waits.time.sleep"
+        ):
+            with self.assertRaises(WaitTimeoutError) as raised:
+                wait_until(
+                    lambda: next(values),
+                    timeout=0.1,
+                    interval=0.1,
+                    message="event missing",
+                    predicate=lambda value: value["ready"],
+                )
+
+        error = raised.exception
+        self.assertEqual({"ready": False, "scene_sequence": 8}, error.last_value)
+        self.assertEqual(2, error.attempts)
+        self.assertEqual(8, error.scene_sequence)
+        self.assertEqual(0.5, error.elapsed)
+        self.assertIn("last_value=", str(error))
+
+    def test_wait_retries_only_selected_exceptions(self):
+        class TransientEventError(RuntimeError):
+            pass
+
+        with self.assertRaises(WaitTimeoutError) as raised:
+            wait_until(
+                lambda: (_ for _ in ()).throw(TransientEventError("cursor unavailable")),
+                timeout=0,
+                retry_exceptions=(TransientEventError,),
+            )
+
+        self.assertIsInstance(raised.exception.last_exception, TransientEventError)
+        with self.assertRaisesRegex(TypeError, "bug"):
+            wait_until(
+                lambda: (_ for _ in ()).throw(TypeError("bug")),
+                timeout=1,
+                retry_exceptions=(TransientEventError,),
+            )
 
 
 class FakeEngineClient(AutomationBridgeClient):
@@ -1263,7 +1507,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     @classmethod
     def close_bridge(cls):
-        if cls.bridge is None:
+        if getattr(cls, "bridge", None) is None:
             return
         bridge = cls.bridge
         cls.bridge = None
@@ -1469,6 +1713,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             timeout=5,
             interval=0.05,
             message=f"Remotery {self.SPRITE_COUNTER_NAME} did not match scene spritec count",
+            retry_exceptions=(AssertionError,),
         )
 
     def run_automation_bridge_api_end_to_end(self):

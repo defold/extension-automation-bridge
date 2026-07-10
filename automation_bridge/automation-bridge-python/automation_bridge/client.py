@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .nodes import Node
 from .receipts import ObservationReceipt, ScreenshotReceipt
-from .waits import wait_until
+from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
 
 
@@ -101,22 +101,27 @@ class EngineLogStream:
     ):
         self.host = host
         self.port = int(port)
-        self._socket = socket.create_connection((host, self.port), timeout=timeout)
+        self._socket: Optional[socket.socket] = socket.create_connection(
+            (host, self.port), timeout=timeout
+        )
         self._buffer = bytearray()
         try:
             status = self._readline_raw(timeout).decode("utf-8", "replace").rstrip("\r\n")
             if status != "0 OK":
                 raise AutomationBridgeError(f"log service rejected connection: {status}")
             self._socket.settimeout(read_timeout)
-        except Exception:
-            self.close()
+        except BaseException:
+            _cleanup_without_masking(self.close)
             raise
 
     def __enter__(self) -> "EngineLogStream":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+        else:
+            _cleanup_without_masking(self.close)
 
     def __iter__(self) -> "EngineLogStream":
         return self
@@ -129,8 +134,12 @@ class EngineLogStream:
 
     def close(self) -> None:
         """Close the underlying log service socket."""
+        sock = self._socket
+        self._socket = None
+        if sock is None:
+            return
         try:
-            self._socket.close()
+            sock.close()
         except OSError:
             pass
 
@@ -142,9 +151,13 @@ class EngineLogStream:
         return data.decode("utf-8", "replace").rstrip("\r\n")
 
     def _readline_raw(self, timeout: Optional[float] = None) -> bytes:
-        previous_timeout = self._socket.gettimeout()
+        sock = self._socket
+        if sock is None:
+            return b""
+        previous_timeout = sock.gettimeout()
+        timeout_changed = timeout is not None
         if timeout is not None:
-            self._socket.settimeout(timeout)
+            sock.settimeout(timeout)
         try:
             while True:
                 newline = self._buffer.find(b"\n")
@@ -153,7 +166,7 @@ class EngineLogStream:
                     del self._buffer[: newline + 1]
                     return line
 
-                chunk = self._socket.recv(4096)
+                chunk = sock.recv(4096)
                 if not chunk:
                     if not self._buffer:
                         return b""
@@ -163,16 +176,48 @@ class EngineLogStream:
                 self._buffer.extend(chunk)
         except socket.timeout:
             return b""
-        except KeyboardInterrupt:
-            self.close()
+        except BaseException:
+            _cleanup_without_masking(self.close)
             raise
         finally:
-            if timeout is not None:
+            if timeout_changed and self._socket is sock:
+                unwinding = sys.exc_info()[0] is not None
                 try:
-                    self._socket.settimeout(previous_timeout)
+                    sock.settimeout(previous_timeout)
                 except OSError:
-                    if sys.exc_info()[0] is None:
+                    # Concurrent socket closure makes restoration irrelevant.
+                    pass
+                except BaseException:
+                    # Socket closure or a second interruption during restoration
+                    # must not replace the exception already leaving recv().
+                    if not unwinding:
                         raise
+
+
+def _cleanup_without_masking(cleanup: Any) -> None:
+    """Run best-effort cleanup while preserving an already-active exception."""
+    try:
+        cleanup()
+    except BaseException:
+        pass
+
+
+class InputInterruptionScope:
+    """Flush this client's input session if an enclosed operation is interrupted."""
+
+    def __init__(self, controller: "InputController", flush: bool, release: bool):
+        self._controller = controller
+        self.flush = flush
+        self.release = release
+
+    def __enter__(self) -> "InputInterruptionScope":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is None:
+            return
+        if self.flush:
+            _cleanup_without_masking(lambda: self._controller.flush(release=self.release))
 
 
 class InputController:
@@ -239,13 +284,15 @@ class InputController:
                 time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
         except BaseException:
             if cancel_on_interrupt:
-                try:
+                def cleanup() -> None:
                     if flush_on_interrupt:
                         self.flush(release=True)
                     else:
                         self.cancel(input_id, release=True)
-                except Exception:
-                    pass
+
+                # Keep cleanup failures from replacing the original timeout,
+                # cancellation, KeyboardInterrupt, or API error.
+                _cleanup_without_masking(cleanup)
             raise
 
     def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
@@ -259,6 +306,21 @@ class InputController:
         params = self._bridge._input_params()
         params["release"] = release
         return self._bridge.post_json("/input/flush", params)
+
+    def interruption_scope(
+        self,
+        flush: bool = True,
+        release: bool = True,
+    ) -> InputInterruptionScope:
+        """Return a context that releases input if any enclosed operation fails.
+
+        This is useful when an interruption may happen outside an input wait,
+        for example while waiting for an application event or screenshot after
+        queueing input with ``wait=False``. With ``flush=True`` (the default),
+        both the active action and later actions owned by this client session
+        are cancelled. Cleanup failures never mask the original exception.
+        """
+        return InputInterruptionScope(self, flush=flush, release=release)
 
 
 class PointerSession:
@@ -281,10 +343,7 @@ class PointerSession:
         if self.closed:
             return
         if exc_type is not None:
-            try:
-                self.cancel()
-            except Exception:
-                pass
+            _cleanup_without_masking(self.cancel)
             return
         self.up()
 
@@ -514,6 +573,7 @@ class AutomationBridgeClient:
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
         self._remotery_url = remotery_url
         self._last_window_size: Optional[Tuple[int, int]] = None
+        self._last_scene_sequence: Optional[int] = None
         # Defold v1 exposes query-only control endpoints with a bounded resource
         # string, so defaults are compact while remaining random per process/session.
         self.client_id = client_id or f"py-{uuid.uuid4().hex[:12]}"
@@ -542,7 +602,7 @@ class AutomationBridgeClient:
                 try:
                     bridge = cls(service_port, remotery_url=remotery_url)
                     bridge.health()
-                except Exception:  # noqa: BLE001 - keep polling other candidate ports.
+                except AutomationBridgeError:
                     continue
                 if hasattr(editor, "remember_engine_service_port"):
                     editor.remember_engine_service_port(service_port)
@@ -560,8 +620,9 @@ class AutomationBridgeClient:
                 timeout=timeout,
                 interval=0.1,
                 message="Automation Bridge endpoint did not become ready",
+                retry_exceptions=(AutomationBridgeError,),
             )
-        except AssertionError:
+        except WaitTimeoutError:
             if not build:
                 raise
 
@@ -577,6 +638,7 @@ class AutomationBridgeClient:
             timeout=timeout,
             interval=0.1,
             message="Automation Bridge endpoint did not become ready after engine restart",
+            retry_exceptions=(AutomationBridgeError,),
         )
 
     @staticmethod
@@ -602,13 +664,19 @@ class AutomationBridgeClient:
         editor = EditorClient.from_project(root)
         return cls.from_editor(editor, build=build, timeout=timeout)
 
-    def wait_ready(self, timeout: float = 20.0) -> JsonDict:
+    def wait_ready(
+        self,
+        timeout: float = 20.0,
+        retry_exceptions: RetryExceptions = (AutomationBridgeError,),
+    ) -> JsonDict:
         """Wait until `/health` succeeds and return the health payload."""
         return wait_until(
             self.health,
             timeout=timeout,
             interval=0.1,
             message="Automation Bridge endpoint did not become ready",
+            retry_exceptions=retry_exceptions,
+            scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
         )
 
     def get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
@@ -721,6 +789,8 @@ class AutomationBridgeClient:
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
         timeout: float = 5.0,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue one FIFO click and optionally wait for the native release receipt."""
         if isinstance(target, Node):
@@ -736,7 +806,9 @@ class AutomationBridgeClient:
         if pointer_id:
             params["pointer_id"] = pointer_id
         receipt = InputReceipt(self.post_json("/input/click", params))
-        return self._wait_input_compat(receipt, wait, timeout)
+        return self._wait_input_compat(
+            receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
+        )
 
     def drag(
         self,
@@ -752,6 +824,8 @@ class AutomationBridgeClient:
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
         timeout: Optional[float] = None,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
         if self._is_node_ref(from_target) and self._is_node_ref(to_target):
@@ -777,7 +851,13 @@ class AutomationBridgeClient:
         if pointer_id:
             params["pointer_id"] = pointer_id
         receipt = InputReceipt(self.post_json("/input/drag", params))
-        return self._wait_input_compat(receipt, wait, timeout or max(5.0, duration + hold_before + hold_after + 5.0))
+        return self._wait_input_compat(
+            receipt,
+            wait,
+            timeout or max(5.0, duration + hold_before + hold_after + 5.0),
+            cancel_on_interrupt,
+            flush_on_interrupt,
+        )
 
     def drag_path(
         self,
@@ -793,6 +873,8 @@ class AutomationBridgeClient:
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
         timeout: Optional[float] = None,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Run one down/path/up gesture with native segment timing, easing, holds, and curves."""
         normalized_points = [self._point(point) for point in points]
@@ -832,7 +914,13 @@ class AutomationBridgeClient:
             }
         )
         receipt = InputReceipt(self.post_json("/input/drag_path", params))
-        return self._wait_input_compat(receipt, wait, timeout or max(5.0, total_duration + 5.0))
+        return self._wait_input_compat(
+            receipt,
+            wait,
+            timeout or max(5.0, total_duration + 5.0),
+            cancel_on_interrupt,
+            flush_on_interrupt,
+        )
 
     def pointer(
         self,
@@ -869,12 +957,16 @@ class AutomationBridgeClient:
         wait: Union[str, bool] = False,
         expected_scene_sequence: Optional[int] = None,
         timeout: float = 10.0,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue FIFO text input and optionally wait for native completion."""
         params = self._input_params()
         params.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self.post_json("/input/key", params))
-        return self._wait_input_compat(receipt, wait, timeout)
+        return self._wait_input_compat(
+            receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
+        )
 
     def key(
         self,
@@ -882,13 +974,17 @@ class AutomationBridgeClient:
         wait: Union[str, bool] = False,
         expected_scene_sequence: Optional[int] = None,
         timeout: float = 10.0,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue a FIFO special key such as `KEY_ENTER`."""
         keys = key if key.startswith("{") and key.endswith("}") else f"{{{key}}}"
         params = self._input_params()
         params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self.post_json("/input/key", params))
-        return self._wait_input_compat(receipt, wait, timeout)
+        return self._wait_input_compat(
+            receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
+        )
 
     def events(self, from_cursor: Union[str, int] = "now") -> EventStream:
         """Create a cursor subscription, resolving ``'now'`` before returning.
@@ -1041,7 +1137,13 @@ class AutomationBridgeClient:
             {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
         )
 
-    def screenshot(self, wait: bool = True, timeout: float = 5.0, after_frames: int = 0) -> ScreenshotReceipt:
+    def screenshot(
+        self,
+        wait: bool = True,
+        timeout: float = 5.0,
+        after_frames: int = 0,
+        retry_exceptions: RetryExceptions = (),
+    ) -> ScreenshotReceipt:
         """Schedule an atomic PNG capture and return its native completion receipt."""
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
@@ -1065,6 +1167,8 @@ class AutomationBridgeClient:
             timeout=timeout,
             interval=0.02,
             message=f"screenshot capture {receipt.capture_id} did not complete",
+            retry_exceptions=retry_exceptions,
+            scene_sequence=lambda: self._last_scene_sequence,
         )
 
     def convert_point(
@@ -1357,8 +1461,14 @@ class AutomationBridgeClient:
         selected = list(nodes if nodes is not None else self.nodes(**selector))
         return "\n".join(node.compact() for node in selected)
 
-    def wait_for_node(self, timeout: float = 10.0, interval: float = 0.1, **selector: Any) -> Node:
-        """Wait until `node(**selector)` succeeds."""
+    def wait_for_node(
+        self,
+        timeout: float = 10.0,
+        interval: float = 0.1,
+        retry_exceptions: RetryExceptions = (SelectorError,),
+        **selector: Any,
+    ) -> Node:
+        """Wait for one node, retrying only caller-approved exception types."""
         def one_node() -> Optional[Node]:
             nodes, _, _ = self._select_nodes(selector)
             return nodes[0] if len(nodes) == 1 else None
@@ -1368,6 +1478,8 @@ class AutomationBridgeClient:
             timeout=timeout,
             interval=interval,
             message=f"node did not appear: {selector}",
+            retry_exceptions=retry_exceptions,
+            scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
         )
 
     def wait_for_count(
@@ -1375,20 +1487,19 @@ class AutomationBridgeClient:
         expected: int,
         timeout: float = 10.0,
         interval: float = 0.1,
+        retry_exceptions: RetryExceptions = (),
         **selector: Any,
     ) -> int:
-        """Wait until `count(**selector)` equals `expected`."""
-        def count_if_expected() -> Optional[bool]:
-            count = self.count(**selector)
-            return True if count == expected else None
-
-        wait_until(
-            count_if_expected,
+        """Wait for an exact count, retaining each observed count in diagnostics."""
+        return wait_until(
+            lambda: self.count(**selector),
             timeout=timeout,
             interval=interval,
             message=f"node count did not become {expected}: {selector}",
+            retry_exceptions=retry_exceptions,
+            scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
+            predicate=lambda count: count == expected,
         )
-        return expected
 
     def wait_frames(self, count: int, timeout: float = 5.0, interval: float = 0.005) -> JsonDict:
         """Wait for ``count`` native engine updates and return the final frame receipt."""
@@ -1571,7 +1682,9 @@ class AutomationBridgeClient:
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
             raise AutomationBridgeApiError(code, message, status, response)
-        return response.get("data", {})
+        data = response.get("data", {})
+        self._remember_scene_sequence(data)
+        return data
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
         url = self.base_url + path
@@ -1589,7 +1702,9 @@ class AutomationBridgeClient:
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
             raise AutomationBridgeApiError(code, message, status, response)
-        return response.get("data", {})
+        data = response.get("data", {})
+        self._remember_scene_sequence(data)
+        return data
 
     def _input_params(self, lease: float = 5.0) -> Dict[str, Any]:
         """Return ownership and per-request correlation fields for mutating input calls."""
@@ -1607,6 +1722,8 @@ class AutomationBridgeClient:
         receipt: InputReceipt,
         wait: Union[str, bool, float, None],
         timeout: float,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         if wait is False or wait == 0:
             return receipt
@@ -1619,7 +1736,13 @@ class AutomationBridgeClient:
             timeout = float(wait)
         else:
             raise TypeError("wait must be a lifecycle state, bool, numeric timeout, or None")
-        return self.input.wait(receipt, state=state, timeout=timeout)
+        return self.input.wait(
+            receipt,
+            state=state,
+            timeout=timeout,
+            cancel_on_interrupt=cancel_on_interrupt,
+            flush_on_interrupt=flush_on_interrupt,
+        )
 
     @staticmethod
     def _input_duration(value: Any, name: str) -> float:
@@ -1646,6 +1769,13 @@ class AutomationBridgeClient:
         height = window.get("height")
         if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
             self._last_window_size = (width, height)
+
+    def _remember_scene_sequence(self, data: Any) -> None:
+        if not isinstance(data, Mapping):
+            return
+        sequence = data.get("scene_sequence")
+        if isinstance(sequence, int) and not isinstance(sequence, bool):
+            self._last_scene_sequence = sequence
 
     def _known_window_size(self) -> Tuple[int, int]:
         if self._last_window_size is None:

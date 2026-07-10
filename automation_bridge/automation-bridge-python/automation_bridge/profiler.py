@@ -1,7 +1,7 @@
 """Helpers for Defold's built-in engine profiler endpoints."""
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .client import AutomationBridgeError, HttpError, request_raw
 
@@ -100,6 +100,8 @@ class ProfilerClient:
         resolve_names: bool = True,
         read_timeout: float = 0.25,
         max_frames: Optional[int] = None,
+        on_finalize: Optional[Callable[["RemoteryCapture"], None]] = None,
+        on_abort: Optional[Callable[[BaseException, "RemoteryCapture"], None]] = None,
     ) -> "RemoteryRecording":
         """Start background Remotery recording until the returned session is stopped.
 
@@ -115,6 +117,8 @@ class ProfilerClient:
             read_timeout=read_timeout,
             max_frames=max_frames,
             close_on_stop=True,
+            on_finalize=on_finalize,
+            on_abort=on_abort,
         )
 
 
