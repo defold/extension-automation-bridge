@@ -83,6 +83,21 @@ class Node:
         return self.raw.get("url")
 
     @property
+    def automation_id(self) -> Optional[str]:
+        """Return the stable application-supplied automation id, if annotated."""
+        return self.raw.get("automation_id")
+
+    @property
+    def localization_key(self) -> Optional[str]:
+        """Return the application-supplied localization key, if annotated."""
+        return self.raw.get("localization_key")
+
+    @property
+    def role(self) -> Optional[str]:
+        """Return the application-supplied semantic role, if annotated."""
+        return self.raw.get("role")
+
+    @property
     def visible(self) -> bool:
         return bool(self.raw.get("visible"))
 
@@ -119,6 +134,6 @@ class Node:
             center_text = f" center=({center['x']},{center['y']})"
         text = f" text={self.text!r}" if self.text is not None else ""
         return (
-            f"id={self.id!r} name={self.name!r} type={self.type!r}{text} "
+            f"id={self.id!r} name={self.name!r} type={self.type!r}{text} automation_id={self.automation_id!r} "
             f"path={self.path!r} visible={self.visible} enabled={self.enabled}{center_text}"
         )

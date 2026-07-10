@@ -60,6 +60,7 @@ It uses a sample fixture whose sprite is offset from the parent game object orig
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
 - Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`, `type_text(...)`, `key(...)`, and `bridge.input` queue/status/cancel/flush/configure methods.
+- Application synchronization: `events(...)`, `wait_for_ack(...)`, `states(...)`, `state(...)`, `wait_for_state(...)`, `start_command(...)`, `command_status(...)`, `cancel_command(...)`, `command(...)`, and `mark(...)`.
 - Waits and screenshots: client methods `wait_for_node(...)`, `wait_for_count(...)`, and `screenshot(...)`, plus the module-level `wait_until(...)`.
 - Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
 - Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
@@ -125,7 +126,7 @@ detail = bridge.by_id(restart.id)
 item = bridge.parent(labels[0])
 ```
 
-Server-side filters are passed to the extension: `id`, `type`, `name`, `text`, `url`, `visible`, `limit`, and `include`.
+Server-side filters are passed to the extension: `id`, `type`, `name`, `text`, `url`, `automation_id`, `localization_key`, `role`, `visible`, `limit`, and `include`.
 
 Python adds stricter client-side filters: `enabled`, `kind`, `path`, `name_exact`, `text_exact`, `has_bounds`, and `visible_and_enabled`.
 
@@ -148,6 +149,9 @@ node.path
 node.parent_id
 node.text
 node.url
+node.automation_id
+node.localization_key
+node.role
 node.visible
 node.enabled
 node.raw
@@ -246,6 +250,76 @@ png = bridge.screenshot(wait=True, timeout=5)
 ```
 
 `wait_until(fn, timeout=..., interval=..., message=...)` polls until `fn()` returns a truthy value. Exceptions raised while polling are retried until timeout, then reported in the final `AssertionError`.
+
+## Race-free application synchronization
+
+Enable the Lua side in `game.project` before using application-defined events, state, commands, acknowledgements, or annotations:
+
+```ini
+[automation_bridge]
+application_api = 1
+```
+
+Resolve an event cursor before sending the action that may emit the event:
+
+```python
+with bridge.events(from_cursor="now") as events:
+    receipt = bridge.drag(start, target, wait="released")
+    completed = events.wait(
+        "my_game.operation_complete",
+        where={"operation_id": "op-42"},
+        timeout=20,
+    )
+```
+
+`EventStream` preserves unmatched events for later waits. The native ring is bounded; `EventBufferOverflow` reports the requested, oldest retained, and latest cursors instead of silently skipping data. Interrupting a wait leaves no persistent socket or background thread to clean up.
+
+Published state carries revisions:
+
+```python
+before = bridge.state("my_game.ui")
+bridge.command("my_game.begin_operation", {"id": "op-42"})
+ready = bridge.wait_for_state(
+    "my_game.ui.busy",
+    False,
+    after_revision=before.revision,
+    timeout=20,
+)
+```
+
+Without `after_revision`, a currently matching value is returned immediately. Pass `state_name=` when the state name cannot be inferred as the longest already-published prefix of the requested path.
+
+Commands are explicit registered functions, never arbitrary Lua source:
+
+```python
+accepted = bridge.start_command("my_game.load_fixture", {"name": "standard"})
+status = bridge.wait_for_command(accepted["command_id"])
+
+# Equivalent submit-and-wait form; raises if the terminal state is not completed.
+status = bridge.command("my_game.load_fixture", {"name": "standard"}, timeout=30)
+print(status["result"])
+```
+
+Command JSON and results are limited to 32 KiB and 16 nested levels. A client timeout attempts to cancel pending work and raises `CommandTimeout`. Running Lua callbacks cannot be preempted; the exception records a cancellation error in that case.
+
+Application acknowledgement is deliberately separate from native release:
+
+```python
+with bridge.events("now") as events:
+    receipt = bridge.click(button, wait="released")
+    acknowledgement = bridge.wait_for_ack(receipt.input_id, events=events)
+```
+
+The application must explicitly call `automation_bridge.ack(input_id, result)`. See the native documentation for the current input-id correlation limitation.
+
+Timeline markers carry both native and host recording-clock timestamps:
+
+```python
+bridge.mark("workflow_started")
+bridge.mark("result_visible", {"operation_id": "op-42"})
+```
+
+By default `mark()` supplies Python's monotonic clock in microseconds as the recording clock. A recorder with its own timebase can pass `recording_timestamp_us=` explicitly.
 
 ## Engine Control
 

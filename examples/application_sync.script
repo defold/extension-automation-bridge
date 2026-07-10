@@ -1,0 +1,29 @@
+-- Reference application-side setup. Copy the relevant calls into a script
+-- instance after enabling [automation_bridge] application_api = 1.
+
+function init(self)
+    automation_bridge.publish("example.ui", {
+        busy = false,
+        workflow_step = "ready",
+    })
+
+    automation_bridge.command("example.load_fixture", function(data)
+        automation_bridge.emit("example.fixture_loaded", { name = data.name })
+        return { loaded = data.name }
+    end)
+
+    automation_bridge.annotate("main:/ui#status", {
+        automation_id = "operation_status",
+        localization_key = "status_ready",
+        role = "status",
+    })
+end
+
+-- Call this only after the application has correlated a bridge input id with
+-- its semantic outcome. See docs/input-action-correlation.md.
+local function acknowledge_rejected_input(input_id)
+    automation_bridge.ack(input_id, {
+        accepted = false,
+        reason = "input_locked",
+    })
+end

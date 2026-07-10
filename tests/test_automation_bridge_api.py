@@ -23,8 +23,11 @@ from automation_bridge import (  # noqa: E402
     AutomationBridgeError,
     EditorClient,
     EngineLogStream,
+    EventBufferOverflow,
+    EventStream,
     InputExecutionError,
     InputReceipt,
+    Node,
     ProfilerClient,
     ProfilerDataError,
     RemoteryCapture,
@@ -115,6 +118,113 @@ def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
 
 
 class AutomationBridgeClientUnitTest(unittest.TestCase):
+    def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
+        class ScriptedClient:
+            timeout = 10.0
+
+            def __init__(self):
+                self.requests = []
+
+            def get(self, path, params=None):
+                self.requests.append((path, params))
+                if path == "/events/cursor":
+                    return {"cursor": 5, "oldest_cursor": 2}
+                if path == "/events":
+                    return {
+                        "events": [
+                            {"sequence": 5, "type": "event", "name": "other", "data": {"id": 1}},
+                            {"sequence": 6, "type": "event", "name": "done", "data": {"id": 42}},
+                        ],
+                        "next_cursor": 7,
+                        "overflow": False,
+                    }
+                raise AssertionError(path)
+
+        client = ScriptedClient()
+        stream = EventStream(client, from_cursor="now")
+
+        done = stream.wait("done", where={"id": 42}, timeout=0.1)
+        other = stream.wait("other", timeout=0.1)
+
+        self.assertEqual(5, client.requests[1][1]["cursor"])
+        self.assertEqual(6, done.sequence)
+        self.assertEqual(5, other.sequence)
+        self.assertEqual(2, len(client.requests))
+
+    def test_event_stream_reports_ring_overflow(self):
+        class OverflowClient:
+            timeout = 10.0
+
+            def get(self, path, params=None):
+                if path == "/events/cursor":
+                    return {"cursor": 20, "oldest_cursor": 10}
+                return {"events": [], "next_cursor": 10, "oldest_cursor": 10, "latest_cursor": 20, "overflow": True}
+
+        stream = EventStream(OverflowClient(), from_cursor=1)
+        with self.assertRaises(EventBufferOverflow) as raised:
+            stream.poll()
+        self.assertEqual(1, raised.exception.requested_cursor)
+        self.assertEqual(10, raised.exception.oldest_cursor)
+
+    def test_wait_for_state_can_require_a_new_revision(self):
+        class StateClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(12345)
+                self.requests = []
+
+            def _request(self, method, path, params=None):
+                self.requests.append((method, path, params))
+                if path == "/state":
+                    return {"states": [{"name": "ui", "value": {"busy": False}, "revision": 2}], "revision": 2}
+                if path == "/state/wait":
+                    return {"states": [{"name": "ui", "value": {"busy": True}, "revision": 3}], "revision": 3}
+                raise AssertionError(path)
+
+        bridge = StateClient()
+        result = bridge.wait_for_state("ui.busy", True, after_revision=2, timeout=0.1)
+
+        self.assertTrue(result.value)
+        self.assertEqual(3, result.revision)
+        self.assertEqual(2, bridge.requests[1][2]["after_revision"])
+
+    def test_semantic_node_metadata_is_typed(self):
+        node = Node(
+            {
+                "id": "n:1",
+                "automation_id": "operation_status",
+                "localization_key": "status_ready",
+                "role": "status",
+            }
+        )
+
+        self.assertEqual("operation_status", node.automation_id)
+        self.assertEqual("status_ready", node.localization_key)
+        self.assertEqual("status", node.role)
+
+    def test_command_and_marker_encode_bounded_json(self):
+        class ApplicationClient(AutomationBridgeClient):
+            def __init__(self):
+                super().__init__(12345)
+                self.requests = []
+
+            def _request(self, method, path, params=None):
+                self.requests.append((method, path, params))
+                if path == "/commands":
+                    return {"command_id": 9, "state": "pending"}
+                if path == "/markers":
+                    return {"event_sequence": 12}
+                raise AssertionError(path)
+
+        bridge = ApplicationClient()
+        accepted = bridge.start_command("test.load_fixture", {"name": "standard"}, timeout=2)
+        marker = bridge.mark("workflow_started", {"case": 7}, recording_timestamp_us=1234)
+
+        self.assertEqual(9, accepted["command_id"])
+        self.assertEqual('{"name":"standard"}', bridge.requests[0][2]["data"])
+        self.assertEqual(2000, bridge.requests[0][2]["timeout_ms"])
+        self.assertEqual(12, marker["event_sequence"])
+        self.assertEqual(1234, bridge.requests[1][2]["recording_timestamp_us"])
+
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
             def count(self, **selector):

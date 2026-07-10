@@ -14,6 +14,7 @@ from .client import (
 )
 from .editor import EditorClient
 from .nodes import Bounds, Node
+from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
 from .remotery import (
     RemoteryCapture,
@@ -42,6 +43,10 @@ __all__ = [
     "Bounds",
     "AutomationBridgeError",
     "EngineLogStream",
+    "CommandTimeout",
+    "Event",
+    "EventBufferOverflow",
+    "EventStream",
     "EditorClient",
     "HttpError",
     "InputController",
@@ -69,6 +74,7 @@ __all__ = [
     "RemoteryValueStats",
     "ResourceProfileEntry",
     "SelectorError",
+    "StateSnapshot",
     "parse_resources_data",
     "wait_until",
 ]

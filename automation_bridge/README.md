@@ -12,7 +12,15 @@ Find `<engine_service_port>` in the editor console line:
 INFO:ENGINE: Engine service started on port <port>
 ```
 
-No Lua setup is required for v1. The endpoint is available in debug builds where Defold's engine service web server is running.
+No Lua setup is required for scene inspection, input, screenshots, events, or timeline markers. The application-defined Lua API is debug-only and must be enabled explicitly:
+
+```ini
+[automation_bridge]
+application_api = 1
+event_capacity = 256
+```
+
+`event_capacity` is clamped to `16..4096` and defaults to `256`. Release builds expose neither the HTTP bridge nor the `automation_bridge` Lua module.
 
 Simple Automation Bridge endpoints take query parameters. Mutating `/input/*` endpoints also accept a flat `application/json` object (string, number, and boolean values) up to 32768 bytes so correlation ids, text, and waypoint payloads are not constrained by Defold's request-resource length. The Python wrapper uses JSON for all mutations. Other request bodies are rejected with `body_not_supported`; do not mix query parameters and a JSON body.
 
@@ -80,7 +88,7 @@ Node responses always include the basic fields:
 }
 ```
 
-Optional node fields include `text`, `url`, `resource`, `bounds`, `properties`, and `children`.
+Optional node fields include `text`, `url`, `resource`, `automation_id`, `localization_key`, `role`, `bounds`, `properties`, and `children`.
 
 `bounds` has screen, center, and normalized center coordinates:
 
@@ -177,6 +185,9 @@ Query parameters:
 - `name`: case-insensitive substring match.
 - `text`: case-insensitive substring match.
 - `url`: case-insensitive substring match.
+- `automation_id`: exact application-supplied automation id.
+- `localization_key`: exact application-supplied localization key.
+- `role`: exact application-supplied semantic role.
 - `visible`: optional boolean filter.
 - `include`: optional comma-separated include list.
 - `limit`: number of returned nodes, clamped to `0..500`. Default is `50`. Use `limit=0` to get counts without node payloads.
@@ -292,3 +303,77 @@ Response `data`:
 ```json
 { "path": "/tmp/automation-bridge/screenshot-123-1.png", "pending": true }
 ```
+
+## Application synchronization
+
+The application channel is optional. Core scene inspection and native input work without application changes. All names are limited to 128 bytes and use letters, numbers, `_`, `-`, `:`, and dot-separated namespace segments. Project-prefixed names such as `my_game.operation_complete` are recommended to avoid collisions.
+
+Application JSON is limited to 32 KiB and 16 nested array/object levels. Commands call registered functions only; there is no endpoint for arbitrary Lua evaluation.
+
+### Structured events and cursors
+
+Applications emit typed JSON from Lua:
+
+```lua
+automation_bridge.emit("my_game.operation_complete", {
+    operation_id = "op-42",
+    success = true,
+})
+```
+
+`GET /events/cursor` returns the next cursor and the oldest retained cursor. `GET /events?cursor=N&timeout_ms=10000&limit=100` long-polls for entries at or after `N`. Each event includes `sequence`, `type`, `name`, JSON `data`, engine `frame`, `native_timestamp_us`, `engine_instance_id`, and `scene_sequence`. `recording_timestamp_us` is present for recorder-correlated markers.
+
+The event ring is bounded. A cursor older than `oldest_cursor` returns `overflow: true`, the retained range, and no silent cursor advancement. Clients must explicitly decide whether to fail or resubscribe.
+
+### Published state
+
+```lua
+automation_bridge.publish("my_game.ui", {
+    busy = false,
+    workflow_step = "ready",
+})
+```
+
+`GET /state` returns all latest values plus the global `revision`. `GET /state?name=my_game.ui` selects an exact state name. `GET /state/wait?after_revision=12&timeout_ms=10000` long-polls until a newer publication. Every state includes its own revision, frame, and native timestamp, so a wait can require a publication newer than the state it already observed.
+
+### Named commands
+
+```lua
+automation_bridge.command("my_game.load_fixture", function(data)
+    load_fixture(data.name)
+    return { loaded = data.name }
+end)
+```
+
+Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-encoded-json>&timeout_ms=30000`. The `202` response contains a command id. Poll `GET /commands?id=<id>` for `pending`, `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua callbacks run on the engine update thread and cannot be safely preempted; a running cancellation returns `409 command_not_cancellable`.
+
+### Native delivery and application acknowledgement
+
+Native input receipts describe only bridge lifecycle stages such as accepted, started, and released. An application can separately report its semantic decision:
+
+```lua
+automation_bridge.ack(input_id, {
+    accepted = false,
+    reason = "input_locked",
+})
+```
+
+Acknowledgements are retained as `type="acknowledgement"`, `name="input.acknowledged"` events whose data contains `input_id` and `result`. They do not claim which script consumed an action. Automatic propagation of a native injection id into Defold's Lua input action requires an engine API that does not currently exist; see [`docs/input-action-correlation.md`](../docs/input-action-correlation.md).
+
+### Semantic annotations
+
+Rendered text does not reveal a localization key. Applications can annotate a public scene-node URL instead:
+
+```lua
+automation_bridge.annotate("main:/ui#status", {
+    automation_id = "operation_status",
+    localization_key = "status_ready",
+    role = "status",
+})
+```
+
+Annotations are copied into matching scene snapshots and can be queried with the exact `automation_id`, `localization_key`, and `role` node filters. Metadata is application-owned and disappears when the engine instance exits.
+
+### Timeline markers
+
+`POST /markers?name=workflow_started&data=<url-encoded-json>&recording_timestamp_us=...` inserts a `marker` event. Native monotonic time is always recorded. The optional recording timestamp is supplied by the companion recorder's clock, allowing sidecar export without coupling marker collection to a particular recorder.

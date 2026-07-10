@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .nodes import Node
 from .waits import wait_until
+from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
 
 
 JsonDict = Dict[str, Any]
@@ -464,7 +465,17 @@ def _encode_system_reboot(args: Sequence[str]) -> bytes:
 class AutomationBridgeClient:
     """High-level client for `/automation-bridge/v1` scene inspection and input control."""
 
-    _SERVER_FILTERS = {"id", "type", "name", "text", "url", "visible"}
+    _SERVER_FILTERS = {
+        "id",
+        "type",
+        "name",
+        "text",
+        "url",
+        "visible",
+        "automation_id",
+        "localization_key",
+        "role",
+    }
     _CLIENT_FILTERS = {
         "enabled",
         "kind",
@@ -606,6 +617,10 @@ class AutomationBridgeClient:
     def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
         """PUT an Automation Bridge API path with query parameters and return `data`."""
         return self._request("PUT", path, params)
+
+    def delete(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
+        """DELETE an Automation Bridge API path and return its `data` object."""
+        return self._request("DELETE", path, params)
 
     def health(self) -> JsonDict:
         """Return API version, capabilities, platform, and screen data."""
@@ -866,6 +881,157 @@ class AutomationBridgeClient:
         params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self.post_json("/input/key", params))
         return self._wait_input_compat(receipt, wait, timeout)
+
+    def events(self, from_cursor: Union[str, int] = "now") -> EventStream:
+        """Create a cursor subscription, resolving ``'now'`` before returning.
+
+        Use ``with bridge.events('now') as events`` before sending an action to
+        avoid the classic subscribe-after-action race.
+        """
+        return EventStream(self, from_cursor=from_cursor)
+
+    def wait_for_ack(
+        self,
+        input_id: int,
+        timeout: float = 10.0,
+        events: Optional[EventStream] = None,
+    ) -> Event:
+        """Wait for the application's opt-in acknowledgement of ``input_id``.
+
+        Native input release and application acknowledgement are separate
+        lifecycle stages. Pass a stream created before the input for strict
+        race-free ordering; without one this searches the retained ring.
+        """
+        stream = events or self.events(from_cursor="oldest")
+        try:
+            return stream.wait(
+                "input.acknowledged",
+                where={"input_id": int(input_id)},
+                event_type="acknowledgement",
+                timeout=timeout,
+            )
+        finally:
+            if events is None:
+                stream.close()
+
+    def states(self, name: Optional[str] = None) -> JsonDict:
+        """Return published JSON states and the latest global revision."""
+        return self.get("/state", {"name": name} if name is not None else None)
+
+    def state(self, name: str) -> StateSnapshot:
+        """Return one published state by its exact application name."""
+        entries = self.states(name=name).get("states", [])
+        if len(entries) != 1 or not isinstance(entries[0], Mapping):
+            raise AutomationBridgeError(f"published state {name!r} is unavailable")
+        return StateSnapshot(entries[0])
+
+    def wait_for_state(
+        self,
+        path: str,
+        expected: Any,
+        timeout: float = 10.0,
+        after_revision: Optional[int] = None,
+        state_name: Optional[str] = None,
+    ) -> StateSnapshot:
+        """Wait for a JSON state path to equal ``expected`` without missing revisions.
+
+        Pass ``after_revision=bridge.state(name).revision`` when an already
+        matching value must not satisfy a wait for a *new* publication.
+        ``state_name`` disambiguates a path before that state has first appeared.
+        """
+        snapshot = self.states()
+        entries = [item for item in snapshot.get("states", []) if isinstance(item, Mapping)]
+        current_revision = int(snapshot.get("revision", 0))
+        selected = select_state_path(entries, path, state_name=state_name)
+        if after_revision is None and selected is not None and selected.value == expected:
+            return selected
+        cursor = current_revision if after_revision is None else int(after_revision)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                observed = selected.value if selected is not None else "<unpublished>"
+                raise TimeoutError(
+                    f"state {path!r} did not become {expected!r} within {timeout:g}s; "
+                    f"last value={observed!r}, revision={cursor}"
+                )
+            safe_wait = min(remaining, max(0.0, float(self.timeout) - 0.1), 1.0)
+            changed = self.get(
+                "/state/wait",
+                {"after_revision": cursor, "timeout_ms": int(safe_wait * 1000), "name": state_name},
+            )
+            cursor = max(cursor, int(changed.get("revision", cursor)))
+            changed_entries = [item for item in changed.get("states", []) if isinstance(item, Mapping)]
+            candidate = select_state_path(changed_entries, path, state_name=state_name)
+            if candidate is not None:
+                selected = candidate
+                if candidate.value == expected and candidate.revision > (after_revision or 0):
+                    return candidate
+
+    def start_command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
+        """Submit a registered named Lua command and return its pending id."""
+        if timeout <= 0 or timeout > 300:
+            raise ValueError("command timeout must be greater than 0 and at most 300 seconds")
+        payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > 32768:
+            raise ValueError("command JSON payload exceeds 32768 bytes")
+        return self.post(
+            "/commands",
+            {"name": name, "data": payload, "timeout_ms": max(1, int(timeout * 1000))},
+        )
+
+    def command_status(self, command_id: int) -> JsonDict:
+        """Return command state, JSON result, error, and timestamps."""
+        return self.get("/commands", {"id": int(command_id)})
+
+    def cancel_command(self, command_id: int) -> JsonDict:
+        """Cancel a queued command; running Lua callbacks are never preempted."""
+        return self.delete("/commands", {"id": int(command_id)})
+
+    def wait_for_command(self, command_id: int, timeout: float = 30.0, interval: float = 0.02) -> JsonDict:
+        """Wait for a command result, cancelling a still-pending command on timeout."""
+        deadline = time.monotonic() + timeout
+        terminal = {"completed", "failed", "cancelled", "timed_out"}
+        while True:
+            status = self.command_status(command_id)
+            if status.get("state") in terminal:
+                return status
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                cancellation_error: Optional[BaseException] = None
+                try:
+                    self.cancel_command(command_id)
+                except AutomationBridgeError as exc:
+                    cancellation_error = exc
+                raise CommandTimeout(command_id, timeout, cancellation_error) from cancellation_error
+            time.sleep(min(interval, remaining))
+
+    def command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
+        """Run a registered command and return its terminal result record."""
+        accepted = self.start_command(name, data=data, timeout=timeout)
+        result = self.wait_for_command(int(accepted["command_id"]), timeout=timeout)
+        if result.get("state") != "completed":
+            raise AutomationBridgeError(
+                f"command {result.get('command_id')} {result.get('state')}: {result.get('error')}"
+            )
+        return result
+
+    def mark(
+        self,
+        name: str,
+        data: Any = None,
+        recording_timestamp_us: Optional[int] = None,
+    ) -> JsonDict:
+        """Add a trace marker with native and host recording-clock timestamps."""
+        payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > 32768:
+            raise ValueError("marker JSON payload exceeds 32768 bytes")
+        if recording_timestamp_us is None:
+            recording_timestamp_us = time.monotonic_ns() // 1000
+        return self.post(
+            "/markers",
+            {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
+        )
 
     def screenshot(self, wait: bool = True, timeout: float = 5.0) -> Path:
         """Schedule a screenshot and optionally wait for the PNG file."""
