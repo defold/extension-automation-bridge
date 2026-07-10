@@ -1,6 +1,17 @@
 """Public exports for the Automation Bridge Python wrapper."""
 
-from .client import AutomationBridgeApiError, AutomationBridgeClient, AutomationBridgeError, EngineLogStream, HttpError, SelectorError
+from .client import (
+    AutomationBridgeApiError,
+    AutomationBridgeClient,
+    AutomationBridgeError,
+    EngineLogStream,
+    HttpError,
+    InputController,
+    InputExecutionError,
+    InputReceipt,
+    PointerSession,
+    SelectorError,
+)
 from .editor import EditorClient
 from .nodes import Bounds, Node
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
@@ -33,9 +44,13 @@ __all__ = [
     "EngineLogStream",
     "EditorClient",
     "HttpError",
+    "InputController",
+    "InputExecutionError",
+    "InputReceipt",
     "Node",
     "ProfilerClient",
     "ProfilerDataError",
+    "PointerSession",
     "RemoteryCapture",
     "RemoteryClient",
     "RemoteryCounterStats",

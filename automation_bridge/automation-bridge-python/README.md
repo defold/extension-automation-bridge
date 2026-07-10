@@ -59,7 +59,7 @@ It uses a sample fixture whose sprite is offset from the parent game object orig
 - Raw API passthrough: `get(path, params=None)`, `post(path, params=None)`, and `put(path, params=None)`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
-- Input: `click(...)`, `drag(...)`, `type_text(...)`, and `key(...)`.
+- Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`, `type_text(...)`, `key(...)`, and `bridge.input` queue/status/cancel/flush/configure methods.
 - Waits and screenshots: client methods `wait_for_node(...)`, `wait_for_count(...)`, and `screenshot(...)`, plus the module-level `wait_until(...)`.
 - Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
 - Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
@@ -67,7 +67,7 @@ It uses a sample fixture whose sprite is offset from the parent game object orig
 
 `EditorClient` exposes editor-oriented helpers for advanced bootstrap flows: `from_project(...)`, `build(...)`, `console_lines()`, `engine_service_port()`, `engine_service_ports()`, `latest_registration_engine_service_ports()`, `latest_registration_has_engine_service_port()`, `last_build_had_engine_service_port()`, `endpoint_registered_count()`, `remotery_url()`, `remotery_urls()`, `latest_registration_remotery_urls()`, `remember_engine_service_port(...)`, and `remember_remotery_url(...)`.
 
-Typed response wrappers include `Node`, `Bounds`, `ResourceProfileEntry`, `RemoteryFrame`, `RemoterySample`, `RemoterySampleAggregate`, `RemoteryCapture`, `RemoteryScopeStats`, `RemoteryCounterStats`, `RemoteryProperty`, `RemoteryPropertyFrame`, `RemoteryPropertyEntry`, `RemoteryTimingStats`, `RemoteryValueStats`, and `RemoteryRecording`. `EngineLogStream`, `ProfilerClient`, and `RemoteryClient` are also exported for direct use. These are lightweight snapshots around native engine data; re-query after clicks, drags, or scene changes.
+Typed response wrappers include `Node`, `Bounds`, `InputReceipt`, `PointerSession`, `ResourceProfileEntry`, `RemoteryFrame`, `RemoterySample`, `RemoterySampleAggregate`, `RemoteryCapture`, `RemoteryScopeStats`, `RemoteryCounterStats`, `RemoteryProperty`, `RemoteryPropertyFrame`, `RemoteryPropertyEntry`, `RemoteryTimingStats`, `RemoteryValueStats`, and `RemoteryRecording`. `InputController`, `EngineLogStream`, `ProfilerClient`, and `RemoteryClient` are also exported for direct use. These are lightweight snapshots around native engine data; re-query after clicks, drags, or scene changes.
 
 ## Bootstrap
 
@@ -165,25 +165,64 @@ for child in node.children:
 ## Input
 
 ```python
-bridge.click(node)
-bridge.click(node.id)
-bridge.click(480, 320)
-bridge.click((480, 320))
-bridge.click({"x": 480, "y": 320})
-bridge.click({"center": {"x": 480, "y": 320}})
-bridge.click(node, visualize=False)
+click = bridge.click(node)
+print(click.input_id, click.state, click.start_frame, click.release_frame)
 
 bridge.drag(first_node, second_node, duration=0.16)
-bridge.drag(first_node.center, second_node.center, duration=0.16)
-bridge.drag(first_node, second_node, duration=0.16, visualize=False)
+bridge.drag(
+    first_node,
+    second_node,
+    duration=0.16,
+    easing="ease_in_out",
+    hold_before=0.04,
+    hold_after=0.02,
+    visualize=False,
+)
+
+path = bridge.drag_path(
+    [(100, 200), (160, 140), (240, 220), (320, 180)],
+    durations=[0.15, 0.22, 0.18],
+    easing=["ease_in", "ease_in_out", "ease_out"],
+    hold_before=0.08,
+    hold_after=0.04,
+)
 
 bridge.type_text("hello")
 bridge.key("KEY_ENTER")
 ```
 
-Mouse/touch input visualization is on by default in the native endpoint: clicks draw a growing circle and drags draw a line for one second. Pass `visualize=False` to `click()` or `drag()` to disable it for that input. Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
+Input is native FIFO: one gesture/key action owns HID state at a time. Each `AutomationBridgeClient` creates stable, compact `client_id` and `session_id` values and a new compact `request_id` per mutation; callers may pass explicit ids to the constructor for external correlation. Input mutations use `application/json` bodies so ids, text, and paths are not truncated by Defold's bounded request-resource string; raw query forms remain available for curl-level use. The first session holds a renewable controller lease while other clients remain read-only observers.
+
+`click()`, `drag()`, and `drag_path()` default to `wait="released"`. This polls the native receipt instead of sleeping for the requested duration. `released` means the engine injected the final up; it does not claim application acceptance. Use `wait="accepted"`, `wait="started"`, or `wait=False` as needed. `InputReceipt` remains dictionary-compatible and exposes keys as attributes. It includes accepted/start/release frames and monotonic timestamps, requested/actual duration, failure/cancellation reason, all correlation ids, engine instance/frame, scene sequence, device, and pointer id.
+
+Configure exclusive devices and inspect/control the queue through `bridge.input`:
+
+```python
+bridge.input.configure(device="mouse", visualize=False, lease=10)
+pending = bridge.input.pending()
+current = bridge.input.status(path.input_id)
+bridge.input.cancel(current.input_id, release=True)
+bridge.input.flush(release=True)
+```
+
+`auto`, `mouse`, and `touch` are capability-gated by the native endpoint. A gesture uses exactly one device and never produces duplicate mouse+touch actions. Touch is conservatively supported on native touch platforms because Defold's public HID API does not expose a reliable connected-touch-hardware query.
+
+Continuous sampled, quadratic, and cubic paths contain exactly one down and one up. Sampled/linear paths take one duration/easing per segment; quadratic paths take three points and one duration/easing; cubic paths take four. Native validation limits paths to 2–128 points and total gesture time to 60 seconds. Visualization follows positions actually injected each engine update, including curves.
+
+For low-level control, use a leased pointer context. Normal exit injects up; exceptions and `KeyboardInterrupt` request cancellation/release without masking the original exception; lease expiry also cleans up if the Python process disappears:
+
+```python
+with bridge.pointer((100, 200), lease=2.0) as pointer:
+    pointer.move((180, 160), duration=0.2, easing="ease_in_out")
+    pointer.hold(0.1)
+    pointer.move((300, 220), duration=0.3, easing="ease_out")
+```
+
+Input waits cancel the active input on interruption by default. Use `bridge.input.wait(receipt, flush_on_interrupt=True)` when interruption should also cancel later inputs from this session. Log reads close their socket and preserve `KeyboardInterrupt`; timeout restoration cannot mask the original exception.
 
 `Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `bridge.by_id(node.id)` or query again.
+
+Pass `expected_scene_sequence=scene["scene_sequence"]` to click/drag/path/pointer/key calls when stale target protection matters. The native endpoint rejects a changed scene with `stale_scene` before resolving node ids, and every receipt records the scene sequence actually used.
 
 Component nodes often expose useful text or properties, while their parent game object is the actionable target. Use `bridge.parent(component_node)` before clicking or dragging when needed:
 
@@ -357,6 +396,7 @@ All custom errors inherit from `AutomationBridgeError`.
 
 - `HttpError`: transport failures or invalid JSON.
 - `AutomationBridgeApiError`: extension returned `{ "ok": false }`.
+- `InputExecutionError`: accepted input ended as native `cancelled` or `failed`; `.receipt` has the reason and lifecycle metadata.
 - `SelectorError`: `node()` or `maybe_node()` found the wrong number of nodes.
 - `ProfilerDataError`: a Defold profiler endpoint returned malformed or unexpected binary data.
 - `RemoteryError`: base class for Remotery websocket connection, timeout, and protocol errors.

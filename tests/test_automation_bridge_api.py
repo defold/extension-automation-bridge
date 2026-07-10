@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import json
 import os
 import socket
 import struct
@@ -8,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+import urllib.parse
 import zlib
 from pathlib import Path
 
@@ -21,6 +23,8 @@ from automation_bridge import (  # noqa: E402
     AutomationBridgeError,
     EditorClient,
     EngineLogStream,
+    InputExecutionError,
+    InputReceipt,
     ProfilerClient,
     ProfilerDataError,
     RemoteryCapture,
@@ -157,26 +161,98 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual([], bridge.api_requests)
 
     def test_click_visualize_false_is_encoded(self):
-        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+        with FakeHttpServer(b'{"ok":true,"data":{"input_id":1,"state":"accepted"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.click(10, 20, wait=0, visualize=False)
 
-        self.assertEqual(
-            "POST /automation-bridge/v1/input/click?x=10&y=20&visualize=0 HTTP/1.1",
-            server.request_line,
-        )
+        method, target, _ = server.request_line.split(" ")
+        parsed = urllib.parse.urlsplit(target)
+        payload = json.loads(server.request_body.decode("utf-8"))
+        self.assertEqual("POST", method)
+        self.assertEqual("/automation-bridge/v1/input/click", parsed.path)
+        self.assertEqual(10, payload["x"])
+        self.assertEqual(20, payload["y"])
+        self.assertFalse(payload["visualize"])
+        self.assertEqual("test-client", payload["client_id"])
+        self.assertEqual("test-session", payload["session_id"])
+        self.assertEqual(14, len(payload["request_id"]))
 
     def test_drag_visualize_false_is_encoded(self):
-        with FakeHttpServer(b'{"ok":true,"data":{"queued":"drag"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+        with FakeHttpServer(b'{"ok":true,"data":{"input_id":2,"state":"accepted"}}') as server:
+            bridge = AutomationBridgeClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.drag((10, 20), (30, 40), duration=0.1, wait=0, visualize=False)
 
-        self.assertEqual(
-            "POST /automation-bridge/v1/input/drag?x1=10&y1=20&x2=30&y2=40&duration=0.1&visualize=0 HTTP/1.1",
-            server.request_line,
+        method, target, _ = server.request_line.split(" ")
+        parsed = urllib.parse.urlsplit(target)
+        payload = json.loads(server.request_body.decode("utf-8"))
+        self.assertEqual("POST", method)
+        self.assertEqual("/automation-bridge/v1/input/drag", parsed.path)
+        self.assertEqual(10, payload["x1"])
+        self.assertEqual(40, payload["y2"])
+        self.assertEqual(0.1, payload["duration"])
+        self.assertFalse(payload["visualize"])
+
+    def test_drag_path_serializes_segments_and_correlation(self):
+        bridge = FakeInputClient()
+
+        receipt = bridge.drag_path(
+            [(1, 2), (3, 4), (5, 6)],
+            durations=[0.1, 0.2],
+            easing=["ease_in", "ease_out"],
+            hold_before=0.03,
+            hold_after=0.04,
+            wait=False,
+            expected_scene_sequence=7,
         )
+
+        self.assertIsInstance(receipt, InputReceipt)
+        self.assertEqual(42, receipt.input_id)
+        _, path, params = bridge.api_requests[-1]
+        self.assertEqual("/input/drag_path", path)
+        self.assertEqual("1,2;3,4;5,6", params["points"])
+        self.assertEqual("0.1,0.2", params["durations"])
+        self.assertEqual("ease_in,ease_out", params["easing"])
+        self.assertEqual(7, params["expected_scene_sequence"])
+        self.assertEqual("test-client", params["client_id"])
+        self.assertEqual("test-session", params["session_id"])
+
+    def test_input_wait_uses_native_status_until_released(self):
+        bridge = FakeInputClient(statuses=["started", "released"])
+        accepted = InputReceipt({"input_id": 42, "state": "accepted"})
+
+        released = bridge.input.wait(accepted, timeout=0.1, interval=0)
+
+        self.assertEqual("released", released.state)
+        self.assertEqual(2, sum(1 for method, path, _ in bridge.api_requests if method == "GET" and path == "/input/status"))
+
+    def test_input_wait_reports_native_failure(self):
+        bridge = FakeInputClient(statuses=["failed"])
+
+        with self.assertRaisesRegex(InputExecutionError, "device_unavailable"):
+            bridge.input.wait({"input_id": 42, "state": "accepted"}, timeout=0.1, interval=0)
+
+    def test_input_wait_interrupt_cancels_without_masking_interrupt(self):
+        bridge = FakeInputClient(statuses=[KeyboardInterrupt()])
+
+        with self.assertRaises(KeyboardInterrupt):
+            bridge.input.wait({"input_id": 42, "state": "accepted"}, timeout=0.1, interval=0)
+
+        cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
+        self.assertTrue(cancel[2]["release"])
+
+    def test_pointer_context_exception_requests_cancel(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(RuntimeError, "original"):
+            with bridge.pointer((10, 20), lease=2.0) as pointer:
+                pointer.move((20, 30), duration=0.1, easing="ease_in_out")
+                raise RuntimeError("original")
+
+        self.assertIn("/input/pointer/open", [path for _, path, _ in bridge.api_requests])
+        self.assertIn("/input/pointer/move", [path for _, path, _ in bridge.api_requests])
+        self.assertIn("/input/cancel", [path for _, path, _ in bridge.api_requests])
 
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
@@ -489,6 +565,42 @@ class FakeEngineClient(AutomationBridgeClient):
         return self._engine_info
 
 
+class FakeInputClient(AutomationBridgeClient):
+    def __init__(self, statuses=None):
+        super().__init__(12345, client_id="test-client", session_id="test-session")
+        self.api_requests = []
+        self.statuses = list(statuses or [])
+
+    def _request(self, method, path, params=None):
+        params = dict(params) if params is not None else None
+        self.api_requests.append((method, path, params))
+        if method == "GET" and path == "/input/status":
+            state = self.statuses.pop(0) if self.statuses else "released"
+            if isinstance(state, BaseException):
+                raise state
+            return {
+                "input_id": int(params["input_id"]),
+                "state": state,
+                "reason": "device_unavailable" if state == "failed" else None,
+            }
+        if method == "GET" and path == "/input/pending":
+            return {"inputs": [], "count": 0}
+        if path == "/input/flush":
+            return {"cancel_requested": 1, "release": bool(params["release"])}
+        if path == "/input/configure":
+            return {"device": params["device"], "visualize": params.get("visualize", True)}
+        if path.startswith("/input/"):
+            return {
+                "input_id": int(params.get("input_id", 42)),
+                "state": "started" if path == "/input/cancel" else "accepted",
+                "request_id": params.get("request_id"),
+            }
+        raise AssertionError(f"unexpected request: {method} {path} {params}")
+
+    def _request_json(self, method, path, payload):
+        return self._request(method, path, payload)
+
+
 class RebootReadyClient(FakeEngineClient):
     def __init__(self, failures=0):
         super().__init__()
@@ -673,6 +785,7 @@ class FakeHttpServer:
         self.reason = reason
         self.port = 0
         self.request_line = None
+        self.request_body = b""
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._thread = None
         self._error = None
@@ -696,8 +809,26 @@ class FakeHttpServer:
         try:
             client, _ = self._socket.accept()
             with client:
-                request = client.recv(4096).decode("iso-8859-1", "replace")
+                request_bytes = bytearray()
+                while b"\r\n\r\n" not in request_bytes:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    request_bytes.extend(chunk)
+                header_bytes, _, initial_body = bytes(request_bytes).partition(b"\r\n\r\n")
+                content_length = 0
+                for line in header_bytes.split(b"\r\n")[1:]:
+                    if line.lower().startswith(b"content-length:"):
+                        content_length = int(line.split(b":", 1)[1].strip())
+                body = bytearray(initial_body)
+                while len(body) < content_length:
+                    chunk = client.recv(content_length - len(body))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                request = request_bytes.decode("iso-8859-1", "replace")
                 self.request_line = request.splitlines()[0] if request else ""
+                self.request_body = bytes(body)
                 headers = (
                     f"HTTP/1.1 {self.status} {self.reason}\r\n"
                     f"Content-Length: {len(self.body)}\r\n"
@@ -888,7 +1019,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
-    def test_drag_negative_duration_is_clamped_in_response(self):
+    def test_drag_negative_duration_is_rejected(self):
         self.ensure_running_bridge()
         self.reset_if_popup_is_visible()
         spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
@@ -902,11 +1033,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         before = self.label_count("L1")
         first, second = self.parents_for_label("L1")[:2]
 
-        response = self.bridge.drag(first, second, duration=-0.25, wait=0.2)
+        with self.assertRaises(AutomationBridgeApiError) as raised:
+            self.bridge.drag(first, second, duration=-0.25, wait=False)
 
-        self.assertEqual("drag", response["queued"])
-        self.assertEqual(0, response["duration"])
-        self.wait_for_merge("L1", before, "L2")
+        self.assertEqual("bad_request", raised.exception.code)
+        self.assertEqual(before, self.label_count("L1"))
 
     def test_drag_visualization_is_visible_in_screenshot(self):
         self.ensure_running_bridge()
@@ -1093,11 +1224,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assert_drag_merge_by_coordinates("L1", expected_new_level="L2")
 
         text_key = self.bridge.type_text("hello")
-        self.assertEqual("key", text_key["queued"])
-        self.assertEqual(5, text_key["length"])
+        self.assertEqual("key", text_key["kind"])
+        self.assertEqual("accepted", text_key["state"])
 
         special_key = self.bridge.key("KEY_ENTER")
-        self.assertEqual("key", special_key["queued"])
+        self.assertEqual("key", special_key["kind"])
 
         self.finish_merge_game()
         gui_nodes = self.bridge.nodes(
@@ -1140,9 +1271,9 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertLessEqual(distance, 2.0)
 
         response = self.bridge.click(fixture, wait=0.1)
-        self.assertEqual("click", response["queued"])
-        self.assertAlmostEqual(fixture_x, response["x"], delta=0.5)
-        self.assertAlmostEqual(fixture_y, response["y"], delta=0.5)
+        self.assertEqual("click", response["kind"])
+        self.assertEqual("released", response["state"])
+        self.assertEqual("mouse", response["device"])
 
     def assert_spawned_by_node_click(self, node):
         before = self.label_count("L1")

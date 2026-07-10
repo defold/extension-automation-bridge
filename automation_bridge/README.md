@@ -14,7 +14,7 @@ INFO:ENGINE: Engine service started on port <port>
 
 No Lua setup is required for v1. The endpoint is available in debug builds where Defold's engine service web server is running.
 
-All Automation Bridge endpoints take query parameters only. Request bodies are rejected with `body_not_supported`.
+Simple Automation Bridge endpoints take query parameters. Mutating `/input/*` endpoints also accept a flat `application/json` object (string, number, and boolean values) up to 32768 bytes so correlation ids, text, and waypoint payloads are not constrained by Defold's request-resource length. The Python wrapper uses JSON for all mutations. Other request bodies are rejected with `body_not_supported`; do not mix query parameters and a JSON body.
 
 ```sh
 ENGINE_PORT=51337
@@ -37,7 +37,7 @@ Error responses use this envelope and an appropriate HTTP status:
 { "ok": false, "error": { "code": "not_found", "message": "..." } }
 ```
 
-Common error codes include `bad_request`, `not_found`, `method_not_allowed`, `body_not_supported`, `input_queue_full`, `input_too_large`, `screen_resize_failed`, `screenshot_unsupported`, `screenshot_path_failed`, and `screenshot_pending`.
+Common error codes include `bad_request`, `not_found`, `method_not_allowed`, `body_not_supported`, `input_queue_full`, `input_too_large`, `input_controller_busy`, `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`, `stale_scene`, `screen_resize_failed`, `screenshot_unsupported`, `screenshot_path_failed`, and `screenshot_pending`.
 
 ## Coordinates
 
@@ -121,9 +121,11 @@ Response `data` includes:
 - `version`: API version string.
 - `debug`: `true`.
 - `platform`: `macos`, `windows`, `linux`, `android`, `ios`, or `unknown`.
-- `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `screen.resize`, `input.click`, `input.drag`, `input.key`, and, when supported, `screenshot`.
+- `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `screen.resize`, `input.click`, `input.drag`, `input.drag_path`, `input.pointer`, `input.receipts`, `input.queue`, `input.controller`, device capabilities, and, when supported, `screenshot`.
 - `screen`: current screen metadata.
 - `scene_sequence`: snapshot sequence number.
+- `engine_frame` and `engine_instance_id`: native temporal and process-instance correlation.
+- `input`: default device/visualization and supported input devices.
 
 ```sh
 curl -fsS "$BASE/health" | python3 -m json.tool
@@ -203,75 +205,79 @@ Query parameters:
 curl -fsS "$BASE/node?id=n:0123456789abcdef&include=bounds,properties,children" | python3 -m json.tool
 ```
 
-### `POST /automation-bridge/v1/input/click`
+### Input ownership, FIFO execution, and receipts
 
-Queues a left-click. Use either a node id or absolute screen coordinates.
+All click, drag, path, pointer, and key actions share one FIFO. Only the first action advances during an engine update, so independent gestures cannot overwrite the same HID state. Every mutating request carries `client_id`, `session_id`, and `request_id`; keep ids compact on query endpoints because Defold bounds the complete request resource. The first client/session acquires the controller lease and other clients receive `input_controller_busy` until that lease expires. Observer endpoints remain readable without the lease.
 
-By default, the last mouse/touch input is drawn for one second: clicks appear as a growing circle, and drags appear as a line. Pass `visualize=0` to disable this for a specific input.
+Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch. The proposed engine-side fix is specified in [`docs/defold-hid-device-capability-query.md`](../docs/defold-hid-device-capability-query.md).
 
-```sh
-curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef"
-curl -fsS -X POST "$BASE/input/click?x=480&y=320&visualize=0"
-```
-
-Response `data`:
+Accepted input returns HTTP 202 and a lifecycle receipt:
 
 ```json
-{ "queued": "click", "x": 480, "y": 320 }
+{
+  "input_id": 42,
+  "kind": "drag",
+  "state": "accepted",
+  "queue_position": 1,
+  "accepted_frame": 120,
+  "start_frame": null,
+  "release_frame": null,
+  "accepted_time_us": 123456789,
+  "start_time_us": null,
+  "release_time_us": null,
+  "requested_duration": 0.35,
+  "actual_duration": 0,
+  "reason": null,
+  "client_id": "runner-1",
+  "session_id": "test-7",
+  "request_id": "request-19",
+  "engine_instance_id": "engine-123456",
+  "scene_sequence": 8,
+  "engine_frame": 120,
+  "device": "mouse",
+  "pointer_id": 0
+}
+```
+
+Lifecycle terms are exact: `accepted` means queued, `started` means the first down/key event was injected, and `released` means the final up was injected. `cancelled` and `failed` are terminal and include `reason`. They do not claim that application code consumed or accepted the action.
+
+Use `GET /input/status?input_id=42` for current/bounded-history status and `GET /input/pending` for the FIFO. `POST /input/cancel?input_id=42&release=1&client_id=...&session_id=...` cancels one action. `POST /input/flush?release=1&client_id=...&session_id=...` cancels the owning session's active and later actions. `release=1` releases mouse/key state or emits a cancelled touch contact. A pointer or controller lease expiry performs the same safe cleanup.
+
+Node-targeted input accepts `expected_scene_sequence`. A mismatch returns HTTP 409 with `stale_scene` before resolving a snapshot/path node id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
+
+### `POST /automation-bridge/v1/input/click`
+
+Use `id`, or finite `x`/`y`. Optional common fields are `device`, `pointer_id`, `visualize`, `expected_scene_sequence`, and the ownership/correlation fields above.
+
+```sh
+curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef&client_id=runner&session_id=test&request_id=click-1"
 ```
 
 ### `POST /automation-bridge/v1/input/drag`
 
-Queues a left-button/touch drag. Use either node ids or absolute screen coordinates.
-
-Query parameters:
-
-- `from_id` and `to_id`: drag from the center of one node to the center of another.
-- `x1`, `y1`, `x2`, `y2`: drag between absolute screen positions.
-- `duration`: optional duration in seconds. Default is `0.35`; negative values are clamped to `0`.
-- `visualize`: optional input visualization flag. Defaults to `1`; use `0` to disable.
+Use `from_id`/`to_id`, or `x1`/`y1`/`x2`/`y2`. `duration`, `hold_before`, and `hold_after` are seconds in `0..60`; their total must not exceed 60. `easing` is `linear`, `ease_in`, `ease_out`, or `ease_in_out`.
 
 ```sh
-curl -fsS -X POST "$BASE/input/drag?from_id=n:1111111111111111&to_id=n:2222222222222222&duration=0.35"
-curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=0.35"
+curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=.35&easing=ease_in_out&client_id=runner&session_id=test"
 ```
 
-Response `data`:
+### `POST /automation-bridge/v1/input/drag_path`
 
-```json
-{
-  "queued": "drag",
-  "from": { "x": 100, "y": 100 },
-  "to": { "x": 500, "y": 300 },
-  "duration": 0.35
-}
+Runs exactly one down, a continuous native path, and one up. `points` contains `x,y` pairs separated by semicolons. For `path=sampled` or `linear`, `durations` and `easing` have one comma-separated value per segment. `path=quadratic` requires three control points and one duration/easing; `path=cubic` requires four. Paths contain 2–128 points, the encoded point list is limited to 8192 bytes, and total duration including holds is at most 60 seconds. Visualization records and draws positions actually injected on engine updates, including the sampled curve, rather than drawing only a start/end chord.
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"points":"100,100;180,60;260,140","durations":".15,.22","easing":"ease_in,ease_out","hold_before":.08,"hold_after":.04,"client_id":"runner","session_id":"test"}' \
+  "$BASE/input/drag_path"
 ```
+
+### Low-level pointer sessions
+
+`POST /input/pointer/open?x=...&y=...&pointer_lease=2...` creates a leased pointer receipt. Append continuous work with `/input/pointer/move?input_id=...&x=...&y=...&duration=...&easing=...` and `/input/pointer/hold?input_id=...&duration=...`; finish with `/input/pointer/up?input_id=...`. Every command includes the same client/session identity and renews `pointer_lease`. If the client disappears, expiry emits a safe release/cancel. `POST /input/cancel` closes a session immediately.
 
 ### `POST /automation-bridge/v1/input/key`
 
-Queues keyboard input.
-
-Use `text` for plain UTF-8 text:
-
-```sh
-curl -fsS -X POST "$BASE/input/key?text=hello"
-```
-
-Use `keys` for Poco-style special key events. URL-encode braces when calling from shells:
-
-```sh
-curl -fsS -X POST "$BASE/input/key?keys=%7BKEY_ENTER%7D"
-```
-
-Special key names include `KEY_SPACE`, `KEY_ESC`, `KEY_ESCAPE`, `KEY_UP`, `KEY_DOWN`, `KEY_LEFT`, `KEY_RIGHT`, `KEY_TAB`, `KEY_ENTER`, `KEY_BACKSPACE`, `KEY_INSERT`, `KEY_DEL`, `KEY_DELETE`, `KEY_PAGEUP`, `KEY_PAGEDOWN`, `KEY_HOME`, `KEY_END`, `KEY_LSHIFT`, `KEY_RSHIFT`, `KEY_LCTRL`, `KEY_RCTRL`, `KEY_LALT`, `KEY_RALT`, `KEY_F1` through `KEY_F12`, `KEY_A` through `KEY_Z`, and `KEY_0` through `KEY_9`.
-
-The `text` or `keys` query value may be up to 4096 bytes.
-
-Response `data`:
-
-```json
-{ "queued": "key", "length": 5 }
-```
+Use `text` for UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names include arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, and `KEY_0`–`KEY_9`. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
 
 ### `GET /automation-bridge/v1/screenshot`
 

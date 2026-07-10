@@ -18,6 +18,9 @@ namespace dmAutomationBridge
     static const char* API_PREFIX = "/automation-bridge/v1";
     static const char* API_VERSION = "1";
     static const uint32_t MAX_INPUT_EVENTS = 64;
+    static const uint32_t MAX_INPUT_HISTORY = 256;
+    static const uint32_t MAX_INPUT_PATH_POINTS = 128;
+    static const float MAX_INPUT_DURATION = 60.0f;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
 
     template <typename T>
@@ -112,18 +115,87 @@ namespace dmAutomationBridge
     enum InputEventType
     {
         INPUT_EVENT_MOUSE,
-        INPUT_EVENT_KEYS
+        INPUT_EVENT_KEYS,
+        INPUT_EVENT_POINTER
+    };
+
+    enum InputDevice
+    {
+        INPUT_DEVICE_AUTO,
+        INPUT_DEVICE_MOUSE,
+        INPUT_DEVICE_TOUCH
+    };
+
+    enum InputState
+    {
+        INPUT_STATE_ACCEPTED,
+        INPUT_STATE_STARTED,
+        INPUT_STATE_RELEASED,
+        INPUT_STATE_CANCELLED,
+        INPUT_STATE_FAILED
+    };
+
+    enum InputEasing
+    {
+        INPUT_EASING_LINEAR,
+        INPUT_EASING_EASE_IN,
+        INPUT_EASING_EASE_OUT,
+        INPUT_EASING_EASE_IN_OUT
+    };
+
+    enum InputPathMode
+    {
+        INPUT_PATH_SAMPLED,
+        INPUT_PATH_QUADRATIC,
+        INPUT_PATH_CUBIC
+    };
+
+    struct InputPoint
+    {
+        float       m_X;
+        float       m_Y;
+        float       m_Duration;
+        InputEasing m_Easing;
+    };
+
+    struct InputReceipt
+    {
+        uint64_t    m_Id;
+        char*       m_Kind;
+        InputState  m_State;
+        uint64_t    m_AcceptedFrame;
+        uint64_t    m_StartFrame;
+        uint64_t    m_ReleaseFrame;
+        uint64_t    m_AcceptedTime;
+        uint64_t    m_StartTime;
+        uint64_t    m_ReleaseTime;
+        float       m_RequestedDuration;
+        char*       m_Reason;
+        char*       m_ClientId;
+        char*       m_SessionId;
+        char*       m_RequestId;
+        uint64_t    m_SceneSequence;
+        InputDevice m_Device;
+        uint32_t    m_PointerId;
     };
 
     struct InputEvent
     {
+        InputReceipt      m_Receipt;
         InputEventType     m_Type;
-        float              m_X1;
-        float              m_Y1;
-        float              m_X2;
-        float              m_Y2;
-        float              m_Duration;
+        Array<InputPoint>   m_Points;
+        InputPathMode       m_PathMode;
+        uint32_t            m_Segment;
+        uint8_t             m_Phase;
         float              m_Elapsed;
+        float              m_HoldBefore;
+        float              m_HoldAfter;
+        bool               m_Pressed;
+        bool               m_ReleaseRequested;
+        bool               m_CancelRequested;
+        bool               m_ReleaseOnCancel;
+        bool               m_PointerOpen;
+        uint64_t           m_LeaseDeadline;
         dmHID::MouseButton m_MouseButton;
         bool               m_Visualize;
 
@@ -136,10 +208,9 @@ namespace dmAutomationBridge
     {
         bool  m_Active;
         bool  m_Drag;
-        float m_X1;
-        float m_Y1;
-        float m_X2;
-        float m_Y2;
+        float m_X[MAX_INPUT_PATH_POINTS];
+        float m_Y[MAX_INPUT_PATH_POINTS];
+        uint32_t m_PointCount;
         float m_Age;
         float m_Duration;
         uint64_t m_LastRenderTime;
@@ -159,7 +230,15 @@ namespace dmAutomationBridge
         uint64_t                m_SnapshotFrame;
         Snapshot                m_Snapshot;
         Array<InputEvent>      m_InputEvents;
+        Array<InputReceipt>    m_InputHistory;
         InputVisualization      m_InputVisualization;
+        uint64_t                m_NextInputId;
+        char*                   m_ControllerClientId;
+        char*                   m_ControllerSessionId;
+        uint64_t                m_ControllerLeaseDeadline;
+        InputDevice             m_DefaultInputDevice;
+        bool                    m_DefaultInputVisualize;
+        char                    m_EngineInstanceId[64];
         bool                    m_ScreenshotPending;
         uint32_t                m_ScreenshotCounter;
         char                    m_ScreenshotPath[1024];
@@ -339,10 +418,30 @@ namespace dmAutomationBridge
     void AppendNodeJson(StringBuffer* out, const Snapshot* snapshot, const Node* node, const IncludeOptions* include, bool recursive, bool visible_only);
     void AppendScreenJson(StringBuffer* out, const Snapshot* snapshot);
 
+    void FreeInputReceipt(InputReceipt* receipt);
     void FreeInputEvent(InputEvent* event);
-    bool AddMouseInput(float x1, float y1, float x2, float y2, float duration);
-    bool AddMouseInput(float x1, float y1, float x2, float y2, float duration, bool visualize);
-    bool AddKeyInput(const char* keys);
+    const char* InputStateName(InputState state);
+    const char* InputDeviceName(InputDevice device);
+    bool ParseInputDevice(const char* value, InputDevice* device);
+    bool ParseInputEasing(const char* value, InputEasing* easing);
+    bool IsInputDeviceSupported(InputDevice device);
+    InputDevice ResolveInputDevice(InputDevice device);
+    bool AcquireInputController(const char* client_id, const char* session_id, float lease, const char** error);
+    bool IsInputController(const char* client_id, const char* session_id);
+    void ReleaseInputController(const char* client_id, const char* session_id);
+    bool AddMouseInput(const Array<InputPoint>* points, InputPathMode path_mode, float hold_before, float hold_after,
+                       InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
+                       const char* client_id, const char* session_id, const char* request_id,
+                       uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt);
+    bool AddKeyInput(const char* keys, const char* client_id, const char* session_id, const char* request_id,
+                     uint64_t scene_sequence, InputReceipt** receipt);
+    bool AppendPointerMove(uint64_t input_id, const InputPoint* point, float lease, const char** error);
+    bool AppendPointerHold(uint64_t input_id, float duration, float lease, const char** error);
+    bool ReleasePointer(uint64_t input_id, const char** error);
+    const InputReceipt* FindInputReceipt(uint64_t input_id);
+    void AppendInputReceiptJson(StringBuffer* out, const InputReceipt* receipt, uint32_t queue_position);
+    bool CancelInput(uint64_t input_id, bool release, const char* reason);
+    uint32_t FlushInput(const char* client_id, const char* session_id, bool release, const char* reason);
     bool GetNodeCenter(const char* id, float* x, float* y, const char** error);
     void UpdateInput(float dt);
 

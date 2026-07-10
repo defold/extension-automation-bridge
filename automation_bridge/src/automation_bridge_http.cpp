@@ -76,6 +76,164 @@ namespace dmAutomationBridge
         return true;
     }
 
+    static char* ReceiveRequestBody(dmWebServer::Request* request, uint32_t max_size)
+    {
+        if (!request || request->m_ContentLength == 0 || request->m_ContentLength > max_size)
+        {
+            return 0;
+        }
+        char* body = (char*)malloc(request->m_ContentLength + 1);
+        if (!body)
+        {
+            return 0;
+        }
+        uint32_t offset = 0;
+        while (offset < request->m_ContentLength)
+        {
+            uint32_t received = 0;
+            dmWebServer::Result result = dmWebServer::Receive(request, body + offset, request->m_ContentLength - offset, &received);
+            if (result != dmWebServer::RESULT_OK || received == 0)
+            {
+                free(body);
+                return 0;
+            }
+            offset += received;
+        }
+        body[offset] = 0;
+        return body;
+    }
+
+    static void SkipJsonWhitespace(const char** cursor)
+    {
+        while (**cursor && isspace((unsigned char)**cursor)) ++*cursor;
+    }
+
+    static char* ParseJsonString(const char** cursor, uint32_t max_size)
+    {
+        if (**cursor != '"') return 0;
+        ++*cursor;
+        StringBuffer value;
+        StringBufferInit(&value);
+        while (**cursor && **cursor != '"')
+        {
+            char c = *(*cursor)++;
+            if (c == '\\')
+            {
+                char escaped = *(*cursor)++;
+                if (!escaped || escaped == 'u')
+                {
+                    StringBufferFree(&value);
+                    return 0;
+                }
+                if (escaped == 'b') c = '\b';
+                else if (escaped == 'f') c = '\f';
+                else if (escaped == 'n') c = '\n';
+                else if (escaped == 'r') c = '\r';
+                else if (escaped == 't') c = '\t';
+                else if (escaped == '"' || escaped == '\\' || escaped == '/') c = escaped;
+                else
+                {
+                    StringBufferFree(&value);
+                    return 0;
+                }
+            }
+            if ((unsigned char)c < 0x20 || value.m_Size >= max_size)
+            {
+                StringBufferFree(&value);
+                return 0;
+            }
+            StringBufferAppendChar(&value, c);
+        }
+        if (**cursor != '"')
+        {
+            StringBufferFree(&value);
+            return 0;
+        }
+        ++*cursor;
+        return StringBufferDetach(&value);
+    }
+
+    static bool AddJsonQueryParam(Array<QueryParam>* query, char* key, char* value)
+    {
+        QueryParam param;
+        param.m_Key = key;
+        param.m_Value = value;
+        return ArrayPush(query, &param);
+    }
+
+    static bool ParseFlatJsonObject(const char* body, Array<QueryParam>* query)
+    {
+        const char* cursor = body;
+        SkipJsonWhitespace(&cursor);
+        if (*cursor++ != '{') return false;
+        SkipJsonWhitespace(&cursor);
+        if (*cursor == '}')
+        {
+            ++cursor;
+            SkipJsonWhitespace(&cursor);
+            return *cursor == 0;
+        }
+        while (*cursor)
+        {
+            SkipJsonWhitespace(&cursor);
+            char* key = ParseJsonString(&cursor, 64);
+            if (!key) return false;
+            SkipJsonWhitespace(&cursor);
+            if (*cursor++ != ':')
+            {
+                FreeString(&key);
+                return false;
+            }
+            SkipJsonWhitespace(&cursor);
+            char* value = 0;
+            if (*cursor == '"')
+            {
+                value = ParseJsonString(&cursor, 8192);
+            }
+            else
+            {
+                const char* start = cursor;
+                while (*cursor && *cursor != ',' && *cursor != '}' && !isspace((unsigned char)*cursor)) ++cursor;
+                uint32_t length = (uint32_t)(cursor - start);
+                if (length == 0 || length > 64)
+                {
+                    FreeString(&key);
+                    return false;
+                }
+                value = DuplicateStringN(start, length);
+                if (value && !StringsEqual(value, "true") && !StringsEqual(value, "false"))
+                {
+                    char* end = 0;
+                    strtod(value, &end);
+                    if (!end || *end != 0)
+                    {
+                        FreeString(&value);
+                    }
+                }
+            }
+            if (!value || !AddJsonQueryParam(query, key, value))
+            {
+                FreeString(&key);
+                FreeString(&value);
+                return false;
+            }
+            SkipJsonWhitespace(&cursor);
+            if (*cursor == ',')
+            {
+                ++cursor;
+                continue;
+            }
+            if (*cursor == '}')
+            {
+                ++cursor;
+                SkipJsonWhitespace(&cursor);
+                return *cursor == 0;
+            }
+            return false;
+        }
+        return false;
+    }
+
     static void InitRequestContext(RequestContext* ctx, dmWebServer::Request* request)
     {
         memset(ctx, 0, sizeof(*ctx));
@@ -135,6 +293,23 @@ namespace dmAutomationBridge
         }
 
         *value = (uint32_t)parsed;
+        return true;
+    }
+
+    static bool RequestGetUInt64Param(const RequestContext* ctx, const char* key, uint64_t* value, bool allow_zero = false)
+    {
+        const char* text = GetParam(&ctx->m_Query, key);
+        if (IsEmpty(text) || !isdigit((unsigned char)text[0]))
+        {
+            return false;
+        }
+        char* end = 0;
+        unsigned long long parsed = strtoull(text, &end, 10);
+        if (!end || *end != 0 || (!allow_zero && parsed == 0))
+        {
+            return false;
+        }
+        *value = (uint64_t)parsed;
         return true;
     }
 
@@ -215,6 +390,27 @@ namespace dmAutomationBridge
         }
     }
 
+    static bool ValidateExpectedScene(RequestContext* ctx)
+    {
+        const char* expected_text = RequestGetParam(ctx, "expected_scene_sequence");
+        if (IsEmpty(expected_text))
+        {
+            return true;
+        }
+        uint64_t expected = 0;
+        if (!RequestGetUInt64Param(ctx, "expected_scene_sequence", &expected))
+        {
+            RequestSendError(ctx, 400, "bad_request", "expected_scene_sequence must be a positive integer");
+            return false;
+        }
+        if (expected != g_AutomationBridge.m_Snapshot.m_Sequence)
+        {
+            RequestSendError(ctx, 409, "stale_scene", "scene sequence changed before input target resolution; refresh the scene and target");
+            return false;
+        }
+        return true;
+    }
+
     static void HandleHealth(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
@@ -242,7 +438,11 @@ namespace dmAutomationBridge
         {
             StringBufferAppend(&response, ",\"screen.resize\"");
         }
-        StringBufferAppend(&response, ",\"input.click\",\"input.drag\",\"input.key\"");
+        StringBufferAppend(&response, ",\"input.click\",\"input.drag\",\"input.drag_path\",\"input.pointer\",\"input.key\",\"input.receipts\",\"input.queue\",\"input.controller\",\"input.device.mouse\"");
+        if (IsInputDeviceSupported(INPUT_DEVICE_TOUCH))
+        {
+            StringBufferAppend(&response, ",\"input.device.touch\"");
+        }
         if (IsScreenshotSupported())
         {
             StringBufferAppend(&response, ",\"screenshot\"");
@@ -251,6 +451,17 @@ namespace dmAutomationBridge
         AppendScreenJson(&response, &g_AutomationBridge.m_Snapshot);
         StringBufferAppend(&response, ",\"scene_sequence\":");
         AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
+        StringBufferAppend(&response, ",\"engine_frame\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
+        StringBufferAppend(&response, ",\"engine_instance_id\":");
+        AppendJsonString(&response, g_AutomationBridge.m_EngineInstanceId);
+        StringBufferAppend(&response, ",\"input\":{\"default_device\":");
+        AppendJsonString(&response, InputDeviceName(g_AutomationBridge.m_DefaultInputDevice));
+        StringBufferAppend(&response, ",\"default_visualize\":");
+        StringBufferAppend(&response, g_AutomationBridge.m_DefaultInputVisualize ? "true" : "false");
+        StringBufferAppend(&response, ",\"devices\":{\"auto\":true,\"mouse\":true,\"touch\":");
+        StringBufferAppend(&response, IsInputDeviceSupported(INPUT_DEVICE_TOUCH) ? "true" : "false");
+        StringBufferAppend(&response, "}}");
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
     }
@@ -431,10 +642,198 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static bool GetInputIdentity(RequestContext* ctx, const char** client_id, const char** session_id,
+                                 const char** request_id, float* lease)
+    {
+        *client_id = RequestGetParam(ctx, "client_id");
+        *session_id = RequestGetParam(ctx, "session_id");
+        *request_id = RequestGetParam(ctx, "request_id");
+        *lease = 5.0f;
+        const char* lease_text = RequestGetParam(ctx, "lease");
+        if (!IsEmpty(lease_text) && (!RequestGetFloatParam(ctx, "lease", lease) || !IsFiniteFloat(*lease) || *lease <= 0.0f || *lease > MAX_INPUT_DURATION))
+        {
+            RequestSendError(ctx, 400, "bad_request", "lease must be finite and between 0 and 60 seconds");
+            return false;
+        }
+        return true;
+    }
+
+    static bool AcquireControllerForRequest(RequestContext* ctx, const char* client_id, const char* session_id, float lease)
+    {
+        const char* error = 0;
+        if (!AcquireInputController(client_id, session_id, lease, &error))
+        {
+            RequestSendError(ctx, 409, "input_controller_busy", error);
+            return false;
+        }
+        return true;
+    }
+
+    static bool GetInputOptions(RequestContext* ctx, InputDevice* device, uint32_t* pointer_id, bool* visualize)
+    {
+        *device = g_AutomationBridge.m_DefaultInputDevice;
+        const char* device_text = RequestGetParam(ctx, "device");
+        if (!IsEmpty(device_text) && !ParseInputDevice(device_text, device))
+        {
+            RequestSendError(ctx, 400, "bad_request", "device must be auto, mouse, or touch");
+            return false;
+        }
+        if (!IsInputDeviceSupported(ResolveInputDevice(*device)))
+        {
+            RequestSendError(ctx, 422, "input_device_unsupported", "requested input device is not supported on this platform");
+            return false;
+        }
+        *pointer_id = 0;
+        uint64_t pointer_value = 0;
+        const char* pointer_text = RequestGetParam(ctx, "pointer_id");
+        if (!IsEmpty(pointer_text))
+        {
+            if (!RequestGetUInt64Param(ctx, "pointer_id", &pointer_value, true) || pointer_value > 0xffffffffU)
+            {
+                RequestSendError(ctx, 400, "bad_request", "pointer_id must be an unsigned 32-bit integer");
+                return false;
+            }
+            *pointer_id = (uint32_t)pointer_value;
+        }
+        *visualize = g_AutomationBridge.m_DefaultInputVisualize;
+        RequestGetBoolParam(ctx, "visualize", visualize);
+        return true;
+    }
+
+    static void SendReceiptResponse(RequestContext* ctx, const InputReceipt* receipt, uint32_t queue_position, int status_code = 202)
+    {
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendInputReceiptJson(&response, receipt, queue_position);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, status_code, &response);
+    }
+
+    static bool ValidateDuration(RequestContext* ctx, float value, const char* name)
+    {
+        if (IsFiniteFloat(value) && value >= 0.0f && value <= MAX_INPUT_DURATION)
+        {
+            return true;
+        }
+        StringBuffer message;
+        StringBufferInit(&message);
+        StringBufferAppend(&message, name);
+        StringBufferAppend(&message, " must be finite and between 0 and 60 seconds");
+        char* text = StringBufferDetach(&message);
+        RequestSendError(ctx, 400, "bad_request", text);
+        free(text);
+        return false;
+    }
+
+    static bool ParsePointList(const char* value, Array<InputPoint>* points)
+    {
+        ArrayInit(points);
+        if (IsEmpty(value) || strlen(value) > 8192) return false;
+        const char* cursor = value;
+        while (*cursor)
+        {
+            char* end = 0;
+            double x = strtod(cursor, &end);
+            if (!end || end == cursor || *end != ',') return false;
+            cursor = end + 1;
+            double y = strtod(cursor, &end);
+            if (!end || end == cursor || (*end != ';' && *end != 0) || !IsFiniteDouble(x) || !IsFiniteDouble(y)) return false;
+            InputPoint point;
+            point.m_X = (float)x;
+            point.m_Y = (float)y;
+            point.m_Duration = 0.0f;
+            point.m_Easing = INPUT_EASING_LINEAR;
+            if (!ArrayPush(points, &point) || points->m_Count > MAX_INPUT_PATH_POINTS) return false;
+            cursor = *end == ';' ? end + 1 : end;
+            if (*cursor == 0) break;
+        }
+        return points->m_Count > 0;
+    }
+
+    static bool ParseDurationList(const char* value, float* durations, uint32_t expected)
+    {
+        if (expected == 0) return IsEmpty(value);
+        if (IsEmpty(value)) return false;
+        const char* cursor = value;
+        for (uint32_t i = 0; i < expected; ++i)
+        {
+            char* end = 0;
+            double duration = strtod(cursor, &end);
+            if (!end || end == cursor || !IsFiniteDouble(duration) || duration < 0.0 || duration > MAX_INPUT_DURATION) return false;
+            durations[i] = (float)duration;
+            if (i + 1 < expected)
+            {
+                if (*end != ',') return false;
+                cursor = end + 1;
+            }
+            else if (*end != 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool ParseEasingList(const char* value, InputEasing* easing, uint32_t expected)
+    {
+        if (IsEmpty(value))
+        {
+            for (uint32_t i = 0; i < expected; ++i) easing[i] = INPUT_EASING_LINEAR;
+            return true;
+        }
+        const char* cursor = value;
+        for (uint32_t i = 0; i < expected; ++i)
+        {
+            const char* end = strchr(cursor, ',');
+            uint32_t length = end ? (uint32_t)(end - cursor) : (uint32_t)strlen(cursor);
+            if (length == 0 || length >= 32) return false;
+            char token[32];
+            memcpy(token, cursor, length);
+            token[length] = 0;
+            if (!ParseInputEasing(token, &easing[i])) return false;
+            if (i + 1 < expected)
+            {
+                if (!end) return false;
+                cursor = end + 1;
+            }
+            else if (end)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool QueuePointerPath(RequestContext* ctx, Array<InputPoint>* points, InputPathMode mode,
+                                 float hold_before, float hold_after, const char* kind, bool pointer_open, float pointer_lease)
+    {
+        InputDevice device;
+        uint32_t pointer_id = 0;
+        bool visualize = true;
+        if (!GetInputOptions(ctx, &device, &pointer_id, &visualize)) return false;
+        const char* client_id = 0;
+        const char* session_id = 0;
+        const char* request_id = 0;
+        float controller_lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &controller_lease) ||
+            !AcquireControllerForRequest(ctx, client_id, session_id, controller_lease)) return false;
+        InputReceipt* receipt = 0;
+        if (!AddMouseInput(points, mode, hold_before, hold_after, device, pointer_id, visualize, kind,
+                           client_id, session_id, request_id, g_AutomationBridge.m_Snapshot.m_Sequence,
+                           pointer_lease, pointer_open, &receipt))
+        {
+            RequestSendError(ctx, 429, "input_queue_full", "input could not be queued; check device support and queue capacity");
+            return false;
+        }
+        SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
+        return true;
+    }
+
     static void HandleClick(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
-
+        if (!ValidateExpectedScene(ctx)) return;
         float x = 0.0f;
         float y = 0.0f;
         const char* id = RequestGetParam(ctx, "id");
@@ -447,122 +846,401 @@ namespace dmAutomationBridge
                 return;
             }
         }
-        else if (!RequestGetFloatParam(ctx, "x", &x) || !RequestGetFloatParam(ctx, "y", &y))
+        else if (!RequestGetFloatParam(ctx, "x", &x) || !RequestGetFloatParam(ctx, "y", &y) || !IsFiniteFloat(x) || !IsFiniteFloat(y))
         {
-            RequestSendError(ctx, 400, "bad_request", "provide either id or x/y");
+            RequestSendError(ctx, 400, "bad_request", "provide either id or finite x/y");
             return;
         }
-
-        bool visualize = true;
-        RequestGetBoolParam(ctx, "visualize", &visualize);
-
-        if (!AddMouseInput(x, y, x, y, 0.0f, visualize))
-        {
-            RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
-            return;
-        }
-
-        StringBuffer response;
-        StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"queued\":\"click\",\"x\":");
-        AppendNumber(&response, x);
-        StringBufferAppend(&response, ",\"y\":");
-        AppendNumber(&response, y);
-        StringBufferAppend(&response, "}}\n");
-        RequestSendJson(ctx, 200, &response);
+        Array<InputPoint> points;
+        ArrayInit(&points);
+        InputPoint point = {x, y, 0.0f, INPUT_EASING_LINEAR};
+        ArrayPush(&points, &point);
+        QueuePointerPath(ctx, &points, INPUT_PATH_SAMPLED, 0.0f, 0.0f, "click", false, 0.0f);
+        ArrayFree(&points);
     }
 
     static void HandleDrag(RequestContext* ctx)
     {
         RefreshSnapshotForRequest();
-
-        float x1 = 0.0f;
-        float y1 = 0.0f;
-        float x2 = 0.0f;
-        float y2 = 0.0f;
+        if (!ValidateExpectedScene(ctx)) return;
+        float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
         float duration = 0.35f;
         RequestGetFloatParam(ctx, "duration", &duration);
-
+        if (!ValidateDuration(ctx, duration, "duration")) return;
         const char* from_id = RequestGetParam(ctx, "from_id");
         const char* to_id = RequestGetParam(ctx, "to_id");
         if (!IsEmpty(from_id) && !IsEmpty(to_id))
         {
             const char* error = 0;
-            if (!GetNodeCenter(from_id, &x1, &y1, &error))
-            {
-                RequestSendError(ctx, 404, "not_found", error);
-                return;
-            }
-            if (!GetNodeCenter(to_id, &x2, &y2, &error))
+            if (!GetNodeCenter(from_id, &x1, &y1, &error) || !GetNodeCenter(to_id, &x2, &y2, &error))
             {
                 RequestSendError(ctx, 404, "not_found", error);
                 return;
             }
         }
-        else if (!RequestGetFloatParam(ctx, "x1", &x1) ||
-                 !RequestGetFloatParam(ctx, "y1", &y1) ||
-                 !RequestGetFloatParam(ctx, "x2", &x2) ||
-                 !RequestGetFloatParam(ctx, "y2", &y2))
+        else if (!RequestGetFloatParam(ctx, "x1", &x1) || !RequestGetFloatParam(ctx, "y1", &y1) ||
+                 !RequestGetFloatParam(ctx, "x2", &x2) || !RequestGetFloatParam(ctx, "y2", &y2) ||
+                 !IsFiniteFloat(x1) || !IsFiniteFloat(y1) || !IsFiniteFloat(x2) || !IsFiniteFloat(y2))
         {
-            RequestSendError(ctx, 400, "bad_request", "provide either from_id/to_id or x1/y1/x2/y2");
+            RequestSendError(ctx, 400, "bad_request", "provide either from_id/to_id or finite x1/y1/x2/y2");
             return;
         }
-
-        bool visualize = true;
-        RequestGetBoolParam(ctx, "visualize", &visualize);
-        duration = MaxFloat(0.0f, duration);
-        if (!AddMouseInput(x1, y1, x2, y2, duration, visualize))
+        InputEasing easing = INPUT_EASING_LINEAR;
+        if (!ParseInputEasing(RequestGetParam(ctx, "easing"), &easing))
         {
-            RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
+            RequestSendError(ctx, 400, "bad_request", "unsupported easing");
             return;
         }
+        float hold_before = 0.0f, hold_after = 0.0f;
+        RequestGetFloatParam(ctx, "hold_before", &hold_before);
+        RequestGetFloatParam(ctx, "hold_after", &hold_after);
+        if (!ValidateDuration(ctx, hold_before, "hold_before")) return;
+        if (!ValidateDuration(ctx, hold_after, "hold_after")) return;
+        if (duration + hold_before + hold_after > MAX_INPUT_DURATION)
+        {
+            RequestSendError(ctx, 400, "bad_request", "total gesture duration exceeds 60 seconds");
+            return;
+        }
+        Array<InputPoint> points;
+        ArrayInit(&points);
+        InputPoint start = {x1, y1, 0.0f, INPUT_EASING_LINEAR};
+        InputPoint end = {x2, y2, duration, easing};
+        ArrayPush(&points, &start);
+        ArrayPush(&points, &end);
+        QueuePointerPath(ctx, &points, INPUT_PATH_SAMPLED, hold_before, hold_after, "drag", false, 0.0f);
+        ArrayFree(&points);
+    }
 
-        StringBuffer response;
-        StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"queued\":\"drag\",\"from\":{\"x\":");
-        AppendNumber(&response, x1);
-        StringBufferAppend(&response, ",\"y\":");
-        AppendNumber(&response, y1);
-        StringBufferAppend(&response, "},\"to\":{\"x\":");
-        AppendNumber(&response, x2);
-        StringBufferAppend(&response, ",\"y\":");
-        AppendNumber(&response, y2);
-        StringBufferAppend(&response, "},\"duration\":");
-        AppendNumber(&response, duration);
-        StringBufferAppend(&response, "}}\n");
-        RequestSendJson(ctx, 200, &response);
+    static void HandleDragPath(RequestContext* ctx)
+    {
+        RefreshSnapshotForRequest();
+        if (!ValidateExpectedScene(ctx)) return;
+        Array<InputPoint> points;
+        if (!ParsePointList(RequestGetParam(ctx, "points"), &points))
+        {
+            ArrayFree(&points);
+            RequestSendError(ctx, 400, "bad_request", "points must contain 2-128 finite x,y pairs separated by semicolons");
+            return;
+        }
+        InputPathMode mode = INPUT_PATH_SAMPLED;
+        const char* mode_text = RequestGetParam(ctx, "path");
+        if (!IsEmpty(mode_text) && StringsEqual(mode_text, "quadratic")) mode = INPUT_PATH_QUADRATIC;
+        else if (!IsEmpty(mode_text) && StringsEqual(mode_text, "cubic")) mode = INPUT_PATH_CUBIC;
+        else if (!IsEmpty(mode_text) && !StringsEqual(mode_text, "sampled") && !StringsEqual(mode_text, "linear"))
+        {
+            ArrayFree(&points);
+            RequestSendError(ctx, 400, "bad_request", "path must be sampled, linear, quadratic, or cubic");
+            return;
+        }
+        uint32_t segment_count = mode == INPUT_PATH_SAMPLED ? points.m_Count - 1 : 1;
+        if (points.m_Count < 2 || (mode == INPUT_PATH_QUADRATIC && points.m_Count != 3) || (mode == INPUT_PATH_CUBIC && points.m_Count != 4))
+        {
+            ArrayFree(&points);
+            RequestSendError(ctx, 400, "bad_request", "sampled paths need at least 2 points; quadratic needs 3; cubic needs 4");
+            return;
+        }
+        float durations[MAX_INPUT_PATH_POINTS];
+        InputEasing easing[MAX_INPUT_PATH_POINTS];
+        if (!ParseDurationList(RequestGetParam(ctx, "durations"), durations, segment_count) ||
+            !ParseEasingList(RequestGetParam(ctx, "easing"), easing, segment_count))
+        {
+            ArrayFree(&points);
+            RequestSendError(ctx, 400, "bad_request", "durations and easing must contain exactly one value per path segment");
+            return;
+        }
+        float total = 0.0f;
+        for (uint32_t i = 0; i < segment_count; ++i)
+        {
+            total += durations[i];
+            uint32_t point_index = mode == INPUT_PATH_SAMPLED ? i + 1 : points.m_Count - 1;
+            points.m_Data[point_index].m_Duration = durations[i];
+            points.m_Data[point_index].m_Easing = easing[i];
+        }
+        float hold_before = 0.0f, hold_after = 0.0f;
+        RequestGetFloatParam(ctx, "hold_before", &hold_before);
+        RequestGetFloatParam(ctx, "hold_after", &hold_after);
+        if (!ValidateDuration(ctx, hold_before, "hold_before") || !ValidateDuration(ctx, hold_after, "hold_after"))
+        {
+            ArrayFree(&points);
+            return;
+        }
+        if (total + hold_before + hold_after > MAX_INPUT_DURATION)
+        {
+            RequestSendError(ctx, 400, "bad_request", "total gesture duration exceeds 60 seconds");
+            ArrayFree(&points);
+            return;
+        }
+        QueuePointerPath(ctx, &points, mode, hold_before, hold_after, "drag_path", false, 0.0f);
+        ArrayFree(&points);
     }
 
     static void HandleKey(RequestContext* ctx)
     {
+        RefreshSnapshotForRequest();
+        if (!ValidateExpectedScene(ctx)) return;
         const char* value = RequestGetParam(ctx, "keys");
-        if (!value)
+        if (!value) value = RequestGetParam(ctx, "text");
+        if (IsEmpty(value) || strlen(value) > MAX_KEY_INPUT_BYTES)
         {
-            value = RequestGetParam(ctx, "text");
-        }
-        if (IsEmpty(value))
-        {
-            RequestSendError(ctx, 400, "bad_request", "provide text or keys");
+            RequestSendError(ctx, IsEmpty(value) ? 400 : 413, IsEmpty(value) ? "bad_request" : "input_too_large", "provide text/keys no larger than 4096 bytes");
             return;
         }
-        if (strlen(value) > MAX_KEY_INPUT_BYTES)
-        {
-            RequestSendError(ctx, 413, "input_too_large", "text or keys parameter is too large");
-            return;
-        }
-
-        if (!AddKeyInput(value))
+        const char* client_id = 0;
+        const char* session_id = 0;
+        const char* request_id = 0;
+        float lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
+        InputReceipt* receipt = 0;
+        if (!AddKeyInput(value, client_id, session_id, request_id, g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
         }
+        SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
+    }
 
+    static bool GetInputId(RequestContext* ctx, uint64_t* input_id)
+    {
+        if (!RequestGetUInt64Param(ctx, "input_id", input_id))
+        {
+            RequestSendError(ctx, 400, "bad_request", "input_id must be a positive integer");
+            return false;
+        }
+        return true;
+    }
+
+    static uint32_t QueuePosition(uint64_t input_id)
+    {
+        for (uint32_t i = 0; i < g_AutomationBridge.m_InputEvents.m_Count; ++i)
+            if (g_AutomationBridge.m_InputEvents.m_Data[i].m_Receipt.m_Id == input_id) return i + 1;
+        return 0;
+    }
+
+    static void HandleInputStatus(RequestContext* ctx)
+    {
+        uint64_t input_id = 0;
+        if (!GetInputId(ctx, &input_id)) return;
+        const InputReceipt* receipt = FindInputReceipt(input_id);
+        if (!receipt)
+        {
+            RequestSendError(ctx, 404, "input_not_found", "input receipt was not found or expired from bounded history");
+            return;
+        }
+        SendReceiptResponse(ctx, receipt, QueuePosition(input_id), 200);
+    }
+
+    static void HandleInputPending(RequestContext* ctx)
+    {
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"queued\":\"key\",\"length\":");
-        AppendNumber(&response, (double)strlen(value));
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"inputs\":[");
+        for (uint32_t i = 0; i < g_AutomationBridge.m_InputEvents.m_Count; ++i)
+        {
+            if (i) StringBufferAppendChar(&response, ',');
+            AppendInputReceiptJson(&response, &g_AutomationBridge.m_InputEvents.m_Data[i].m_Receipt, i + 1);
+        }
+        StringBufferAppend(&response, "],\"count\":");
+        AppendNumber(&response, (double)g_AutomationBridge.m_InputEvents.m_Count);
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
+    }
+
+    static bool VerifyReceiptOwner(RequestContext* ctx, const InputReceipt* receipt, const char* client_id, const char* session_id)
+    {
+        if (receipt && StringsEqual(receipt->m_ClientId, IsEmpty(client_id) ? "anonymous" : client_id) &&
+            StringsEqual(receipt->m_SessionId, IsEmpty(session_id) ? "default" : session_id)) return true;
+        RequestSendError(ctx, 403, "input_not_owned", "input belongs to a different client/session");
+        return false;
+    }
+
+    static void HandleInputCancel(RequestContext* ctx)
+    {
+        uint64_t input_id = 0;
+        if (!GetInputId(ctx, &input_id)) return;
+        const char* client_id = 0, *session_id = 0, *request_id = 0;
+        float lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
+        const InputReceipt* receipt = FindInputReceipt(input_id);
+        if (!receipt)
+        {
+            RequestSendError(ctx, 404, "input_not_found", "input was not found");
+            return;
+        }
+        if (!VerifyReceiptOwner(ctx, receipt, client_id, session_id)) return;
+        bool release = true;
+        RequestGetBoolParam(ctx, "release", &release);
+        if (!CancelInput(input_id, release, "cancelled_by_client"))
+        {
+            RequestSendError(ctx, 409, "input_already_finished", "input is already in a terminal state");
+            return;
+        }
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+    }
+
+    static void HandleInputFlush(RequestContext* ctx)
+    {
+        const char* client_id = 0, *session_id = 0, *request_id = 0;
+        float lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
+        bool release = true;
+        RequestGetBoolParam(ctx, "release", &release);
+        uint32_t count = FlushInput(IsEmpty(client_id) ? "anonymous" : client_id, IsEmpty(session_id) ? "default" : session_id,
+                                    release, "flushed_by_client");
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"cancel_requested\":");
+        AppendNumber(&response, (double)count);
+        StringBufferAppend(&response, ",\"release\":");
+        StringBufferAppend(&response, release ? "true" : "false");
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 202, &response);
+    }
+
+    static void HandleInputConfigure(RequestContext* ctx)
+    {
+        const char* client_id = 0, *session_id = 0, *request_id = 0;
+        float lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
+        InputDevice device = g_AutomationBridge.m_DefaultInputDevice;
+        const char* device_text = RequestGetParam(ctx, "device");
+        if (!IsEmpty(device_text) && (!ParseInputDevice(device_text, &device) || !IsInputDeviceSupported(ResolveInputDevice(device))))
+        {
+            RequestSendError(ctx, 422, "input_device_unsupported", "device must be auto/mouse or a supported touch device");
+            return;
+        }
+        bool visualize = g_AutomationBridge.m_DefaultInputVisualize;
+        RequestGetBoolParam(ctx, "visualize", &visualize);
+        g_AutomationBridge.m_DefaultInputDevice = device;
+        g_AutomationBridge.m_DefaultInputVisualize = visualize;
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"device\":");
+        AppendJsonString(&response, InputDeviceName(device));
+        StringBufferAppend(&response, ",\"resolved_device\":");
+        AppendJsonString(&response, InputDeviceName(ResolveInputDevice(device)));
+        StringBufferAppend(&response, ",\"visualize\":");
+        StringBufferAppend(&response, visualize ? "true" : "false");
+        StringBufferAppend(&response, ",\"controller\":{\"client_id\":");
+        AppendJsonString(&response, IsEmpty(client_id) ? "anonymous" : client_id);
+        StringBufferAppend(&response, ",\"session_id\":");
+        AppendJsonString(&response, IsEmpty(session_id) ? "default" : session_id);
+        StringBufferAppend(&response, "},\"devices\":{\"auto\":true,\"mouse\":true,\"touch\":");
+        StringBufferAppend(&response, IsInputDeviceSupported(INPUT_DEVICE_TOUCH) ? "true" : "false");
+        StringBufferAppend(&response, "}}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandlePointerOpen(RequestContext* ctx)
+    {
+        RefreshSnapshotForRequest();
+        if (!ValidateExpectedScene(ctx)) return;
+        float x = 0.0f, y = 0.0f;
+        if (!RequestGetFloatParam(ctx, "x", &x) || !RequestGetFloatParam(ctx, "y", &y) || !IsFiniteFloat(x) || !IsFiniteFloat(y))
+        {
+            RequestSendError(ctx, 400, "bad_request", "pointer open requires finite x/y");
+            return;
+        }
+        float pointer_lease = 2.0f;
+        RequestGetFloatParam(ctx, "pointer_lease", &pointer_lease);
+        if (!ValidateDuration(ctx, pointer_lease, "pointer_lease")) return;
+        if (pointer_lease <= 0.0f)
+        {
+            RequestSendError(ctx, 400, "bad_request", "pointer_lease must be greater than zero");
+            return;
+        }
+        Array<InputPoint> points;
+        ArrayInit(&points);
+        InputPoint point = {x, y, 0.0f, INPUT_EASING_LINEAR};
+        ArrayPush(&points, &point);
+        QueuePointerPath(ctx, &points, INPUT_PATH_SAMPLED, 0.0f, 0.0f, "pointer", true, pointer_lease);
+        ArrayFree(&points);
+    }
+
+    static bool PreparePointerCommand(RequestContext* ctx, uint64_t* input_id, float* pointer_lease,
+                                      const char** client_id, const char** session_id)
+    {
+        if (!GetInputId(ctx, input_id)) return false;
+        const char* request_id = 0;
+        float controller_lease = 5.0f;
+        if (!GetInputIdentity(ctx, client_id, session_id, &request_id, &controller_lease) ||
+            !AcquireControllerForRequest(ctx, *client_id, *session_id, controller_lease)) return false;
+        const InputReceipt* receipt = FindInputReceipt(*input_id);
+        if (!receipt)
+        {
+            RequestSendError(ctx, 404, "input_not_found", "pointer session was not found");
+            return false;
+        }
+        if (!VerifyReceiptOwner(ctx, receipt, *client_id, *session_id)) return false;
+        *pointer_lease = 2.0f;
+        RequestGetFloatParam(ctx, "pointer_lease", pointer_lease);
+        if (!ValidateDuration(ctx, *pointer_lease, "pointer_lease")) return false;
+        if (*pointer_lease <= 0.0f)
+        {
+            RequestSendError(ctx, 400, "bad_request", "pointer_lease must be greater than zero");
+            return false;
+        }
+        return true;
+    }
+
+    static void HandlePointerMove(RequestContext* ctx)
+    {
+        uint64_t input_id = 0;
+        float pointer_lease = 0.0f;
+        const char* client_id = 0, *session_id = 0;
+        if (!PreparePointerCommand(ctx, &input_id, &pointer_lease, &client_id, &session_id)) return;
+        InputPoint point;
+        memset(&point, 0, sizeof(point));
+        if (!RequestGetFloatParam(ctx, "x", &point.m_X) || !RequestGetFloatParam(ctx, "y", &point.m_Y) ||
+            !RequestGetFloatParam(ctx, "duration", &point.m_Duration) || !IsFiniteFloat(point.m_X) || !IsFiniteFloat(point.m_Y))
+        {
+            RequestSendError(ctx, 400, "bad_request", "pointer move requires finite x/y and duration");
+            return;
+        }
+        if (!ValidateDuration(ctx, point.m_Duration, "duration")) return;
+        if (!ParseInputEasing(RequestGetParam(ctx, "easing"), &point.m_Easing))
+        {
+            RequestSendError(ctx, 400, "bad_request", "pointer move easing is unsupported");
+            return;
+        }
+        const char* error = 0;
+        if (!AppendPointerMove(input_id, &point, pointer_lease, &error))
+        {
+            RequestSendError(ctx, 409, "pointer_closed", error);
+            return;
+        }
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+    }
+
+    static void HandlePointerHold(RequestContext* ctx)
+    {
+        uint64_t input_id = 0;
+        float pointer_lease = 0.0f;
+        const char* client_id = 0, *session_id = 0;
+        if (!PreparePointerCommand(ctx, &input_id, &pointer_lease, &client_id, &session_id)) return;
+        float duration = 0.0f;
+        if (!RequestGetFloatParam(ctx, "duration", &duration) || !ValidateDuration(ctx, duration, "duration")) return;
+        const char* error = 0;
+        if (!AppendPointerHold(input_id, duration, pointer_lease, &error))
+        {
+            RequestSendError(ctx, 409, "pointer_closed", error);
+            return;
+        }
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+    }
+
+    static void HandlePointerUp(RequestContext* ctx)
+    {
+        uint64_t input_id = 0;
+        float pointer_lease = 0.0f;
+        const char* client_id = 0, *session_id = 0;
+        if (!PreparePointerCommand(ctx, &input_id, &pointer_lease, &client_id, &session_id)) return;
+        const char* error = 0;
+        if (!ReleasePointer(input_id, &error))
+        {
+            RequestSendError(ctx, 409, "pointer_closed", error);
+            return;
+        }
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
     }
 
     static void HandleScreenshot(RequestContext* ctx)
@@ -630,7 +1308,17 @@ namespace dmAutomationBridge
         {"/node", "GET", HandleNode},
         {"/input/click", "POST", HandleClick},
         {"/input/drag", "POST", HandleDrag},
+        {"/input/drag_path", "POST", HandleDragPath},
         {"/input/key", "POST", HandleKey},
+        {"/input/status", "GET", HandleInputStatus},
+        {"/input/pending", "GET", HandleInputPending},
+        {"/input/cancel", "POST", HandleInputCancel},
+        {"/input/flush", "POST", HandleInputFlush},
+        {"/input/configure", "PUT", HandleInputConfigure},
+        {"/input/pointer/open", "POST", HandlePointerOpen},
+        {"/input/pointer/move", "POST", HandlePointerMove},
+        {"/input/pointer/hold", "POST", HandlePointerHold},
+        {"/input/pointer/up", "POST", HandlePointerUp},
         {"/screenshot", "GET", HandleScreenshot}
     };
 
@@ -643,10 +1331,32 @@ namespace dmAutomationBridge
 
         if (request->m_ContentLength > 0)
         {
-            DrainRequestBody(request);
-            RequestSendError(&ctx, 400, "body_not_supported", "request body is not supported; use query parameters");
-            FreeRequestContext(&ctx);
-            return;
+            bool structured_input = StartsWith(ctx.m_Route, "/input/") && !RequestIsMethod(&ctx, "GET");
+            if (!structured_input)
+            {
+                DrainRequestBody(request);
+                RequestSendError(&ctx, 400, "body_not_supported", "request body is supported only for mutating input endpoints; use query parameters");
+                FreeRequestContext(&ctx);
+                return;
+            }
+            if (request->m_ContentLength > 32768 || ctx.m_Query.m_Count > 0)
+            {
+                DrainRequestBody(request);
+                RequestSendError(&ctx, request->m_ContentLength > 32768 ? 413 : 400,
+                                 request->m_ContentLength > 32768 ? "input_too_large" : "bad_request",
+                                 request->m_ContentLength > 32768 ? "JSON input body exceeds 32768 bytes" : "do not mix query parameters with a structured JSON body");
+                FreeRequestContext(&ctx);
+                return;
+            }
+            char* body = ReceiveRequestBody(request, 32768);
+            bool parsed = body && ParseFlatJsonObject(body, &ctx.m_Query);
+            free(body);
+            if (!parsed)
+            {
+                RequestSendError(&ctx, 400, "bad_json", "expected a flat JSON object containing string, number, or boolean values");
+                FreeRequestContext(&ctx);
+                return;
+            }
         }
 
         if (!RequestHasApiPrefix(&ctx))

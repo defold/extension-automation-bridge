@@ -24,12 +24,22 @@ namespace dmAutomationBridge
             FreeInputEvent(&bridge->m_InputEvents.m_Data[i]);
         }
         ArrayFree(&bridge->m_InputEvents);
+        for (uint32_t i = 0; i < bridge->m_InputHistory.m_Count; ++i)
+        {
+            FreeInputReceipt(&bridge->m_InputHistory.m_Data[i]);
+        }
+        ArrayFree(&bridge->m_InputHistory);
+        FreeString(&bridge->m_ControllerClientId);
+        FreeString(&bridge->m_ControllerSessionId);
     }
 
     static void InitAutomationBridgeContext(AutomationBridgeContext* bridge)
     {
         memset(bridge, 0, sizeof(*bridge));
         InitSnapshot(&bridge->m_Snapshot);
+        bridge->m_NextInputId = 1;
+        bridge->m_DefaultInputDevice = INPUT_DEVICE_AUTO;
+        bridge->m_DefaultInputVisualize = true;
         bridge->m_DisplayWidth = 960;
         bridge->m_DisplayHeight = 640;
     }
@@ -68,6 +78,8 @@ namespace dmAutomationBridge
             }
         }
         g_AutomationBridge.m_LastTime = dmTime::GetTime();
+        dmSnPrintf(g_AutomationBridge.m_EngineInstanceId, sizeof(g_AutomationBridge.m_EngineInstanceId),
+                   "engine-%llu", (unsigned long long)g_AutomationBridge.m_LastTime);
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);
         dmExtension::RegisterCallback(dmExtension::CALLBACK_PRE_RENDER, PreRender);

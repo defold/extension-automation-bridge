@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -19,8 +20,8 @@ from .waits import wait_until
 
 JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
-_INPUT_SETTLE_SECONDS = 0.1
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
+_INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
 
 
 class AutomationBridgeError(RuntimeError):
@@ -54,6 +55,35 @@ class SelectorError(AutomationBridgeError):
     """Raised when a node selector finds too many or too few nodes."""
 
     pass
+
+
+class InputExecutionError(AutomationBridgeError):
+    """Raised when an accepted native input is cancelled or fails before release."""
+
+    def __init__(self, receipt: "InputReceipt"):
+        self.receipt = receipt
+        super().__init__(
+            f"input {receipt.input_id} ended as {receipt.state}: "
+            f"{receipt.get('reason') or 'no reason reported'}"
+        )
+
+
+class InputReceipt(dict):
+    """Dictionary-compatible native input lifecycle receipt with attribute access."""
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    @property
+    def input_id(self) -> int:
+        return int(self["input_id"])
+
+    @property
+    def state(self) -> str:
+        return str(self["state"])
 
 
 class EngineLogStream:
@@ -130,14 +160,202 @@ class EngineLogStream:
                 self._buffer.extend(chunk)
         except socket.timeout:
             return b""
+        except KeyboardInterrupt:
+            self.close()
+            raise
         finally:
             if timeout is not None:
-                self._socket.settimeout(previous_timeout)
+                try:
+                    self._socket.settimeout(previous_timeout)
+                except OSError:
+                    if sys.exc_info()[0] is None:
+                        raise
 
 
-def request_json(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[int, JsonDict]:
+class InputController:
+    """Queue, receipt, controller-lease, cancellation, and device operations."""
+
+    def __init__(self, bridge: "AutomationBridgeClient"):
+        self._bridge = bridge
+
+    def configure(
+        self,
+        device: str = "auto",
+        visualize: Optional[bool] = None,
+        lease: float = 5.0,
+    ) -> JsonDict:
+        """Acquire/renew control and configure the default exclusive input device."""
+        params = self._bridge._input_params(lease=lease)
+        params["device"] = device
+        if visualize is not None:
+            params["visualize"] = visualize
+        return self._bridge.put_json("/input/configure", params)
+
+    def pending(self) -> List[InputReceipt]:
+        """Return FIFO-ordered accepted/started input receipts."""
+        data = self._bridge.get("/input/pending")
+        return [InputReceipt(item) for item in data.get("inputs", [])]
+
+    def status(self, input_id: int) -> InputReceipt:
+        """Return the current or bounded-history receipt for `input_id`."""
+        return InputReceipt(self._bridge.get("/input/status", {"input_id": input_id}))
+
+    def wait(
+        self,
+        input_or_id: Union[int, Mapping[str, Any]],
+        state: str = "released",
+        timeout: float = 10.0,
+        interval: float = 0.01,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
+    ) -> InputReceipt:
+        """Wait for native `started` or `released`; cancellation/failure raises."""
+        if state not in {"accepted", "started", "released"}:
+            raise ValueError("input wait state must be accepted, started, or released")
+        receipt = InputReceipt(input_or_id) if isinstance(input_or_id, Mapping) else None
+        input_id = int(receipt["input_id"] if receipt is not None else input_or_id)
+        if state == "accepted" and receipt is not None:
+            return receipt
+        deadline = time.monotonic() + max(0.0, timeout)
+        last = receipt
+        try:
+            while True:
+                if last is None or last.state == "accepted" or state == "released":
+                    last = self.status(input_id)
+                if last.state in {"cancelled", "failed"}:
+                    raise InputExecutionError(last)
+                if state == "started" and last.state in {"started", "released"}:
+                    return last
+                if state == "released" and last.state == "released":
+                    return last
+                if time.monotonic() >= deadline:
+                    raise AutomationBridgeError(
+                        f"input {input_id} did not reach {state!r} within {timeout}s; "
+                        f"last state was {last.state!r}"
+                    )
+                time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
+        except BaseException:
+            if cancel_on_interrupt:
+                try:
+                    if flush_on_interrupt:
+                        self.flush(release=True)
+                    else:
+                        self.cancel(input_id, release=True)
+                except Exception:
+                    pass
+            raise
+
+    def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
+        """Request cancellation, releasing active pointer/key state by default."""
+        params = self._bridge._input_params()
+        params.update({"input_id": input_id, "release": release})
+        return InputReceipt(self._bridge.post_json("/input/cancel", params))
+
+    def flush(self, release: bool = True) -> JsonDict:
+        """Cancel this session's active and later queued inputs."""
+        params = self._bridge._input_params()
+        params["release"] = release
+        return self._bridge.post_json("/input/flush", params)
+
+
+class PointerSession:
+    """Leased low-level pointer that guarantees up/cancel cleanup in a context manager."""
+
+    def __init__(self, bridge: "AutomationBridgeClient", receipt: InputReceipt, lease: float):
+        self._bridge = bridge
+        self.receipt = receipt
+        self.lease = lease
+        self.closed = False
+
+    @property
+    def input_id(self) -> int:
+        return self.receipt.input_id
+
+    def __enter__(self) -> "PointerSession":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if self.closed:
+            return
+        if exc_type is not None:
+            try:
+                self.cancel()
+            except Exception:
+                pass
+            return
+        self.up()
+
+    def move(
+        self,
+        target: Target,
+        duration: float = 0.2,
+        easing: str = "linear",
+    ) -> InputReceipt:
+        """Append one continuous movement segment without releasing the pointer."""
+        self._ensure_open()
+        x, y = self._bridge._point(target)
+        params = self._bridge._input_params(lease=max(5.0, self.lease))
+        params.update(
+            {
+                "input_id": self.input_id,
+                "x": x,
+                "y": y,
+                "duration": duration,
+                "easing": easing,
+                "pointer_lease": self.lease,
+            }
+        )
+        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/move", params))
+        return self.receipt
+
+    def hold(self, duration: float) -> InputReceipt:
+        """Keep the pointer down at its current position for `duration`."""
+        self._ensure_open()
+        params = self._bridge._input_params(lease=max(5.0, self.lease))
+        params.update(
+            {
+                "input_id": self.input_id,
+                "duration": duration,
+                "pointer_lease": self.lease,
+            }
+        )
+        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/hold", params))
+        return self.receipt
+
+    def up(self, wait: Union[str, bool] = "released", timeout: float = 10.0) -> InputReceipt:
+        """Request one final up event and optionally wait for native release injection."""
+        self._ensure_open()
+        params = self._bridge._input_params(lease=max(5.0, self.lease))
+        params.update({"input_id": self.input_id, "pointer_lease": self.lease})
+        self.receipt = InputReceipt(self._bridge.post_json("/input/pointer/up", params))
+        self.closed = True
+        if wait:
+            target_state = "released" if wait is True else str(wait)
+            self.receipt = self._bridge.input.wait(self.receipt, target_state, timeout=timeout)
+        return self.receipt
+
+    def cancel(self, release: bool = True) -> InputReceipt:
+        """Cancel the session and release/cancel the active contact."""
+        if self.closed:
+            return self.receipt
+        self.receipt = self._bridge.input.cancel(self.input_id, release=release)
+        self.closed = True
+        return self.receipt
+
+    def _ensure_open(self) -> None:
+        if self.closed:
+            raise AutomationBridgeError(f"pointer session {self.input_id} is closed")
+
+
+def request_json(
+    url: str,
+    method: str = "GET",
+    timeout: float = 10.0,
+    data: Optional[bytes] = None,
+    headers: Optional[Mapping[str, str]] = None,
+) -> Tuple[int, JsonDict]:
     """Request JSON and return `(status, object)`."""
-    request = urllib.request.Request(url, method=method)
+    request = urllib.request.Request(url, data=data, headers=dict(headers or {}), method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.getcode()
@@ -258,13 +476,30 @@ class AutomationBridgeClient:
     }
     _SELECTOR_KEYS = _SERVER_FILTERS | _CLIENT_FILTERS | {"include", "limit"}
 
-    def __init__(self, port: int, timeout: float = 10.0, remotery_url: Optional[str] = None):
-        """Create a client for an already-known engine service `port`."""
+    def __init__(
+        self,
+        port: int,
+        timeout: float = 10.0,
+        remotery_url: Optional[str] = None,
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ):
+        """Create a client with stable controller/session correlation ids."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
         self._remotery_url = remotery_url
         self._last_window_size: Optional[Tuple[int, int]] = None
+        # Defold v1 exposes query-only control endpoints with a bounded resource
+        # string, so defaults are compact while remaining random per process/session.
+        self.client_id = client_id or f"py-{uuid.uuid4().hex[:12]}"
+        self.session_id = session_id or f"s-{uuid.uuid4().hex[:12]}"
+        self._input_controller = InputController(self)
+
+    @property
+    def input(self) -> InputController:
+        """Return queue, status, cancellation, lease, and device controls."""
+        return self._input_controller
 
     @classmethod
     def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
@@ -360,6 +595,14 @@ class AutomationBridgeClient:
         """POST an Automation Bridge API path with query parameters and return `data`."""
         return self._request("POST", path, params)
 
+    def post_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        """POST an `application/json` object for structured Automation Bridge operations."""
+        return self._request_json("POST", path, payload)
+
+    def put_json(self, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        """PUT an `application/json` object for structured Automation Bridge operations."""
+        return self._request_json("PUT", path, payload)
+
     def put(self, path: str, params: Optional[Mapping[str, Any]] = None) -> JsonDict:
         """PUT an Automation Bridge API path with query parameters and return `data`."""
         return self._request("PUT", path, params)
@@ -449,10 +692,14 @@ class AutomationBridgeClient:
         self,
         target: Union[Target, float, int],
         y: Optional[float] = None,
-        wait: float = 0.25,
+        wait: Union[str, bool, float] = "released",
         visualize: Optional[bool] = None,
-    ) -> JsonDict:
-        """Queue a left-click on a Node, node id, mapping, tuple, or x/y pair."""
+        device: Optional[str] = None,
+        pointer_id: int = 0,
+        expected_scene_sequence: Optional[int] = None,
+        timeout: float = 5.0,
+    ) -> InputReceipt:
+        """Queue one FIFO click and optionally wait for the native release receipt."""
         if isinstance(target, Node):
             params: Dict[str, Any] = {"id": target.id}
         elif isinstance(target, str):
@@ -461,23 +708,29 @@ class AutomationBridgeClient:
             x_value, y_value = self._point(target, y)
             params = {"x": x_value, "y": y_value}
 
-        if visualize is not None:
-            params["visualize"] = visualize
-
-        response = self.post("/input/click", params)
-        if wait:
-            time.sleep(wait)
-        return response
+        params.update(self._input_params())
+        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        if pointer_id:
+            params["pointer_id"] = pointer_id
+        receipt = InputReceipt(self.post_json("/input/click", params))
+        return self._wait_input_compat(receipt, wait, timeout)
 
     def drag(
         self,
         from_target: Target,
         to_target: Target,
         duration: float = 0.35,
-        wait: Optional[float] = None,
+        wait: Union[str, bool, float, None] = "released",
         visualize: Optional[bool] = None,
-    ) -> JsonDict:
-        """Queue a drag between nodes or coordinates and block until it finishes."""
+        easing: str = "linear",
+        hold_before: float = 0.0,
+        hold_after: float = 0.0,
+        device: Optional[str] = None,
+        pointer_id: int = 0,
+        expected_scene_sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> InputReceipt:
+        """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
         if self._is_node_ref(from_target) and self._is_node_ref(to_target):
             params: Dict[str, Any] = {
                 "from_id": self._node_id(from_target),
@@ -489,23 +742,130 @@ class AutomationBridgeClient:
             x2, y2 = self._point(to_target)
             params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
 
-        if visualize is not None:
-            params["visualize"] = visualize
+        controller_lease = min(60.0, max(5.0, duration + hold_before + hold_after + 2.0))
+        params.update(self._input_params(lease=controller_lease))
+        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        if easing != "linear":
+            params["easing"] = easing
+        if hold_before:
+            params["hold_before"] = hold_before
+        if hold_after:
+            params["hold_after"] = hold_after
+        if pointer_id:
+            params["pointer_id"] = pointer_id
+        receipt = InputReceipt(self.post_json("/input/drag", params))
+        return self._wait_input_compat(receipt, wait, timeout or max(5.0, duration + hold_before + hold_after + 5.0))
 
-        response = self.post("/input/drag", params)
-        block_for = max(0.0, duration) + _INPUT_SETTLE_SECONDS if wait is None else wait
-        if block_for:
-            time.sleep(block_for)
-        return response
+    def drag_path(
+        self,
+        points: Sequence[Target],
+        durations: Sequence[float],
+        easing: Union[str, Sequence[str]] = "linear",
+        hold_before: float = 0.0,
+        hold_after: float = 0.0,
+        path: str = "sampled",
+        visualize: Optional[bool] = None,
+        wait: Union[str, bool, float, None] = "released",
+        device: Optional[str] = None,
+        pointer_id: int = 0,
+        expected_scene_sequence: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> InputReceipt:
+        """Run one down/path/up gesture with native segment timing, easing, holds, and curves."""
+        normalized_points = [self._point(point) for point in points]
+        if path not in {"sampled", "linear", "quadratic", "cubic"}:
+            raise ValueError("path must be sampled, linear, quadratic, or cubic")
+        expected_segments = len(normalized_points) - 1 if path in {"sampled", "linear"} else 1
+        if len(normalized_points) < 2:
+            raise ValueError("drag_path requires at least two points")
+        if path == "quadratic" and len(normalized_points) != 3:
+            raise ValueError("quadratic drag_path requires exactly three points")
+        if path == "cubic" and len(normalized_points) != 4:
+            raise ValueError("cubic drag_path requires exactly four points")
+        if len(durations) != expected_segments:
+            raise ValueError(f"drag_path requires exactly {expected_segments} durations")
+        duration_values = [self._input_duration(value, "duration") for value in durations]
+        hold_before = self._input_duration(hold_before, "hold_before")
+        hold_after = self._input_duration(hold_after, "hold_after")
+        total_duration = sum(duration_values) + hold_before + hold_after
+        if total_duration > 60.0:
+            raise ValueError("total gesture duration exceeds 60 seconds")
+        easing_values = [easing] * expected_segments if isinstance(easing, str) else list(easing)
+        if len(easing_values) != expected_segments or any(value not in _INPUT_EASINGS for value in easing_values):
+            raise ValueError(f"drag_path requires {expected_segments} supported easing values")
+        params = self._input_params(lease=min(60.0, max(5.0, total_duration + 2.0)))
+        params.update(
+            {
+                "points": ";".join(f"{x},{y}" for x, y in normalized_points),
+                "durations": ",".join(str(value) for value in duration_values),
+                "easing": ",".join(easing_values),
+                "hold_before": hold_before,
+                "hold_after": hold_after,
+                "path": path,
+                "visualize": visualize,
+                "device": device,
+                "pointer_id": pointer_id,
+                "expected_scene_sequence": expected_scene_sequence,
+            }
+        )
+        receipt = InputReceipt(self.post_json("/input/drag_path", params))
+        return self._wait_input_compat(receipt, wait, timeout or max(5.0, total_duration + 5.0))
 
-    def type_text(self, text: str) -> JsonDict:
-        """Queue plain text keyboard input."""
-        return self.post("/input/key", {"text": text})
+    def pointer(
+        self,
+        start: Target,
+        lease: float = 2.0,
+        visualize: Optional[bool] = None,
+        device: Optional[str] = None,
+        pointer_id: int = 0,
+        expected_scene_sequence: Optional[int] = None,
+    ) -> PointerSession:
+        """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup."""
+        lease = self._input_duration(lease, "lease")
+        if lease <= 0:
+            raise ValueError("lease must be greater than zero")
+        x, y = self._point(start)
+        params = self._input_params(lease=max(5.0, lease))
+        params.update(
+            {
+                "x": x,
+                "y": y,
+                "pointer_lease": lease,
+                "visualize": visualize,
+                "device": device,
+                "pointer_id": pointer_id,
+                "expected_scene_sequence": expected_scene_sequence,
+            }
+        )
+        receipt = InputReceipt(self.post_json("/input/pointer/open", params))
+        return PointerSession(self, receipt, lease)
 
-    def key(self, key: str) -> JsonDict:
-        """Queue a special key such as `KEY_ENTER`."""
+    def type_text(
+        self,
+        text: str,
+        wait: Union[str, bool] = False,
+        expected_scene_sequence: Optional[int] = None,
+        timeout: float = 10.0,
+    ) -> InputReceipt:
+        """Queue FIFO text input and optionally wait for native completion."""
+        params = self._input_params()
+        params.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self.post_json("/input/key", params))
+        return self._wait_input_compat(receipt, wait, timeout)
+
+    def key(
+        self,
+        key: str,
+        wait: Union[str, bool] = False,
+        expected_scene_sequence: Optional[int] = None,
+        timeout: float = 10.0,
+    ) -> InputReceipt:
+        """Queue a FIFO special key such as `KEY_ENTER`."""
         keys = key if key.startswith("{") and key.endswith("}") else f"{{{key}}}"
-        return self.post("/input/key", {"keys": keys})
+        params = self._input_params()
+        params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self.post_json("/input/key", params))
+        return self._wait_input_compat(receipt, wait, timeout)
 
     def screenshot(self, wait: bool = True, timeout: float = 5.0) -> Path:
         """Schedule a screenshot and optionally wait for the PNG file."""
@@ -793,6 +1153,63 @@ class AutomationBridgeClient:
             message = str(error.get("message", response))
             raise AutomationBridgeApiError(code, message, status, response)
         return response.get("data", {})
+
+    def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        url = self.base_url + path
+        compact_payload = {key: value for key, value in payload.items() if value is not None}
+        data = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        status, response = request_json(
+            url,
+            method=method,
+            timeout=self.timeout,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        if not response.get("ok"):
+            error = response.get("error", {})
+            code = str(error.get("code", "unknown"))
+            message = str(error.get("message", response))
+            raise AutomationBridgeApiError(code, message, status, response)
+        return response.get("data", {})
+
+    def _input_params(self, lease: float = 5.0) -> Dict[str, Any]:
+        """Return ownership and per-request correlation fields for mutating input calls."""
+        params: Dict[str, Any] = {
+            "client_id": self.client_id,
+            "session_id": self.session_id,
+            "request_id": f"r-{uuid.uuid4().hex[:12]}",
+        }
+        if lease != 5.0:
+            params["lease"] = lease
+        return params
+
+    def _wait_input_compat(
+        self,
+        receipt: InputReceipt,
+        wait: Union[str, bool, float, None],
+        timeout: float,
+    ) -> InputReceipt:
+        if wait is False or wait == 0:
+            return receipt
+        if wait is None or wait is True:
+            state = "released"
+        elif isinstance(wait, str):
+            state = wait
+        elif isinstance(wait, (int, float)):
+            state = "released"
+            timeout = float(wait)
+        else:
+            raise TypeError("wait must be a lifecycle state, bool, numeric timeout, or None")
+        return self.input.wait(receipt, state=state, timeout=timeout)
+
+    @staticmethod
+    def _input_duration(value: Any, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a number")
+        result = float(value)
+        if result < 0.0 or result > 60.0 or result != result or result in {float("inf"), float("-inf")}:
+            raise ValueError(f"{name} must be finite and between 0 and 60 seconds")
+        return result
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
         url = f"http://127.0.0.1:{self.port}{path}"
