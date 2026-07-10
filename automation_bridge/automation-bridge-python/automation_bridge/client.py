@@ -579,6 +579,7 @@ class AutomationBridgeClient:
         self.client_id = client_id or f"py-{uuid.uuid4().hex[:12]}"
         self.session_id = session_id or f"s-{uuid.uuid4().hex[:12]}"
         self._input_controller = InputController(self)
+        self._active_traces: List[Any] = []
 
     @property
     def input(self) -> InputController:
@@ -741,14 +742,18 @@ class AutomationBridgeClient:
         nodes, metadata, selector_text = self._select_nodes(selector)
         if len(nodes) == 1:
             return nodes[0]
-        raise SelectorError(self._selector_error("expected exactly one node", selector, selector_text, nodes, metadata))
+        error = SelectorError(self._selector_error("expected exactly one node", selector, selector_text, nodes, metadata))
+        self._trace_record("selector_error", {"selector": selector, "error": str(error)})
+        raise error
 
     def maybe_node(self, **selector: Any) -> Optional[Node]:
         """Return zero or one matching node, raising if multiple nodes match."""
         nodes, metadata, selector_text = self._select_nodes(selector)
         if len(nodes) <= 1:
             return nodes[0] if nodes else None
-        raise SelectorError(self._selector_error("expected zero or one node", selector, selector_text, nodes, metadata))
+        error = SelectorError(self._selector_error("expected zero or one node", selector, selector_text, nodes, metadata))
+        self._trace_record("selector_error", {"selector": selector, "error": str(error)})
+        raise error
 
     def by_id(
         self,
@@ -1242,6 +1247,88 @@ class AutomationBridgeClient:
         return ProfilerClient(self.port, timeout=self.timeout, remotery_url=self._remotery_url)
 
     @property
+    def gestures(self) -> "GestureGenerator":
+        """Return deterministic, dependency-free generated gesture helpers."""
+        from .gestures import GestureGenerator
+
+        return GestureGenerator(self)
+
+    def trace(
+        self,
+        path: Union[str, Path],
+        *,
+        screenshots: str = "on_error",
+        screenshot_directory: Optional[Union[str, Path]] = None,
+        prerequisites: Optional[Mapping[str, Any]] = None,
+    ) -> "TraceSession":
+        """Create a diagnostic trace context with explicitly best-effort replay."""
+        from .trace import TraceSession
+
+        return TraceSession(
+            self,
+            path,
+            screenshots=screenshots,
+            screenshot_directory=screenshot_directory,
+            prerequisites=prerequisites,
+        )
+
+    def recording_capabilities(self, backend: Optional[Any] = None) -> Any:
+        """Return explicit optional recorder capabilities without starting it."""
+        if backend is None:
+            from .recording import default_backend
+
+            backend = default_backend()
+        return backend.capabilities()
+
+    def recording_permission_diagnostics(self, backend: Optional[Any] = None) -> Mapping[str, Any]:
+        """Return recorder availability and platform permission guidance."""
+        if backend is None:
+            from .recording import default_backend
+
+            backend = default_backend()
+        return backend.permission_diagnostics()
+
+    def record_video(
+        self,
+        path: Union[str, Path],
+        *,
+        size: Optional[Tuple[int, int]] = None,
+        fps: float = 30.0,
+        video_codec: str = "libx264",
+        audio: str = "none",
+        audio_codec: str = "aac",
+        application: Optional[str] = None,
+        window_title: Optional[str] = None,
+        crop: Optional[Union[str, Tuple[int, int, int, int]]] = None,
+        source_rect: Optional[Tuple[int, int, int, int]] = None,
+        exclude_titlebar: bool = False,
+        extra_args: Sequence[str] = (),
+        backend: Optional[Any] = None,
+    ) -> "RecordingSession":
+        """Start an optional platform recording and return its safe session.
+
+        `crop="content"` uses a rectangle advertised by `/screen`. Exact
+        application audio is capability-gated and is never replaced by a
+        microphone recording.
+        """
+        from .recording import RecordingOptions, default_backend
+
+        selected_backend = backend or default_backend()
+        if crop == "content" and source_rect is None:
+            source_rect = self._recording_content_rect(self.screen())
+        options = RecordingOptions(
+            path=Path(path), size=size, fps=fps, video_codec=video_codec,
+            audio=audio, audio_codec=audio_codec, application=application,
+            window_title=window_title, crop=crop, source_rect=source_rect,
+            exclude_titlebar=exclude_titlebar, extra_args=tuple(extra_args),
+        )
+        session = selected_backend.start(options)
+        if hasattr(session, "_trace_callback"):
+            session._trace_callback = self._trace_record
+        self._trace_record("recording_started", {"path": str(path), "options": options})
+        return session
+
+    @property
     def remotery_url(self) -> Optional[str]:
         """Return the Remotery websocket URL discovered while bootstrapping, if known."""
         return self._remotery_url
@@ -1676,14 +1763,26 @@ class AutomationBridgeClient:
         if encoded_params:
             url += "?" + urllib.parse.urlencode(encoded_params)
 
-        status, response = request_json(url, method=method, timeout=self.timeout, json_body=json_body)
+        request_trace = {"method": method, "path": path, "params": dict(params or {})}
+        if json_body is not None:
+            request_trace["json_body"] = dict(json_body)
+        try:
+            status, response = request_json(url, method=method, timeout=self.timeout, json_body=json_body)
+        except BaseException as error:
+            request_trace["error"] = repr(error)
+            self._trace_record("action" if path.startswith("/input/") else "request_error", request_trace)
+            raise
         if not response.get("ok"):
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
+            request_trace.update({"status": status, "error": response})
+            self._trace_record("action" if path.startswith("/input/") else "request_error", request_trace)
             raise AutomationBridgeApiError(code, message, status, response)
         data = response.get("data", {})
         self._remember_scene_sequence(data)
+        request_trace.update({"status": status, "response": data})
+        self._trace_record("action" if path.startswith("/input/") else "request", request_trace)
         return data
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
@@ -1752,6 +1851,30 @@ class AutomationBridgeClient:
         if result < 0.0 or result > 60.0 or result != result or result in {float("inf"), float("-inf")}:
             raise ValueError(f"{name} must be finite and between 0 and 60 seconds")
         return result
+
+    def _trace_record(self, kind: str, payload: Any) -> None:
+        for trace in tuple(self._active_traces):
+            trace.record(kind, payload)
+
+    @staticmethod
+    def _recording_content_rect(screen: Mapping[str, Any]) -> Optional[Tuple[int, int, int, int]]:
+        containers = [screen]
+        rectangles = screen.get("rectangles")
+        if isinstance(rectangles, Mapping):
+            containers.append(rectangles)
+        for container in containers:
+            # Local viewport/client coordinates are intentionally excluded:
+            # desktop capture needs a rectangle whose global display-pixel
+            # coordinate space is explicit.
+            rectangle = container.get("content_display_pixels")
+            if isinstance(rectangle, Mapping):
+                x = rectangle.get("x", 0)
+                y = rectangle.get("y", 0)
+                width = rectangle.get("width", rectangle.get("w"))
+                height = rectangle.get("height", rectangle.get("h"))
+                if all(isinstance(value, (int, float)) for value in (x, y, width, height)) and width > 0 and height > 0:
+                    return int(x), int(y), int(width), int(height)
+        return None
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
         url = f"http://127.0.0.1:{self.port}{path}"

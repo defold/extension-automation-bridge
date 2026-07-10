@@ -15,6 +15,7 @@ from .client import (
 )
 from .editor import EditorClient
 from .lifecycle import FinalizationHooks
+from .gestures import GestureConstraintError, GestureGenerator, generate_drag
 from .nodes import Bounds, Node
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
 from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry, parse_resources_data
@@ -39,6 +40,16 @@ from .remotery import (
     RemoteryValueStats,
 )
 from .waits import WaitTimeoutError, wait_until
+from .recording import (
+    FFmpegRecordingBackend,
+    RecordingCapabilities,
+    RecordingError,
+    RecordingMetadata,
+    RecordingOptions,
+    RecordingSession,
+    UnsupportedRecordingCapability,
+)
+from .trace import REPLAY_PREREQUISITES, TRACE_VERSION, TraceError, TraceSession
 
 
 __all__ = [
@@ -53,6 +64,9 @@ __all__ = [
     "EventStream",
     "EditorClient",
     "FinalizationHooks",
+    "FFmpegRecordingBackend",
+    "GestureConstraintError",
+    "GestureGenerator",
     "HttpError",
     "InputController",
     "InputExecutionError",
@@ -63,6 +77,11 @@ __all__ = [
     "ProfilerClient",
     "ProfilerDataError",
     "PointerSession",
+    "RecordingCapabilities",
+    "RecordingError",
+    "RecordingMetadata",
+    "RecordingOptions",
+    "RecordingSession",
     "RemoteryCapture",
     "RemoteryClient",
     "RemoteryCounterStats",
@@ -87,6 +106,12 @@ __all__ = [
     "VisualObservation",
     "difference",
     "WaitTimeoutError",
+    "TRACE_VERSION",
+    "TraceError",
+    "TraceSession",
+    "REPLAY_PREREQUISITES",
+    "UnsupportedRecordingCapability",
+    "generate_drag",
     "parse_resources_data",
     "wait_until",
 ]

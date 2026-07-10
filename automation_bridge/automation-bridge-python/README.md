@@ -72,6 +72,7 @@ finalization/abort hooks.
 - Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
 - Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
 - Profiling: `bridge.profiler.resources()`, `bridge.profiler.remotery(...)`, `bridge.profiler.capture(...)`, and `bridge.profiler.start_recording(...)`.
+- Tooling: `bridge.gestures.generate_drag(...)`, `bridge.trace(...)`, `bridge.recording_capabilities(...)`, `bridge.recording_permission_diagnostics(...)`, and optional `bridge.record_video(...)`.
 
 `EditorClient` exposes editor-oriented helpers for advanced bootstrap flows: `from_project(...)`, `build(...)`, `console_lines()`, `engine_service_port()`, `engine_service_ports()`, `latest_registration_engine_service_ports()`, `latest_registration_has_engine_service_port()`, `last_build_had_engine_service_port()`, `endpoint_registered_count()`, `remotery_url()`, `remotery_urls()`, `latest_registration_remotery_urls()`, `remember_engine_service_port(...)`, and `remember_remotery_url(...)`.
 
@@ -293,6 +294,28 @@ must fail with `stale_scene` instead of resolving its id against a newer graph.
 
 Pass `expected_scene_sequence=scene["scene_sequence"]` to click/drag/path/pointer/key calls when stale target protection matters. The native endpoint rejects a changed scene with `stale_scene` before resolving node ids, and every receipt records the scene sequence actually used.
 
+### Deterministic generated gestures
+
+Generated gestures are standard-library helpers layered on the native `drag_path` API. A seed produces identical points and segment durations. Bounds and finite-difference velocity/acceleration limits are enforced before a path is returned:
+
+```python
+gesture = bridge.gestures.generate_drag(
+    start=(120, 800),
+    target=(920, 240),
+    seed=42,
+    duration=(0.7, 0.8),
+    easing="ease_in_out",
+    lateral_offset=(-35, 35),
+    control_points=4,
+    bounds=(0, 0, 1080, 1920),
+    max_velocity=1600,
+    max_acceleration=9000,
+)
+bridge.drag_path(**gesture)
+```
+
+The returned mapping contains only `points`, `durations`, and `easing`, so it can be passed directly to `drag_path`. Velocity is the length of each returned segment divided by its duration. Acceleration is the finite difference between adjacent segment velocities; native easing may impose additional within-segment acceleration. If the endpoints/duration make a constraint impossible, `GestureConstraintError` is raised rather than emitting an implausible path.
+
 Component nodes often expose useful text or properties, while their parent game object is the actionable target. Use `bridge.parent(component_node)` before clicking or dragging when needed:
 
 ```python
@@ -481,6 +504,60 @@ with bridge.log_stream(read_timeout=1.0) as logs:
 
 recent = bridge.read_logs(duration=2.0, limit=20)
 ```
+
+### Trace and diagnostic bundles
+
+Use a trace context to capture initial health/capabilities, geometry and scene; API requests; input actions and receipts; generated paths; selector failures; timestamps; cleanup; and optional error screenshots:
+
+```python
+with bridge.trace(
+    "artifacts/session.trace.json",
+    screenshots="on_error",
+    prerequisites={
+        "application_state": "fixture-standard-v3",
+        "random_seeds": [42],
+        "timing_mode": "native-release-receipts",
+        "external_services": "mock-server snapshot 18",
+    },
+) as trace:
+    gesture = bridge.gestures.generate_drag((100, 100), (500, 300), seed=42)
+    receipt = bridge.drag_path(**gesture)
+    trace.record_acknowledgement({"input_id": receipt.input_id, "accepted": True})
+    trace.record_event({"name": "workflow_complete", "engine_frame": 811})
+    trace.record_state("ui", revision=6, value={"busy": False})
+    trace.record_profiler({"first_frame": 800, "last_frame": 820})
+```
+
+`screenshots` is `"never"`, `"on_error"`, or `"always"`. Trace finalization is atomic and does not replace an active `KeyboardInterrupt` or workflow exception. Low-level event/state/acknowledgement clients may call the explicit `record_*` methods until those optional native APIs are present.
+
+`TraceSession.replay(bridge, path)` replays recorded `/input/*` requests in order and always reports `mode="best-effort"`. Deterministic reproduction additionally requires recorded and restored application state, random seeds, timing mode, and external services. Pass `require_deterministic=True` to reject a trace missing any prerequisite; the helper still cannot restore those systems for the caller.
+
+### Optional platform recording
+
+Recording is isolated from the dependency-free base client. The default companion discovers external `ffmpeg`/`ffprobe` tools at runtime:
+
+```python
+diagnostics = bridge.recording_permission_diagnostics()
+print(diagnostics)
+
+with bridge.record_video(
+    "artifacts/session.mp4",
+    crop="content",
+    size=(1080, 1920),
+    fps=30,
+    video_codec="libx264",
+    audio="none",
+) as recording:
+    run_workflow()
+
+print(recording.metadata.to_dict())
+```
+
+The FFmpeg backend supports display/content-rectangle capture, explicit output scaling/FPS, and detected video encoders. Windows FFmpeg also supports window-title selection. `crop="content"` uses only an explicitly named `content_display_pixels` rectangle from `/screen`; local `client`/`viewport` coordinates are not silently treated as global coordinates. Until the proposed engine contract exists, pass a verified global `source_rect=(x, y, width, height)`. A global content rectangle is also the portable mechanism for title-bar exclusion.
+
+Capabilities are explicit. The default backend rejects `audio="application"`: it does not silently record a microphone or all system audio. Exact application identity/audio requires ScreenCaptureKit, PipeWire portal, or Windows process-audio backends and a stable Defold window contract. See [`docs/recording-platform-contract.md`](../../docs/recording-platform-contract.md) for the engine/platform proposal and current API gap.
+
+On scope exit, the session asks FFmpeg to finalize the container, then terminates only if finalization times out. Metadata includes duration, dimensions, frame rate, codecs, audio channels/sample rate when `ffprobe` can observe them, and whether the file finalized. A finalization failure never masks the original workflow exception.
 
 `bridge.log_stream()` discovers the log port from engine `/info`, performs Defold's `0 OK` log-service handshake, and then yields plain log lines without trailing newlines. The stream only receives logs emitted after it connects; use `EditorClient.console_lines()` when you need the editor's existing console history.
 
