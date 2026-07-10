@@ -25,6 +25,9 @@ JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
+PYTHON_PACKAGE_VERSION = "1.1.0"
+SUPPORTED_API_VERSION_MIN = 1
+SUPPORTED_API_VERSION_MAX = 1
 
 
 class AutomationBridgeError(RuntimeError):
@@ -87,6 +90,18 @@ class InputReceipt(dict):
     @property
     def state(self) -> str:
         return str(self["state"])
+
+
+class IncompatibleApiVersionError(AutomationBridgeError):
+    """Raised when the native API does not overlap the wrapper's supported range."""
+
+    pass
+
+
+class UnsupportedCapabilityError(AutomationBridgeError):
+    """Raised when a declared required capability is unavailable or too old."""
+
+    pass
 
 
 class EngineLogStream:
@@ -533,6 +548,9 @@ def _encode_system_reboot(args: Sequence[str]) -> bytes:
 class AutomationBridgeClient:
     """High-level client for `/automation-bridge/v1` scene inspection and input control."""
 
+    SUPPORTED_API_VERSION_MIN = SUPPORTED_API_VERSION_MIN
+    SUPPORTED_API_VERSION_MAX = SUPPORTED_API_VERSION_MAX
+
     _SERVER_FILTERS = {
         "id",
         "instance_id",
@@ -566,8 +584,10 @@ class AutomationBridgeClient:
         remotery_url: Optional[str] = None,
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        required_capabilities: Sequence[str] = (),
+        optional_capabilities: Sequence[str] = (),
     ):
-        """Create a client with stable controller/session correlation ids."""
+        """Create a correlated client with optional capability declarations."""
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
@@ -580,6 +600,9 @@ class AutomationBridgeClient:
         self.session_id = session_id or f"s-{uuid.uuid4().hex[:12]}"
         self._input_controller = InputController(self)
         self._active_traces: List[Any] = []
+        self._required_capabilities = set(required_capabilities)
+        self._optional_capabilities = set(optional_capabilities)
+        self._last_health: Optional[JsonDict] = None
 
     @property
     def input(self) -> InputController:
@@ -587,7 +610,14 @@ class AutomationBridgeClient:
         return self._input_controller
 
     @classmethod
-    def from_editor(cls, editor: Any, build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
+    def from_editor(
+        cls,
+        editor: Any,
+        build: bool = True,
+        timeout: float = 20.0,
+        required_capabilities: Sequence[str] = (),
+        optional_capabilities: Sequence[str] = (),
+    ) -> "AutomationBridgeClient":
         """Build through `editor`, discover the engine port, and wait for health."""
         if build:
             cls._close_candidate_engine_ports(editor)
@@ -596,17 +626,42 @@ class AutomationBridgeClient:
 
         def bridge_after_build() -> Optional["AutomationBridgeClient"]:
             service_ports = editor.engine_service_ports() if hasattr(editor, "engine_service_ports") else [editor.engine_service_port()]
+            registration_ports = editor.latest_registration_engine_service_ports() if hasattr(editor, "latest_registration_engine_service_ports") else []
             remotery_url = cls._editor_remotery_url(editor, fresh_build=build)
             for service_port in service_ports:
                 if not service_port:
                     continue
                 try:
-                    bridge = cls(service_port, remotery_url=remotery_url)
-                    bridge.health()
+                    bridge = cls(
+                        service_port,
+                        remotery_url=remotery_url,
+                        required_capabilities=required_capabilities,
+                        optional_capabilities=optional_capabilities,
+                    )
+                    health = bridge.health()
+                    registration_is_authoritative = service_port in registration_ports
+                    if hasattr(editor, "validate_cached_engine_health") and not editor.validate_cached_engine_health(
+                        service_port,
+                        health,
+                        fresh_build=build or registration_is_authoritative,
+                    ):
+                        continue
+                except (IncompatibleApiVersionError, UnsupportedCapabilityError):
+                    raise
                 except AutomationBridgeError:
                     continue
                 if hasattr(editor, "remember_engine_service_port"):
-                    editor.remember_engine_service_port(service_port)
+                    identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
+                    editor.remember_engine_service_port(
+                        service_port,
+                        identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
+                        identity.get("project_identity") if isinstance(identity, Mapping) else None,
+                    )
+                if hasattr(editor, "record_lifecycle"):
+                    editor.record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
+                    lifecycle = health.get("lifecycle", {})
+                    if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
+                        editor.record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
                 if remotery_url and hasattr(editor, "remember_remotery_url"):
                     editor.remember_remotery_url(remotery_url)
                 return bridge
@@ -616,10 +671,9 @@ class AutomationBridgeClient:
             return cls._recover_after_stale_build(editor, bridge_after_build, timeout)
 
         try:
-            return wait_until(
+            return cls._wait_for_bridge(
                 bridge_after_build,
                 timeout=timeout,
-                interval=0.1,
                 message="Automation Bridge endpoint did not become ready",
                 retry_exceptions=(AutomationBridgeError,),
             )
@@ -634,13 +688,48 @@ class AutomationBridgeClient:
         cls._close_candidate_engine_ports(editor)
         time.sleep(0.5)
         editor.build()
-        return wait_until(
+        return cls._wait_for_bridge(
             bridge_after_build,
             timeout=timeout,
-            interval=0.1,
             message="Automation Bridge endpoint did not become ready after engine restart",
             retry_exceptions=(AutomationBridgeError,),
         )
+
+    @classmethod
+    def _wait_for_bridge(
+        cls,
+        probe: Any,
+        timeout: float,
+        message: str,
+        retry_exceptions: RetryExceptions = (AutomationBridgeError,),
+    ) -> "AutomationBridgeClient":
+        """Poll transport failures while surfacing protocol/capability errors immediately."""
+        started = time.monotonic()
+        deadline = time.monotonic() + timeout
+        last_error: Optional[BaseException] = None
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            try:
+                bridge = probe()
+                if bridge is not None:
+                    return bridge
+            except (IncompatibleApiVersionError, UnsupportedCapabilityError):
+                raise
+            except retry_exceptions as exc:
+                last_error = exc
+            time.sleep(0.1)
+        error = WaitTimeoutError(
+            message,
+            last_value=None,
+            elapsed=time.monotonic() - started,
+            attempts=attempts,
+            scene_sequence=None,
+            last_exception=last_error,
+        )
+        if last_error is not None:
+            raise error from last_error
+        raise error
 
     @staticmethod
     def _last_build_missing_engine_service_port(editor: Any) -> bool:
@@ -658,12 +747,25 @@ class AutomationBridgeClient:
         return None
 
     @classmethod
-    def from_project(cls, root: Union[str, Path] = ".", build: bool = True, timeout: float = 20.0) -> "AutomationBridgeClient":
+    def from_project(
+        cls,
+        root: Union[str, Path] = ".",
+        build: bool = True,
+        timeout: float = 20.0,
+        required_capabilities: Sequence[str] = (),
+        optional_capabilities: Sequence[str] = (),
+    ) -> "AutomationBridgeClient":
         """Create an editor client from `root`, then connect to the Automation Bridge API."""
         from .editor import EditorClient
 
         editor = EditorClient.from_project(root)
-        return cls.from_editor(editor, build=build, timeout=timeout)
+        return cls.from_editor(
+            editor,
+            build=build,
+            timeout=timeout,
+            required_capabilities=required_capabilities,
+            optional_capabilities=optional_capabilities,
+        )
 
     def wait_ready(
         self,
@@ -705,12 +807,107 @@ class AutomationBridgeClient:
         return self._request("DELETE", path, params)
 
     def health(self) -> JsonDict:
-        """Return API version, capabilities, platform, and screen data."""
+        """Return and validate API version, capabilities, identity, and backend data."""
         data = self.get("/health")
+        self._validate_health(data)
+        self._last_health = data
         screen = data.get("screen")
         if isinstance(screen, Mapping):
             self._remember_window_size(screen)
         return data
+
+    @property
+    def engine_instance_id(self) -> Optional[str]:
+        """Return the last validated engine-instance id, if the native API supplies one."""
+        if not isinstance(self._last_health, Mapping):
+            return None
+        identity = self._last_health.get("identity")
+        if not isinstance(identity, Mapping):
+            return None
+        value = identity.get("engine_instance_id")
+        return value if isinstance(value, str) and value else None
+
+    def lifecycle(self) -> JsonDict:
+        """Return native runtime lifecycle stages and their monotonic timestamps."""
+        self.require("runtime.lifecycle")
+        return self.get("/lifecycle")
+
+    def require(self, *capabilities: str) -> "AutomationBridgeClient":
+        """Declare mandatory capabilities and fail clearly when any are unavailable.
+
+        A declaration may include a minimum feature version as ``name>=2``.
+        """
+        self._required_capabilities.update(capabilities)
+        self._validate_required_capabilities(self.health())
+        return self
+
+    def optional(self, *capabilities: str) -> Dict[str, bool]:
+        """Declare optional capabilities and return their current availability."""
+        self._optional_capabilities.update(capabilities)
+        health = self.health()
+        versions = self._capability_versions(health)
+        return {declaration: self._capability_satisfies(declaration, versions) for declaration in capabilities}
+
+    def trace_metadata(self) -> JsonDict:
+        """Return stable metadata to embed in trace bundles and CI artifacts."""
+        health = self.health()
+        return {
+            "python_package_version": PYTHON_PACKAGE_VERSION,
+            "native_version": health.get("native_version"),
+            "api_version": health.get("version"),
+            "capability_versions": self._capability_versions(health),
+            "identity": health.get("identity"),
+            "backend": health.get("backend"),
+            "platform": health.get("platform"),
+        }
+
+    def _validate_health(self, health: Mapping[str, Any]) -> None:
+        version = self._parse_version(health.get("version"), "native API")
+        if version < self.SUPPORTED_API_VERSION_MIN or version > self.SUPPORTED_API_VERSION_MAX:
+            raise IncompatibleApiVersionError(
+                f"native Automation Bridge API version {version} is incompatible with Python "
+                f"{PYTHON_PACKAGE_VERSION}; supported native range is "
+                f"{self.SUPPORTED_API_VERSION_MIN}..{self.SUPPORTED_API_VERSION_MAX}"
+            )
+        self._validate_required_capabilities(health)
+
+    def _validate_required_capabilities(self, health: Mapping[str, Any]) -> None:
+        versions = self._capability_versions(health)
+        missing = [declaration for declaration in sorted(self._required_capabilities) if not self._capability_satisfies(declaration, versions)]
+        if missing:
+            backend = health.get("backend", {})
+            raise UnsupportedCapabilityError(
+                f"required Automation Bridge capabilities are unavailable or too old: {', '.join(missing)}; "
+                f"available={', '.join(sorted(versions)) or 'none'}; backend={backend!r}"
+            )
+
+    @staticmethod
+    def _parse_version(value: Any, label: str) -> int:
+        try:
+            return int(str(value).split(".", 1)[0])
+        except (TypeError, ValueError) as exc:
+            raise IncompatibleApiVersionError(f"{label} returned invalid version {value!r}") from exc
+
+    @classmethod
+    def _capability_versions(cls, health: Mapping[str, Any]) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        capabilities = health.get("capabilities", [])
+        if isinstance(capabilities, (list, tuple, set)):
+            for name in capabilities:
+                if isinstance(name, str):
+                    result[name] = 1
+        versions = health.get("capability_versions", {})
+        if isinstance(versions, Mapping):
+            for name, version in versions.items():
+                if isinstance(name, str):
+                    result[name] = cls._parse_version(version, f"capability {name}")
+        return result
+
+    @classmethod
+    def _capability_satisfies(cls, declaration: str, versions: Mapping[str, int]) -> bool:
+        name, separator, minimum = declaration.partition(">=")
+        required_version = cls._parse_version(minimum, f"capability declaration {declaration}") if separator else 1
+        return versions.get(name, 0) >= required_version
 
     def screen(self) -> JsonDict:
         """Return window, backbuffer, viewport, and coordinate metadata."""
@@ -1446,10 +1643,16 @@ class AutomationBridgeClient:
         for service_port in service_ports:
             if not service_port:
                 continue
+            if hasattr(editor, "record_lifecycle"):
+                editor.record_lifecycle("previous_engine_closing", port=service_port)
             try:
                 cls(service_port, timeout=1.0).close_engine(timeout=1.0)
-            except AutomationBridgeError:
+            except AutomationBridgeError as exc:
+                if hasattr(editor, "record_lifecycle"):
+                    editor.record_lifecycle("previous_engine_close_failed", port=service_port, error=str(exc))
                 continue
+            if hasattr(editor, "record_lifecycle"):
+                editor.record_lifecycle("previous_engine_closed", port=service_port)
 
     def _wait_until_unavailable(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout

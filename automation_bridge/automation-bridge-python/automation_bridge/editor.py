@@ -1,5 +1,6 @@
 """Client for the Defold editor HTTP server used to build and find the engine."""
 
+import json
 import re
 import time
 from pathlib import Path
@@ -30,8 +31,10 @@ class EditorClient:
         self.port = int(port)
         self.base_url = f"http://localhost:{self.port}"
         self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
+        self._cached_engine_identity = self._read_cached_engine_identity()
         self._remotery_url: Optional[str] = self._read_cached_remotery_url()
         self._last_build_had_engine_service_port: Optional[bool] = None
+        self._lifecycle_events = []
 
     @classmethod
     def from_project(cls, root: Union[str, Path] = ".") -> "EditorClient":
@@ -40,16 +43,23 @@ class EditorClient:
 
     def build(self, timeout: float = 60.0) -> None:
         """Build/run the project and wait until the Automation Bridge HTTP endpoint registers."""
+        self.record_lifecycle("editor_build_started")
         previous_lines = self.console_lines()
         previous_registration_count = self._endpoint_registered_count(previous_lines)
         previous_registration_ports = self._latest_registration_engine_service_ports(previous_lines)
         previous_port = self.engine_service_port()
         if previous_port is not None:
             self._engine_service_port = previous_port
-        _, response = request_json(f"{self.base_url}/command/build", method="POST", timeout=timeout)
+        try:
+            _, response = request_json(f"{self.base_url}/command/build", method="POST", timeout=timeout)
+        except Exception as exc:
+            self.record_lifecycle("editor_build_failed", error=str(exc))
+            raise
         if not response.get("success"):
             issues = response.get("issues", [])
+            self.record_lifecycle("editor_build_failed", issues=issues)
             raise AutomationBridgeError(f"Defold build failed: {issues}")
+        self.record_lifecycle("editor_build_completed")
 
         try:
             wait_until(
@@ -62,7 +72,9 @@ class EditorClient:
                 message="Defold build completed, but Automation Bridge endpoint did not register",
             )
         except AssertionError as exc:
+            self.record_lifecycle("new_engine_registration_failed", error=str(exc))
             raise AutomationBridgeError(str(exc)) from exc
+        self.record_lifecycle("new_engine_registered")
         self._last_build_had_engine_service_port = self.latest_registration_has_engine_service_port()
         time.sleep(0.2)
 
@@ -167,10 +179,56 @@ class EditorClient:
         start_index = previous_endpoint_index + 1 if previous_endpoint_index is not None else 0
         return lines[start_index:endpoint_index]
 
-    def remember_engine_service_port(self, port: int) -> None:
-        """Remember a validated Automation Bridge API port for reused-engine builds."""
+    def remember_engine_service_port(
+        self,
+        port: int,
+        engine_instance_id: Optional[str] = None,
+        project_identity: Optional[str] = None,
+    ) -> None:
+        """Remember a validated port and identity so stale port reuse is detectable."""
         self._engine_service_port = int(port)
         self._write_cached_engine_service_port(self._engine_service_port)
+        self._cached_engine_identity = {
+            "port": self._engine_service_port,
+            "engine_instance_id": engine_instance_id,
+            "project_identity": project_identity,
+        }
+        self._write_cached_engine_identity(self._cached_engine_identity)
+
+    def validate_cached_engine_health(self, port: int, health: dict, fresh_build: bool = False) -> bool:
+        """Reject a cached-only port when it now belongs to a different engine/project.
+
+        Fresh editor registrations are authoritative and replace the cache. When attaching
+        without a build, an instance mismatch means the operating system reused the port.
+        """
+        cached = self._cached_engine_identity
+        if not isinstance(cached, dict) or cached.get("port") != int(port):
+            return True
+        identity = health.get("identity", {}) if isinstance(health, dict) else {}
+        if not isinstance(identity, dict):
+            return not cached.get("engine_instance_id")
+        cached_project = cached.get("project_identity")
+        current_project = identity.get("project_identity")
+        if cached_project and current_project and cached_project != current_project:
+            self.record_lifecycle("cached_port_rejected", port=port, reason="project_identity_mismatch")
+            return False
+        cached_instance = cached.get("engine_instance_id")
+        current_instance = identity.get("engine_instance_id")
+        if not fresh_build and cached_instance and current_instance != cached_instance:
+            self.record_lifecycle("cached_port_rejected", port=port, reason="engine_instance_mismatch")
+            return False
+        return True
+
+    def record_lifecycle(self, stage: str, **details: object) -> None:
+        """Record an observable editor/bootstrap lifecycle transition."""
+        event = {"stage": stage, "state": "completed", "monotonic": time.monotonic()}
+        event.update(details)
+        self._lifecycle_events.append(event)
+
+    @property
+    def lifecycle_events(self) -> list:
+        """Return a copy of editor/bootstrap lifecycle events observed by this client."""
+        return [dict(event) for event in self._lifecycle_events]
 
     def remember_remotery_url(self, url: str) -> None:
         """Remember the Remotery websocket URL for reused-engine builds."""
@@ -208,6 +266,22 @@ class EditorClient:
         path = self._engine_service_port_cache_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{port}\n", encoding="utf-8")
+
+    @property
+    def _engine_identity_cache_path(self) -> Path:
+        return self.root / ".internal" / "automation_bridge.engine.identity.json"
+
+    def _read_cached_engine_identity(self) -> Optional[dict]:
+        try:
+            value = json.loads(self._engine_identity_cache_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _write_cached_engine_identity(self, value: dict) -> None:
+        path = self._engine_identity_cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
     @property
     def _remotery_url_cache_path(self) -> Path:

@@ -24,6 +24,22 @@ with bridge.log_stream(read_timeout=1.0) as logs:
     print(logs.readline(timeout=1.0))
 ```
 
+Declare required and optional capabilities explicitly:
+
+```python
+bridge = AutomationBridgeClient.from_project(
+    ".",
+    required_capabilities=["runtime.lifecycle", "application.events>=1"],
+    optional_capabilities=["scene", "screenshot", "input.drag"],
+)
+availability = bridge.optional("scene", "screenshot", "input.drag")
+metadata = bridge.trace_metadata()
+```
+
+Incompatible native APIs raise `IncompatibleApiVersionError`. Missing or too-old
+required features raise `UnsupportedCapabilityError` with backend and available-feature
+details.
+
 Close the running engine when a script needs to clean up after itself:
 
 ```python
@@ -64,6 +80,7 @@ finalization/abort hooks.
 - Bootstrap: `AutomationBridgeClient(port)`, `from_project(...)`, `from_editor(...)`, and `wait_ready(...)`.
 - Raw API passthrough: `get(...)`, `post(...)`, `put(...)`, `post_json(...)`, and `put_json(...)`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
+- Negotiation/lifecycle: `require(...)`, `optional(...)`, `lifecycle()`, `engine_instance_id`, and `trace_metadata()`.
 - Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
 - Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`, `type_text(...)`, `key(...)`, and `bridge.input` queue/status/cancel/flush/configure methods.
 - Application synchronization: `events(...)`, `wait_for_ack(...)`, `states(...)`, `state(...)`, `wait_for_state(...)`, `start_command(...)`, `command_status(...)`, `cancel_command(...)`, `command(...)`, and `mark(...)`.
@@ -87,7 +104,7 @@ re-query after clicks, drags, or scene changes.
 ## Bootstrap
 
 Use the editor client when you want explicit control over the Defold editor server. `AutomationBridgeClient.from_editor(..., build=True)` closes known candidate engine ports before building so repeated runs start from a fresh engine process. `build()` waits until the runtime logs `Automation Bridge endpoint registered`, then waits another 0.2 seconds before returning.
-When the editor reuses the same running engine process, it may not print a fresh engine service port before `Automation Bridge endpoint registered`; `EditorClient` reuses the last port it saw and stores it in `.internal/automation_bridge.engine.port`.
+When the editor reuses the same running engine process, it may not print a fresh engine service port before `Automation Bridge endpoint registered`; `EditorClient` reuses the last port it saw and stores it in `.internal/automation_bridge.engine.port`. It stores the validated opaque engine/project identity in `.internal/automation_bridge.engine.identity.json`; attach without a fresh build rejects a cached port reassigned to another engine instance or project.
 The same bootstrap reads Defold's `Initialized Remotery (ws://.../rmt)` log line when it is present and stores it in `.internal/automation_bridge.remotery.url`, so `bridge.profiler.remotery()` can connect without a hard-coded port when discovery succeeds. If no fresh Remotery URL is discovered, the helper falls back to Defold's default Remotery port; pass `url=` or `port=` to override it.
 If the latest build logs `Automation Bridge endpoint registered` without a fresh engine service port before it, `AutomationBridgeClient.from_editor(..., build=True)` immediately tries to close candidate engine ports with `@system/exit`, rebuilds once, and retries. It uses the same recovery path if discovered ports do not serve `/automation-bridge/v1/health`.
 
@@ -100,6 +117,25 @@ editor.build()
 bridge = AutomationBridgeClient.from_editor(editor, build=False)
 bridge.wait_ready()
 ```
+
+`EditorClient.lifecycle_events` records build start/success/failure,
+previous-engine closing/closed, new registration, bridge health, initial scene readiness,
+and cached-port rejection. Native timestamps are available from `bridge.lifecycle()`.
+
+## Version and Capability Negotiation
+
+The wrapper supports native API versions `1..1`. Flat capability lists from legacy v1
+servers imply feature version 1; newer health responses provide explicit
+`capability_versions`. Use `name>=N` for behavior introduced by a later feature version.
+Optional capabilities do not disable the client, allowing health, lifecycle,
+application sync, and tracing to remain usable when scene, graphics, screenshots,
+windows, or HID are unavailable. `trace_metadata()` records both native and Python
+package versions.
+
+Defold currently lacks a public debug web service for `DM_HEADLESS` and a public
+project-content build id. See
+[`docs/defold-headless-lifecycle-api.md`](../../docs/defold-headless-lifecycle-api.md)
+for the supported fallback and exact engine proposal.
 
 Use an already-started engine service port directly:
 

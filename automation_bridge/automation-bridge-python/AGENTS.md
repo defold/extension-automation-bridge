@@ -3,13 +3,17 @@
 - Purpose: dependency-free Python helpers for driving a Defold debug build through the Automation Bridge HTTP API. Use it for editor/bootstrap automation, runtime scene inspection, node selection, input, screenshots, logs, window control, reboot/shutdown, resource data, and Remotery profiling.
 - Setup from this repo: add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path`, then import `AutomationBridgeClient`, `EditorClient`, or `wait_until` from `automation_bridge` as needed.
 - Public APIs have docstrings. Use `help(AutomationBridgeClient)`, `help(AutomationBridgeClient.drag)`, or `.__doc__` for quick in-code reference.
-- Normal bootstrap: `bridge = AutomationBridgeClient.from_project(".", build=True)`. It builds through the editor, discovers/caches the engine service port and, when present in fresh logs, the Remotery URL, handles stale reused engine ports, and waits for `/automation-bridge/v1/health`. If Remotery discovery is missing, `bridge.profiler.remotery()` falls back to Defold's default port; pass `url=` or `port=` to override it.
+- Normal bootstrap: `bridge = AutomationBridgeClient.from_project(".", build=True)`. It builds through the editor, discovers/caches the engine service port plus engine/project identity and, when present in fresh logs, the Remotery URL, rejects stale reused ports, and waits for `/automation-bridge/v1/health`. Declare mandatory/optional features with `required_capabilities=[...]` and `optional_capabilities=[...]` or `bridge.require(...)`/`bridge.optional(...)`. If Remotery discovery is missing, `bridge.profiler.remotery()` falls back to Defold's default port; pass `url=` or `port=` to override it.
 - Use `AutomationBridgeClient.from_editor(editor, build=True)` for explicit editor control, `AutomationBridgeClient(port)` for an already known engine port, and `AUTOMATION_BRIDGE_ENGINE_PORT` only when a running port is known.
-- Core API also includes `convert_point(...)`, `wait_frames(...)`, transient
+- Core API includes `health()`, `lifecycle()`, `require(...)`, `optional(...)`,
+  `trace_metadata()`, scene/node queries, FIFO input and pointer sessions,
+  application events/state/commands, recording/tracing, and diagnostic waits.
+- It also includes `convert_point(...)`, `wait_frames(...)`, transient
   observation receipts, `assert_node(...)`, atomic screenshot receipts, and the
   explicit visual stability/change layer.
 - Exact, boolean, identity, and pagination selectors are native. `count()` is
   complete regardless of the response page limit.
+- Native `type`/`name`/`text`/`url` matching is case-insensitive substring matching. Use `name_exact` or `text_exact` when exact matching matters.
 - `Node` objects are snapshots with fields like `id`, `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, `visible`, `enabled`, `bounds`, `center`, `children`, and `raw`. Re-query after clicks, drags, collection changes, or UI updates.
 - Component nodes often expose useful labels/properties while the parent game object receives input. Use `bridge.parent(component_node)` before clicking or dragging when needed.
 - Input accepts nodes, node ids, point mappings, `(x, y)` tuples, or raw `x, y` coordinates. Coordinates are top-left screen pixels. `drag(..., duration=...)` waits for the queued drag to finish by default.

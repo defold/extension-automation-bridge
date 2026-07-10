@@ -1,17 +1,22 @@
 """Public exports for the Automation Bridge Python wrapper."""
 
 from .client import (
+    PYTHON_PACKAGE_VERSION,
+    SUPPORTED_API_VERSION_MAX,
+    SUPPORTED_API_VERSION_MIN,
     AutomationBridgeApiError,
     AutomationBridgeClient,
     AutomationBridgeError,
     EngineLogStream,
     HttpError,
+    IncompatibleApiVersionError,
     InputController,
     InputExecutionError,
     InputInterruptionScope,
     InputReceipt,
     PointerSession,
     SelectorError,
+    UnsupportedCapabilityError,
 )
 from .editor import EditorClient
 from .lifecycle import FinalizationHooks
@@ -53,6 +58,9 @@ from .trace import REPLAY_PREREQUISITES, TRACE_VERSION, TraceError, TraceSession
 
 
 __all__ = [
+    "PYTHON_PACKAGE_VERSION",
+    "SUPPORTED_API_VERSION_MAX",
+    "SUPPORTED_API_VERSION_MIN",
     "AutomationBridgeApiError",
     "AutomationBridgeClient",
     "Bounds",
@@ -68,6 +76,7 @@ __all__ = [
     "GestureConstraintError",
     "GestureGenerator",
     "HttpError",
+    "IncompatibleApiVersionError",
     "InputController",
     "InputExecutionError",
     "InputInterruptionScope",
@@ -112,6 +121,7 @@ __all__ = [
     "REPLAY_PREREQUISITES",
     "UnsupportedRecordingCapability",
     "generate_drag",
+    "UnsupportedCapabilityError",
     "parse_resources_data",
     "wait_until",
 ]
