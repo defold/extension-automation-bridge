@@ -6,6 +6,7 @@ import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -26,6 +27,7 @@ from automation_bridge import (  # noqa: E402
     EngineLogStream,
     EventBufferOverflow,
     EventStream,
+    IncompatibleApiVersionError,
     InputExecutionError,
     InputReceipt,
     Node,
@@ -36,6 +38,7 @@ from automation_bridge import (  # noqa: E402
     RemoteryProtocolError,
     RemoteryRecording,
     ScreenshotReceipt,
+    UnsupportedCapabilityError,
     WaitTimeoutError,
     difference,
     wait_until,
@@ -239,6 +242,98 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(2000, bridge.requests[0][2]["timeout_ms"])
         self.assertEqual(12, marker["event_sequence"])
         self.assertEqual(1234, bridge.requests[1][2]["recording_timestamp_us"])
+
+    def test_health_rejects_incompatible_native_api_version(self):
+        bridge = FakeEngineClient()
+        bridge._api_version = "2"
+
+        with self.assertRaisesRegex(IncompatibleApiVersionError, "supported native range is 1..1"):
+            bridge.health()
+
+    def test_bridge_startup_does_not_retry_incompatible_api(self):
+        calls = []
+
+        def incompatible_probe():
+            calls.append(True)
+            raise IncompatibleApiVersionError("unsupported")
+
+        with self.assertRaises(IncompatibleApiVersionError):
+            AutomationBridgeClient._wait_for_bridge(incompatible_probe, timeout=1.0, message="not ready")
+
+        self.assertEqual([True], calls)
+
+    def test_required_capability_reports_backend_and_available_capabilities(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "scene"])
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "application.events"):
+            bridge.require("application.events")
+
+    def test_capability_versions_support_minimum_declarations(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "scene"])
+        bridge._capability_versions_data = {"scene": "2"}
+
+        self.assertEqual({"scene>=2": True, "scene>=3": False}, bridge.optional("scene>=2", "scene>=3"))
+
+    def test_trace_metadata_records_native_and_python_versions(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health"])
+
+        metadata = bridge.trace_metadata()
+
+        self.assertEqual("1.1.0", metadata["python_package_version"])
+        self.assertEqual("1.1.0", metadata["native_version"])
+        self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
+
+    def test_headless_capability_subset_keeps_health_and_lifecycle_usable(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "runtime.lifecycle", "application.events"])
+        bridge._backend = {"headless": True, "graphics": False, "hid": False}
+
+        health = bridge.health()
+        optional = bridge.optional("application.events", "scene", "screenshot", "input.drag")
+
+        self.assertTrue(health["backend"]["headless"])
+        self.assertEqual(
+            {"application.events": True, "scene": False, "screenshot": False, "input.drag": False},
+            optional,
+        )
+
+    def test_editor_rejects_cached_port_reused_by_another_engine_instance(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
+                encoding="utf-8",
+            )
+            editor = EditorClient(root, port=12345)
+
+            accepted = editor.validate_cached_engine_health(
+                43210,
+                {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
+                fresh_build=False,
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual("cached_port_rejected", editor.lifecycle_events[-1]["stage"])
+
+    def test_editor_accepts_new_instance_after_fresh_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
+                encoding="utf-8",
+            )
+            editor = EditorClient(root, port=12345)
+
+            accepted = editor.validate_cached_engine_health(
+                43210,
+                {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
+                fresh_build=True,
+            )
+
+        self.assertTrue(accepted)
 
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
@@ -1063,12 +1158,22 @@ class FakeEngineClient(AutomationBridgeClient):
         self._screen = screen or {"window": {"width": 800, "height": 600}}
         self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
+        self._api_version = "1"
+        self._capability_versions_data = {name: "1" for name in self._capabilities}
+        self._backend = {"headless": False, "graphics": True, "hid": True}
 
     def _request(self, method, path, params=None, json_body=None):
         request_values = json_body if json_body is not None else params
         self.api_requests.append((method, path, dict(request_values) if request_values is not None else None))
         if method == "GET" and path == "/health":
-            return {"version": "1", "capabilities": list(self._capabilities), "screen": self._screen}
+            return {
+                "version": self._api_version,
+                "native_version": "1.1.0",
+                "capabilities": list(self._capabilities),
+                "capability_versions": dict(self._capability_versions_data),
+                "backend": dict(self._backend),
+                "screen": self._screen,
+            }
         if method == "GET" and path == "/screen":
             return self._screen
         if method == "PUT" and path == "/screen":
@@ -1719,10 +1824,18 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def run_automation_bridge_api_end_to_end(self):
         health = self.bridge.health()
         self.assertEqual("1", health["version"])
+        self.assertEqual("1.1.0", health["native_version"])
         self.assertIn("scene", health["capabilities"])
         self.assertIn("input.click", health["capabilities"])
         self.assertIn("scene.pagination", health["capabilities"])
         self.assertGreaterEqual(health["engine_frame"], 0)
+        self.assertEqual("1", health["capability_versions"]["scene"])
+        self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
+        self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
+        self.assertGreater(health["identity"]["start_wall_time_us"], 0)
+        self.assertGreater(health["identity"]["start_monotonic_time_us"], 0)
+        self.assertEqual("initial_scene_ready", health["lifecycle"]["current_stage"])
+        self.assertEqual(health["identity"]["engine_instance_id"], self.bridge.health()["identity"]["engine_instance_id"])
 
         screen = self.bridge.screen()
         self.assertEqual("top-left", screen["coordinates"]["origin"])
