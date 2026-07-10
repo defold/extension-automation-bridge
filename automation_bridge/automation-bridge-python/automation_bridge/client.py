@@ -26,7 +26,7 @@ JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "2.1.0"
+PYTHON_PACKAGE_VERSION = "2.2.0"
 SUPPORTED_API_VERSION_MIN = 1
 SUPPORTED_API_VERSION_MAX = 1
 
@@ -1982,26 +1982,6 @@ class AutomationBridgeClient:
     def _trace_record(self, kind: str, payload: Any) -> None:
         for trace in tuple(self._active_traces):
             trace.record(kind, payload)
-
-    @staticmethod
-    def _recording_content_rect(screen: Mapping[str, Any]) -> Optional[Tuple[int, int, int, int]]:
-        containers = [screen]
-        rectangles = screen.get("rectangles")
-        if isinstance(rectangles, Mapping):
-            containers.append(rectangles)
-        for container in containers:
-            # Local viewport/client coordinates are intentionally excluded:
-            # desktop capture needs a rectangle whose global display-pixel
-            # coordinate space is explicit.
-            rectangle = container.get("content_display_pixels")
-            if isinstance(rectangle, Mapping):
-                x = rectangle.get("x", 0)
-                y = rectangle.get("y", 0)
-                width = rectangle.get("width", rectangle.get("w"))
-                height = rectangle.get("height", rectangle.get("h"))
-                if all(isinstance(value, (int, float)) for value in (x, y, width, height)) and width > 0 and height > 0:
-                    return int(x), int(y), int(width), int(height)
-        return None
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
         url = f"http://127.0.0.1:{self.port}{path}"

@@ -18,7 +18,7 @@ namespace dmAutomationBridge
 {
     static const char* API_PREFIX = "/automation-bridge/v1";
     static const char* API_VERSION = "1";
-    static const char* NATIVE_VERSION = "1.1.0";
+    static const char* NATIVE_VERSION = "1.2.0";
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_INPUT_HISTORY = 256;
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;

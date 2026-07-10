@@ -24,6 +24,9 @@
   `wait_for_disappearance(...)`.
 - Optional tools are namespaced: `bridge.visual`, `bridge.gestures`,
   `bridge.recording`, `bridge.profiler`, and `bridge.trace(...)`.
+- `bridge.recording` uses the native macOS ScreenCaptureKit recorder embedded
+  in the engine (macOS 15+). It captures the current Defold process window to
+  H.264 MP4, supports application audio, and does not require FFmpeg.
 - Profiling is publicly named only as profiling. The internal stream protocol
   implementation lives in `remotery.py`; callers use `bridge.profiler` and
   profiler-named types from `automation_bridge.profiler`.

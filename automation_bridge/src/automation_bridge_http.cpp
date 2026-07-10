@@ -1,5 +1,6 @@
 #include "automation_bridge_private.h"
 #include "automation_bridge_defold_private_api.h"
+#include "automation_bridge_recording.h"
 
 #if defined(DM_DEBUG)
 
@@ -747,6 +748,11 @@ namespace dmAutomationBridge
         if (IsScreenshotSupported())
         {
             AppendCapability(&names, &versions, &first, "screenshot");
+        }
+        if (IsNativeRecordingSupported())
+        {
+            AppendCapability(&names, &versions, &first, "recording.video");
+            AppendCapability(&names, &versions, &first, "recording.application_audio");
         }
         StringBufferAppend(out, "[ ");
         StringBufferAppend(out, names.m_Data ? names.m_Data : "");
@@ -2106,6 +2112,151 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static void AppendRecordingStatusJson(StringBuffer* out, const RecordingStatus* status)
+    {
+        StringBufferAppend(out, "{\"supported\":");
+        StringBufferAppend(out, status->m_Supported ? "true" : "false");
+        StringBufferAppend(out, ",\"active\":");
+        StringBufferAppend(out, status->m_Active ? "true" : "false");
+        StringBufferAppend(out, ",\"finalized\":");
+        StringBufferAppend(out, status->m_Finalized ? "true" : "false");
+        StringBufferAppend(out, ",\"backend\":\"screen_capture_kit\",\"container\":\"mp4\",\"video_codec\":\"h264\"");
+        StringBufferAppend(out, ",\"audio\":");
+        StringBufferAppend(out, status->m_Audio ? "true" : "false");
+        StringBufferAppend(out, ",\"width\":");
+        AppendNumber(out, (double)status->m_Width);
+        StringBufferAppend(out, ",\"height\":");
+        AppendNumber(out, (double)status->m_Height);
+        StringBufferAppend(out, ",\"fps\":");
+        AppendNumber(out, (double)status->m_Fps);
+        StringBufferAppend(out, ",\"path\":");
+        if (status->m_Path[0]) AppendJsonString(out, status->m_Path); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"started_wall_time_us\":");
+        if (status->m_StartedWallTime) AppendTimestamp(out, status->m_StartedWallTime); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"started_monotonic_time_us\":");
+        if (status->m_StartedMonotonicTime) AppendTimestamp(out, status->m_StartedMonotonicTime); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"stopped_wall_time_us\":");
+        if (status->m_StoppedWallTime) AppendTimestamp(out, status->m_StoppedWallTime); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"stopped_monotonic_time_us\":");
+        if (status->m_StoppedMonotonicTime) AppendTimestamp(out, status->m_StoppedMonotonicTime); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"duration_seconds\":");
+        if (status->m_StartedMonotonicTime && status->m_StoppedMonotonicTime >= status->m_StartedMonotonicTime)
+        {
+            AppendNumber(out, (double)(status->m_StoppedMonotonicTime - status->m_StartedMonotonicTime) / 1000000.0);
+        }
+        else
+        {
+            StringBufferAppend(out, "null");
+        }
+        StringBufferAppend(out, ",\"failure\":");
+        if (status->m_Failure[0]) AppendJsonString(out, status->m_Failure); else StringBufferAppend(out, "null");
+        StringBufferAppend(out, "}");
+    }
+
+    static void SendRecordingStatus(RequestContext* ctx, const RecordingStatus* status)
+    {
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendRecordingStatusJson(&response, status);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleRecordingCapabilities(RequestContext* ctx)
+    {
+        RecordingStatus status;
+        GetNativeRecordingStatus(&status);
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"backend\":\"screen_capture_kit\",\"available\":");
+        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, ",\"application_window\":");
+        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, ",\"application_audio\":");
+        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, ",\"resize_output\":");
+        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, ",\"frame_rate\":");
+        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, ",\"containers\":[\"mp4\"],\"video_codecs\":[\"h264\"],\"minimum_macos_version\":\"15.0\",\"reason\":");
+        if (!status.m_Supported && status.m_Failure[0]) AppendJsonString(&response, status.m_Failure); else StringBufferAppend(&response, "null");
+        StringBufferAppend(&response, "}}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleRecordingStatus(RequestContext* ctx)
+    {
+        RecordingStatus status;
+        GetNativeRecordingStatus(&status);
+        SendRecordingStatus(ctx, &status);
+    }
+
+    static void HandleRecordingStart(RequestContext* ctx)
+    {
+        if (!IsNativeRecordingSupported())
+        {
+            RequestSendError(ctx, 501, "recording_unsupported", "native video recording requires macOS 15 or newer");
+            return;
+        }
+        const char* path = RequestGetParam(ctx, "path");
+        if (IsEmpty(path))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide a non-empty output path");
+            return;
+        }
+        uint32_t width = 0;
+        uint32_t height = 0;
+        bool has_width = !IsEmpty(RequestGetParam(ctx, "width"));
+        bool has_height = !IsEmpty(RequestGetParam(ctx, "height"));
+        if (has_width != has_height ||
+            (has_width && (!RequestGetUIntParam(ctx, "width", &width, 16384) ||
+                           !RequestGetUIntParam(ctx, "height", &height, 16384))))
+        {
+            RequestSendError(ctx, 400, "bad_request", "width and height must be positive integers no greater than 16384, or both omitted");
+            return;
+        }
+        uint32_t fps = 30;
+        if (!IsEmpty(RequestGetParam(ctx, "fps")) && !RequestGetUIntParam(ctx, "fps", &fps, 60))
+        {
+            RequestSendError(ctx, 400, "bad_request", "fps must be an integer between 1 and 60");
+            return;
+        }
+        bool audio = true;
+        if (!IsEmpty(RequestGetParam(ctx, "audio")) && !RequestGetBoolParam(ctx, "audio", &audio))
+        {
+            RequestSendError(ctx, 400, "bad_request", "audio must be a boolean");
+            return;
+        }
+        RecordingStatus status;
+        if (!StartNativeRecording(path, width, height, fps, audio, &status))
+        {
+            RequestSendError(ctx, status.m_Active ? 409 : 500,
+                             status.m_Active ? "recording_active" : "recording_start_failed",
+                             status.m_Failure[0] ? status.m_Failure : "video recording could not be started");
+            return;
+        }
+        SendRecordingStatus(ctx, &status);
+    }
+
+    static void HandleRecordingStop(RequestContext* ctx)
+    {
+        RecordingStatus status;
+        GetNativeRecordingStatus(&status);
+        if (!status.m_Active)
+        {
+            RequestSendError(ctx, 409, "recording_inactive", "no video recording is active");
+            return;
+        }
+        if (!StopNativeRecording(&status))
+        {
+            RequestSendError(ctx, 500, "recording_stop_failed",
+                             status.m_Failure[0] ? status.m_Failure : "video recording could not be stopped");
+            return;
+        }
+        SendRecordingStatus(ctx, &status);
+    }
+
     static void HandleEventCursor(RequestContext* ctx)
     {
         StringBuffer response;
@@ -2374,6 +2525,10 @@ namespace dmAutomationBridge
         {"/input/pointer/hold", "POST", HandlePointerHold},
         {"/input/pointer/up", "POST", HandlePointerUp},
         {"/screenshot", "GET", HandleScreenshot},
+        {"/recording/capabilities", "GET", HandleRecordingCapabilities},
+        {"/recording/status", "GET", HandleRecordingStatus},
+        {"/recording/start", "POST", HandleRecordingStart},
+        {"/recording/stop", "POST", HandleRecordingStop},
         {"/events/cursor", "GET", HandleEventCursor},
         {"/events", "GET", HandleEvents},
         {"/state", "GET", HandleState},

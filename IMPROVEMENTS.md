@@ -484,7 +484,7 @@ client can remain dependency-free.
 
 ## P2: Recording and capture tooling
 
-### 22. Provide recording as an optional platform companion
+### 22. Provide native macOS recording
 
 The desired API is still valuable:
 
@@ -492,25 +492,26 @@ The desired API is still valuable:
 recording = bridge.recording.start(
     "session.mp4",
     size=(1080, 1920),
-    audio="application",
-    crop="content",
+    fps=30,
+    audio=True,
 )
 ```
 
-However, exact application-window capture plus audio requires platform
-APIs such as ScreenCaptureKit on macOS and different implementations on other
-platforms. Implement this as an optional Python companion with explicit
-capabilities rather than coupling it to the portable native extension.
+The macOS implementation lives in the native extension and uses
+ScreenCaptureKit to select the current Defold process window and record H.264
+MP4 with optional application audio. Python is only a thin controller; it does
+not launch FFmpeg or another recorder process. Other platforms report the
+capability as unsupported until they receive native implementations.
 
 It should provide:
 
-- application-window/content selection and title-bar exclusion;
-- application audio rather than microphone audio;
+- automatic current-process window selection and title-bar exclusion;
+- optional application audio rather than microphone audio;
 - explicit output size and frame rate;
-- H.264/AAC defaults with configurable codecs;
-- permission diagnostics;
+- native H.264 MP4 output;
+- explicit permission/start failures;
 - reliable stop/finalization under exceptions;
-- duration, dimensions, codecs, audio channels, and sample-rate metadata.
+- duration, dimensions, codec, and native timestamp metadata.
 
 Backbuffer-only recording could be a separate native capability, but it
 does not solve application-audio capture by itself.

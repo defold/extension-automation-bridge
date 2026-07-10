@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import io
 import json
 import math
 import sys
@@ -14,11 +13,7 @@ sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
 from automation_bridge import AutomationBridgeClient  # noqa: E402
 from automation_bridge.gestures import GestureConstraintError, GestureGenerator  # noqa: E402
-from automation_bridge.recording import (  # noqa: E402
-    FFmpegRecordingBackend,
-    RecordingOptions,
-    UnsupportedRecordingCapability,
-)
+from automation_bridge.recording import RecordingClient  # noqa: E402
 from automation_bridge.trace import TraceError, TraceSession  # noqa: E402
 
 
@@ -59,72 +54,59 @@ class GestureGeneratorTest(unittest.TestCase):
             GestureGenerator().generate_drag((0, 0), (100, 0), seed=1, duration=1.0, max_velocity=50)
 
 
-class _FakeProcess:
-    def __init__(self):
-        self.stdin = io.BytesIO()
-        self.returncode = None
-
-    def poll(self):
-        return self.returncode
-
-    def wait(self, timeout=None):
-        self.returncode = 0
-        return 0
-
-    def terminate(self):
-        self.returncode = 0
-
-    def kill(self):
-        self.returncode = 0
-
-
 class RecordingTest(unittest.TestCase):
-    def test_linux_command_supports_content_rect_output_size_fps_and_codec(self):
-        backend = FFmpegRecordingBackend(ffmpeg=sys.executable, platform="linux", display=":9", video_codecs=("libx264",))
-        options = RecordingOptions(
-            path=Path("capture.mp4"), source_rect=(10, 20, 640, 480), crop="content",
-            size=(320, 240), fps=24, video_codec="libx264",
-        )
-        command = backend.command(options)
-        joined = " ".join(command)
-        self.assertIn("-video_size 640x480", joined)
-        self.assertIn(":9+10,20", joined)
-        self.assertIn("scale=320:240", joined)
-        self.assertIn("-r 24", joined)
-        self.assertIn("-c:v libx264", joined)
+    class Bridge:
+        def __init__(self, fail_stop=False):
+            self.requests = []
+            self.traces = []
+            self.fail_stop = fail_stop
 
-    def test_application_audio_fails_instead_of_recording_wrong_source(self):
-        backend = FFmpegRecordingBackend(ffmpeg=sys.executable, platform="linux", display=":9", video_codecs=("libx264",))
-        with self.assertRaisesRegex(UnsupportedRecordingCapability, "isolate application audio"):
-            backend.command(RecordingOptions(path=Path("capture.mp4"), audio="application"))
+        def request(self, method, path, *, params=None, json=None):
+            self.requests.append((method, path, json))
+            if path == "/recording/capabilities":
+                return {"backend": "screen_capture_kit", "available": True,
+                        "application_window": True, "application_audio": True,
+                        "resize_output": True, "frame_rate": True,
+                        "containers": ["mp4"], "video_codecs": ["h264"]}
+            if path == "/recording/start":
+                return {"path": json["path"], "active": True, "finalized": False,
+                        "audio": json["audio"], "width": json.get("width", 800),
+                        "height": json.get("height", 600), "fps": json["fps"]}
+            if path == "/recording/stop":
+                if self.fail_stop:
+                    raise RuntimeError("native finalization failed")
+                return {"path": "capture.mp4", "active": False, "finalized": True,
+                        "audio": True, "width": 320, "height": 240, "fps": 24,
+                        "duration_seconds": 1.25}
+            raise AssertionError(path)
 
-    def test_content_crop_requires_global_content_geometry(self):
-        backend = FFmpegRecordingBackend(ffmpeg=sys.executable, platform="linux", display=":9", video_codecs=("libx264",))
-        with self.assertRaisesRegex(UnsupportedRecordingCapability, "content geometry"):
-            backend.command(RecordingOptions(path=Path("capture.mp4"), crop="content"))
+        def _trace_record(self, kind, payload):
+            self.traces.append((kind, payload))
 
-    def test_context_finalizes_and_returns_observed_metadata(self):
+    def test_start_uses_native_endpoint_and_context_finalizes(self):
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "capture.mp4"
-            output.write_bytes(b"video")
-            backend = FFmpegRecordingBackend(
-                ffmpeg=sys.executable, platform="linux", display=":9", video_codecs=("libx264",), popen=lambda *args, **kwargs: _FakeProcess()
-            )
-            with backend.start(RecordingOptions(path=output, size=(320, 240), fps=30)) as recording:
-                pass
+            bridge = self.Bridge()
+            with RecordingClient(bridge).start(Path(directory) / "capture.mp4", size=(320, 240), fps=24) as recording:
+                self.assertTrue(recording.metadata.active)
             self.assertTrue(recording.metadata.finalized)
-            self.assertEqual(320, recording.metadata.width)
-            self.assertEqual(240, recording.metadata.height)
-            self.assertIn(b"q\n", recording.process.stdin.getvalue())
+            self.assertEqual((320, 240, 24), (recording.metadata.width, recording.metadata.height, recording.metadata.fps))
+            start = bridge.requests[0]
+            self.assertEqual(("POST", "/recording/start"), start[:2])
+            self.assertEqual({"width": 320, "height": 240, "fps": 24, "audio": True},
+                             {key: start[2][key] for key in ("width", "height", "fps", "audio")})
+            self.assertEqual(["recording_started", "recording_stopped"], [kind for kind, _ in bridge.traces])
 
-    def test_original_exception_survives_finalization_failure(self):
-        with tempfile.TemporaryDirectory() as directory:
-            backend = FFmpegRecordingBackend(
-                ffmpeg=sys.executable, platform="linux", display=":9", video_codecs=("libx264",), popen=lambda *args, **kwargs: _FakeProcess()
-            )
-            with self.assertRaisesRegex(KeyboardInterrupt, "stop now"):
-                with backend.start(RecordingOptions(path=Path(directory) / "missing.mp4")):
-                    raise KeyboardInterrupt("stop now")
+    def test_capabilities_are_reported_by_engine(self):
+        capabilities = RecordingClient(self.Bridge()).capabilities()
+        self.assertTrue(capabilities.available)
+        self.assertTrue(capabilities.application_audio)
+        self.assertEqual(("h264",), capabilities.video_codecs)
+
+    def test_original_exception_survives_native_finalization_failure(self):
+        bridge = self.Bridge(fail_stop=True)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(KeyboardInterrupt, "stop now"):
+            with RecordingClient(bridge).start(Path(directory) / "capture.mp4"):
+                raise KeyboardInterrupt("stop now")
 
 
 class _TraceClient:
@@ -197,31 +179,7 @@ class TraceTest(unittest.TestCase):
             self.assertIn("capture_error", data["screenshots"][0])
 
 
-class _CapturingBackend:
-    def __init__(self):
-        self.options = None
-
-    def start(self, options):
-        self.options = options
-        return "session"
-
-
 class ClientToolingTest(unittest.TestCase):
-    def test_record_video_resolves_content_geometry(self):
-        backend = _CapturingBackend()
-        client = AutomationBridgeClient(1)
-        client.screen = lambda: {"rectangles": {"content_display_pixels": {"x": 3, "y": 4, "width": 640, "height": 480}}}
-        session = client.recording.start("capture.mp4", crop="content", backend=backend)
-        self.assertEqual("session", session)
-        self.assertEqual((3, 4, 640, 480), backend.options.source_rect)
-
-    def test_record_video_does_not_treat_local_viewport_as_global_crop(self):
-        backend = _CapturingBackend()
-        client = AutomationBridgeClient(1)
-        client.screen = lambda: {"viewport": {"x": 3, "y": 4, "width": 640, "height": 480}}
-        client.recording.start("capture.mp4", crop="content", backend=backend)
-        self.assertIsNone(backend.options.source_rect)
-
     def test_active_trace_automatically_records_input_request_and_receipt(self):
         client = AutomationBridgeClient(1234)
         client.health = lambda: {"version": 1, "capabilities": ["input.click"]}

@@ -18,6 +18,7 @@
 
 #include "automation_bridge_private.h"
 #include "automation_bridge_defold_private_api.h"
+#include "automation_bridge_recording.h"
 
 namespace dmAutomationBridge
 {
@@ -158,6 +159,7 @@ namespace dmAutomationBridge
     {
         (void)params;
         UnregisterWebEndpoint();
+        FinalizeNativeRecording();
         FreeAutomationBridgeContext(&g_AutomationBridge);
         InitAutomationBridgeContext(&g_AutomationBridge);
         return dmExtension::RESULT_OK;

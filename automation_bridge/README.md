@@ -12,7 +12,9 @@ Find `<engine_service_port>` in the editor console line:
 INFO:ENGINE: Engine service started on port <port>
 ```
 
-No Lua setup is required for scene inspection, input, screenshots, events, or timeline markers. The application-defined Lua API is debug-only and must be enabled explicitly:
+No Lua setup is required for scene inspection, input, screenshots, native macOS
+video recording, events, or timeline markers. The application-defined Lua API
+is debug-only and must be enabled explicitly:
 
 ```ini
 [automation_bridge]
@@ -55,7 +57,9 @@ Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `stale_scene`, `input_queue_full`, `input_too_large`, `input_controller_busy`,
 `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`,
 `screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
-`screenshot_pending`, and `unsupported_capability`. The latter names a feature
+`screenshot_pending`, `recording_unsupported`, `recording_active`,
+`recording_inactive`, `recording_start_failed`, `recording_stop_failed`, and
+`unsupported_capability`. The latter names a feature
 omitted by the current graphics, game-object, window, or HID backend.
 
 ## Coordinates
@@ -427,6 +431,32 @@ Takes `capture_id` (or `id`) and returns `pending`, `complete`, or `failed`.
 Completed receipts include capture frame/sequence, dimensions, and SHA-256. The
 PNG is first written to a temporary path and atomically renamed before `complete`
 is visible.
+
+## Native video recording (macOS)
+
+The extension selects its own largest on-screen window, resolves the matching
+`NSWindow` content frame, and records only that undecorated game area with
+ScreenCaptureKit's native H.264 MP4 recorder on macOS 15 or newer. The explicit
+source rectangle excludes the title bar and rounded window corners. It does not
+launch FFmpeg or any other helper process. Screen Recording permission is
+granted to the running game process; the first request may cause the system
+permission prompt.
+
+- `GET /recording/capabilities` reports runtime availability, output format,
+  codec, resizing, frame-rate, and application-audio support.
+- `GET /recording/status` reports the active or most recently finalized capture.
+- `POST /recording/start` accepts `path`, optional paired `width` and `height`,
+  integer `fps` from 1 through 60 (default 30), and boolean `audio` (default
+  true). It automatically selects a window owned by the current process.
+- `POST /recording/stop` stops capture and waits until the MP4 is finalized.
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/game.mp4","width":960,"height":540,"fps":30,"audio":true}' \
+  "$BASE/recording/start"
+
+curl -fsS -X POST "$BASE/recording/stop"
+```
 
 ## Application synchronization
 
