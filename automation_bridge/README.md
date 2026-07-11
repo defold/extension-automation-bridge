@@ -13,8 +13,9 @@ INFO:ENGINE: Engine service started on port <port>
 ```
 
 No Lua setup is required for scene inspection, input, screenshots, native
-desktop video recording, events, or timeline markers. The application-defined Lua API
-is debug-only and must be enabled explicitly:
+desktop video recording, the event cursor transport, or timeline markers.
+Application-defined events, state, commands, annotations, and acknowledgements
+use a debug-only Lua API that must be enabled explicitly:
 
 ```ini
 [automation_bridge]
@@ -171,7 +172,10 @@ Response `data` includes:
 - `version`: API version string.
 - `debug`: `true`.
 - `platform`: `macos`, `windows`, `linux`, `android`, `ios`, or `unknown`.
-- `capabilities`: supported capability names such as `scene`, `nodes`, `node`, `screen.resize`, `input.click`, `input.drag`, `input.drag_path`, `input.pointer`, `input.receipts`, `input.queue`, `input.controller`, device capabilities, and, when supported, `screenshot`.
+- `capabilities`: supported capability names for runtime health/lifecycle,
+  diagnostics, scene inspection, screen/coordinate operations, input and input
+  devices, events, markers, frame waits, application synchronization, screenshots,
+  and native video recording. Backend-dependent names are omitted when unavailable.
 - `capability_versions`: capability-to-version map for feature negotiation.
 - `native_version`, `api_version_min`, and `api_version_max`: native package and API compatibility information.
 - `identity`: opaque engine instance, process id where portable, wall/monotonic start timestamps, hashed project identity, and hashed build-configuration identity.
@@ -539,4 +543,8 @@ Annotations are copied into matching scene snapshots and can be queried with the
 
 ### Timeline markers
 
-`POST /markers?name=workflow_started&data=<url-encoded-json>&recording_timestamp_us=...` inserts a `marker` event. Native monotonic time is always recorded. The optional recording timestamp is supplied by the companion recorder's clock, allowing sidecar export without coupling marker collection to a particular recorder.
+`POST /markers?name=workflow_started&data=<url-encoded-json>&recording_timestamp_us=...`
+inserts a `marker` event. Native monotonic time is always recorded. The optional
+recording timestamp is caller-supplied, allowing a client to correlate markers
+with its own media or trace clock. Native video recording does not add this
+correlation automatically.

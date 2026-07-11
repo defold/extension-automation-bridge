@@ -37,16 +37,22 @@ The package root exposes only `editor` and `engine`.
   `project.clean_build_and_run()`, `project.connect_engine()`, and
   `engine.connect(port)`.
 - Editor operations: `project.commands`, `project.debugger`, `project.console`,
-  `project.preferences`, `project.reference`, and `project.preview`.
+  `project.preferences`, `project.reference`, `project.preview`, and
+  `project.build_and_run_html5()`.
 - Runtime state: `health()`, `screen()`, `scene(...)`, capabilities, and lifecycle.
 - Elements: `elements(...)`, `element(...)`, `maybe_element(...)`,
-  `element_by_id(...)`, `parent(...)`, and `count(...)`.
+  `element_by_id(...)`, `parent(...)`, `count(...)`, compact formatting, and
+  scene dumps.
 - Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`,
   `type_text(...)`, `key(...)`, and `game.input`.
 - Synchronization: events, states, application commands, full input
-  acknowledgements, frame waits, and element observation.
-- Capture and diagnostics: screenshots, geometry, engine logs, scene dumps,
-  profiling, visual comparison, tracing, and `game.video_recording`.
+  acknowledgements, timeline markers, frame/count waits, and element
+  observation.
+- Runtime control and geometry: `resize(...)`, `set_portrait()`,
+  `set_landscape()`, `convert_point(...)`, `reboot(...)`, and
+  `close_engine()`.
+- Capture and diagnostics: screenshots, engine metadata/logs, profiling,
+  visual comparison, tracing, and `game.video_recording`.
 - Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
 
 ## Bootstrap
@@ -166,9 +172,10 @@ game.type_text("Hello")
 game.key("SPACE")
 ```
 
-`click()`, `drag()`, `drag_path()`, `type_text()`, and `key()` wait for native
-release by default. Use `wait="accepted"`, `wait="started"`, or `wait=False`
-when needed.
+`click()`, `drag()`, and `drag_path()` wait for native release by default.
+`type_text()` and `key()` return after the request is accepted unless a `wait`
+state is supplied. These five helpers accept `wait="accepted"`,
+`wait="started"`, `wait="released"`, or `wait=False` as appropriate.
 
 Low-level queue and interruption control lives under `game.input`:
 
@@ -204,6 +211,13 @@ Run application commands:
 
 ```python
 result = game.command("reset_fixture", {"seed": 42})
+```
+
+Add a timeline marker. `recording_timestamp_us` is optional; when omitted, the
+wrapper records the host monotonic clock in microseconds:
+
+```python
+marker = game.mark("workflow_started", {"fixture": "menu"})
 ```
 
 Native input completion and application acknowledgement are distinct. An
@@ -291,7 +305,8 @@ window, crops it to the undecorated game content area, and finalizes the file
 when the context exits. Omitted `audio` uses the platform default: enabled on
 macOS and disabled on Windows. The current Windows backend is video-only and
 rejects `audio=True`. The first macOS capture may trigger Screen Recording
-permission. No FFmpeg installation or external recorder process is used.
+permission. Check `capabilities().available` before treating recording as an
+optional feature. No FFmpeg installation or external recorder process is used.
 
 Diagnostic traces remain a client-bound context because they intercept client
 operations:

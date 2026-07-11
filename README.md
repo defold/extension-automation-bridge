@@ -1,10 +1,24 @@
 # Automation Bridge Extension
 
-Debug-only native extension for inspecting a running Defold game and sending input from local automation clients such as Codex.
+Debug-only native extension for inspecting and controlling a running Defold game
+from local automation clients such as Codex. It provides scene and node queries,
+FIFO input with receipts, screenshots, optional native desktop video recording,
+and an opt-in Lua channel for application events, state, commands, semantic
+annotations, and input acknowledgements.
 
 ## Installation
 
 After Defold has fetched the extension into your project, copy the `automation-bridge-python` directory from the extension into your project. When you update the extension, update the copied Python helper directory at the same time so your automation scripts use the matching API.
+
+The HTTP bridge is available only in debug builds. Scene inspection, input,
+screenshots, recording, and timeline markers require no Lua setup. Enable the
+application-defined Lua channel separately in `game.project` when a script needs
+events, published state, commands, annotations, or acknowledgements:
+
+```ini
+[automation_bridge]
+application_api = 1
+```
 
 ## Documentation
 
