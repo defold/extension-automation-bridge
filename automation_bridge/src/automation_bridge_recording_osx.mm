@@ -74,6 +74,11 @@
 
 namespace dmAutomationBridge
 {
+    // AppKit includes the rounded bottom edge in NSWindow's content rect. The
+    // window server masks roughly 14-15 points there on current macOS releases,
+    // so exclude a narrow safety row to produce a fully rectangular game frame.
+    static const CGFloat WINDOW_BOTTOM_CORNER_CROP_POINTS = 16.0;
+
     static NSLock* g_Lock = nil;
     static bool g_Starting = false;
     static SCStream* g_Stream = nil;
@@ -132,8 +137,10 @@ namespace dmAutomationBridge
                 NSRect content = [window contentRectForFrameRect:frame];
                 CGFloat left_inset = NSMinX(content) - NSMinX(frame);
                 CGFloat top_inset = NSMaxY(frame) - NSMaxY(content);
+                CGFloat bottom_corner_crop = MIN(WINDOW_BOTTOM_CORNER_CROP_POINTS,
+                                                  NSHeight(content) * 0.25);
                 result = CGRectMake(left_inset, top_inset,
-                                    NSWidth(content), NSHeight(content));
+                                    NSWidth(content), NSHeight(content) - bottom_corner_crop);
                 NSScreen* screen = [window screen];
                 backing_scale = screen ? [screen backingScaleFactor] : 1.0;
                 found = result.size.width > 0.0 && result.size.height > 0.0;

@@ -22,8 +22,11 @@ independently of the desktop and excludes the cursor, title-bar shadow, and
 other applications.
 
 The default output size is the selected window's point size multiplied by the
-main screen backing scale. Callers may provide an explicit paired width and
-height. Frame rate is an integer from 1 through 60 and defaults to 30.
+window screen's backing scale. AppKit includes the rounded bottom edge in its
+content rectangle, so the macOS backend removes a 16-point bottom safety band
+to return a fully rectangular game frame. Callers may provide an explicit
+paired width and height. Frame rate is an integer from 1 through 60 and defaults
+to 30.
 
 ## Audio
 
