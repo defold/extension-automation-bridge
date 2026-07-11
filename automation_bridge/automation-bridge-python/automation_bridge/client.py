@@ -13,7 +13,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
+import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .nodes import Element
@@ -148,6 +150,11 @@ class EngineLogStream:
             raise StopIteration
         return line
 
+    @property
+    def closed(self) -> bool:
+        """Return whether the log-service socket is closed."""
+        return self._socket is None
+
     def close(self) -> None:
         """Close the underlying log service socket."""
         sock = self._socket
@@ -155,7 +162,9 @@ class EngineLogStream:
         if sock is None:
             return
         try:
-            sock.close()
+            close = getattr(sock, "close", None)
+            if close is not None:
+                close()
         except OSError:
             pass
 
@@ -185,9 +194,11 @@ class EngineLogStream:
                 chunk = sock.recv(4096)
                 if not chunk:
                     if not self._buffer:
+                        self.close()
                         return b""
                     line = bytes(self._buffer)
                     self._buffer.clear()
+                    self.close()
                     return line
                 self._buffer.extend(chunk)
         except socket.timeout:
@@ -216,6 +227,87 @@ def _cleanup_without_masking(cleanup: Any) -> None:
         cleanup()
     except BaseException:
         pass
+
+
+class RuntimeLogs:
+    """Bounded background collection from Defold's engine log service."""
+
+    def __init__(self, bridge: "Client", capacity: int = 10000):
+        self._bridge = bridge
+        self._lines = deque(maxlen=capacity)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._stream: Optional[EngineLogStream] = None
+        self._error: Optional[BaseException] = None
+
+    def start(self) -> "RuntimeLogs":
+        """Start collecting future engine log lines in a bounded daemon thread."""
+        thread = self._thread
+        if thread is not None:
+            return self
+        if self._stop.is_set():
+            raise AutomationBridgeError("engine log collector is closed")
+        self._ready.clear()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._collect,
+            name=f"automation-bridge-logs-{self._bridge.port}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def tail(self, limit: int = 100, *, contains: Optional[str] = None) -> List[str]:
+        """Return buffered engine log lines, optionally filtered by text."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+            raise ValueError("log tail limit must be a non-negative integer")
+        if contains is not None and not isinstance(contains, str):
+            raise TypeError("log tail contains filter must be a string or None")
+        self.start()
+        self._ready.wait(timeout=min(1.0, max(0.0, float(self._bridge.timeout))))
+        with self._lock:
+            lines = list(self._lines)
+        if self._error is not None and not lines:
+            raise AutomationBridgeError(f"engine log collector failed: {self._error}") from self._error
+        if contains is not None:
+            lines = [line for line in lines if contains in line]
+        return lines[-limit:] if limit else []
+
+    def close(self, timeout: float = 1.0) -> None:
+        """Stop collection and close its engine log connection."""
+        self._stop.set()
+        stream = self._stream
+        if stream is not None:
+            _cleanup_without_masking(stream.close)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, timeout))
+
+    def _collect(self) -> None:
+        try:
+            with self._bridge.log_stream(
+                timeout=self._bridge.timeout,
+                read_timeout=0.25,
+            ) as stream:
+                self._stream = stream
+                self._ready.set()
+                while not self._stop.is_set():
+                    line = stream.readline(timeout=0.25)
+                    if line is not None:
+                        with self._lock:
+                            self._lines.append(line)
+                    elif stream.closed:
+                        break
+                    else:
+                        self._stop.wait(0.01)
+        except Exception as error:
+            if not self._stop.is_set():
+                self._error = error
+        finally:
+            self._stream = None
+            self._ready.set()
 
 
 class InputInterruptionScope:
@@ -599,6 +691,7 @@ class Client:
         self.client_id = client_id or f"py-{uuid.uuid4().hex[:12]}"
         self.session_id = session_id or f"s-{uuid.uuid4().hex[:12]}"
         self._input_controller = InputController(self)
+        self._logs = RuntimeLogs(self)
         self._active_traces: List[Any] = []
         self._required_capabilities = set(required_capabilities)
         self._last_health: Optional[JsonDict] = None
@@ -607,6 +700,11 @@ class Client:
     def input(self) -> InputController:
         """Return queue, status, cancellation, lease, and device controls."""
         return self._input_controller
+
+    @property
+    def logs(self) -> RuntimeLogs:
+        """Return the bounded background engine log collector."""
+        return self._logs
 
     @classmethod
     def _from_editor(
@@ -660,6 +758,7 @@ class Client:
                     editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
                 if profiler_url:
                     editor._remember_remotery_url(profiler_url)
+                bridge.logs.start()
                 return bridge
             return None
 
@@ -1580,6 +1679,7 @@ class Client:
 
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
+        self._logs.close()
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
         try:
             self._post_engine_message("/post/@system/exit", b"\010\000", timeout=timeout)
@@ -1751,22 +1851,66 @@ class Client:
             predicate=lambda count: count == expected,
         )
 
-    def wait_frames(self, count: int, timeout: float = 5.0, interval: float = 0.005) -> JsonDict:
-        """Wait for ``count`` native engine updates and return the final frame receipt."""
+    def wait_frames(
+        self,
+        count: int,
+        timeout: Optional[float] = None,
+        interval: float = 0.005,
+    ) -> JsonDict:
+        """Wait for ``count`` native engine updates and return the final frame receipt.
+
+        When ``timeout`` is omitted, allow the greater of five seconds or the
+        requested frame count at 30 FPS. Explicit timeouts are used unchanged.
+        A timeout reports the initial and last observed frames, whether frames
+        advanced, and a best-effort runtime health/lifecycle snapshot.
+        """
         if not isinstance(count, int) or count < 0:
             raise ValueError("frame count must be a non-negative integer")
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        effective_timeout = max(5.0, count / 30.0) if timeout is None else float(timeout)
         initial = self._request("GET", "/frame")
-        target = int(initial.get("engine_frame", 0)) + count
+        initial_frame = int(initial.get("engine_frame", 0))
+        target = initial_frame + count
         if count == 0:
             return initial
-        return wait_until(
-            lambda: (data if int(data.get("engine_frame", 0)) >= target else None)
-            if (data := self._request("GET", "/frame"))
-            else None,
-            timeout=timeout,
-            interval=interval,
-            message=f"engine frame did not reach {target}",
-        )
+
+        try:
+            return wait_until(
+                lambda: self._request("GET", "/frame"),
+                timeout=effective_timeout,
+                interval=interval,
+                message=f"engine frame did not reach {target}",
+                predicate=lambda data: int(data.get("engine_frame", 0)) >= target,
+            )
+        except WaitTimeoutError as error:
+            last = error.last_value if isinstance(error.last_value, Mapping) else {}
+            last_frame = int(last.get("engine_frame", initial_frame))
+            lifecycle_stage: Any = "unknown"
+            engine_health: Any = "unavailable"
+            try:
+                health = self.health()
+                engine_health = "reachable"
+                lifecycle = health.get("lifecycle")
+                if isinstance(lifecycle, Mapping):
+                    lifecycle_stage = lifecycle.get("current_stage", "unknown")
+            except Exception as health_error:
+                engine_health = f"unavailable ({type(health_error).__name__}: {health_error})"
+
+            diagnostics = (
+                f"initial_frame={initial_frame}, last_observed_frame={last_frame}, "
+                f"frames_advancing={last_frame > initial_frame}, "
+                f"lifecycle_stage={lifecycle_stage!r}, engine_health={engine_health}"
+            )
+            enriched = WaitTimeoutError(
+                f"engine frame did not reach {target}; {diagnostics}",
+                last_value=error.last_value,
+                elapsed=error.elapsed,
+                attempts=error.attempts,
+                scene_sequence=error.scene_sequence,
+                last_exception=error.last_exception,
+            )
+            raise enriched from error
 
     def observe_element(
         self,

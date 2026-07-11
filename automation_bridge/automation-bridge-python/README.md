@@ -51,8 +51,8 @@ The package root exposes only `editor` and `engine`.
 - Runtime control and geometry: `resize(...)`, `set_portrait()`,
   `set_landscape()`, `convert_point(...)`, `reboot(...)`, and
   `close_engine()`.
-- Capture and diagnostics: screenshots, engine metadata/logs, profiling,
-  visual comparison, tracing, and `game.video_recording`.
+- Capture and diagnostics: screenshots, historical `game.logs`, live engine
+  logs, profiling, visual comparison, tracing, and `game.video_recording`.
 - Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
 
 ## Bootstrap
@@ -67,9 +67,99 @@ existing_game = project.connect_engine()
 direct_game = engine.connect(51337)
 ```
 
+Choose the operation by ownership and lifecycle intent:
+
+| Operation | Editor required | Builds | Engine intent |
+| --- | --- | --- | --- |
+| `editor.open_project(".")` | No; starts or reuses it | No | Return an editor project client |
+| `project.build_and_run()` | Yes | Incremental | Replace the previous engine and connect |
+| `project.clean_build_and_run()` | Yes | Clean | Replace the previous engine and connect |
+| `project.connect_engine()` | Yes | No | Connect to the healthy engine already registered by this project |
+| `engine.connect(port)` | No | No | Connect directly to a known engine service port |
+| `game.close_engine()` | No | No | Close the connected engine; use only when the script owns cleanup |
+
+There is intentionally no `project.connect()`: a project is already the editor
+client, while `connect_engine()` makes the second client and its lifecycle
+explicit.
+
 The editor bootstrap discovers `.internal/editor.port`, launches Defold when
 needed, rejects stale engine ports, and waits for Automation Bridge health.
 Pass `start_if_needed=False` to require an already-running editor.
+
+## Reliable game test loop
+
+Resize before coordinate-based input or visual assertions, then synchronize on
+application-published state instead of estimating completion from elapsed time:
+
+If a `.go`, `.gui`, or `.collection` resource was created or edited manually,
+render it through the editor preview before building. This makes the editor
+parse its references and produces a quick visual artifact, so malformed files,
+missing resources, and obvious layout mistakes are reported close to the edit:
+
+```python
+from pathlib import Path
+from automation_bridge import editor
+
+project = editor.open_project(".")
+preview_directory = Path("/tmp/defold-previews")
+preview_directory.mkdir(parents=True, exist_ok=True)
+
+for resource in (
+    "main/player.go",
+    "main/hud.gui",
+    "main/main.collection",
+):
+    png = project.preview.render(resource, resolution_multiplier=0.5)
+    output = preview_directory / f"{Path(resource).name}.png"
+    output.write_bytes(png)
+    print(f"Rendered {resource} to {output}")
+```
+
+Preview rendering validates editor loading and appearance; it does not replace
+`build_and_run()` when runtime scripts, input, physics, or dynamically spawned
+content must be tested.
+
+After previewing manually authored resources, continue with the runtime loop:
+
+```python
+from automation_bridge import editor
+
+project = editor.open_project(".")
+game = project.build_and_run(required_capabilities=[
+    "screen.resize",
+    "input.pointer",
+    "screenshot",
+    "application.state",
+])
+
+game.resize(1080, 1920)
+game.set_portrait()
+game.wait_for_state("tutorial.phase", "ready")
+
+before = game.screenshot(after_frames=1)
+game.drag((540, 1500), (540, 500), duration=0.25)
+game.wait_for_state("tutorial.phase", "waiting_for_pickup")
+after = game.screenshot(after_frames=1)
+```
+
+The state names and values in this example belong to the game. Publish them
+from Lua together with semantic scene annotations:
+
+```lua
+automation_bridge.publish("tutorial", {
+    phase = "waiting_for_pickup",
+    figure = figure_num,
+})
+
+automation_bridge.annotate("main:/ghost#sprite", {
+    automation_id = "tutorial_target_ghost",
+    role = "tutorial_target",
+})
+```
+
+Tests can then use
+`game.element(automation_id="tutorial_target_ghost")` instead of inferring a
+runtime object from size, scale, depth, or changing instance ids.
 
 On macOS, run a bootstrap that may launch Defold outside restricted agent
 sandboxes. A GUI process inherits its Python parent's sandbox and cannot
@@ -200,6 +290,18 @@ with game.pointer((100, 100)) as pointer:
     pointer.hold(0.1)
 ```
 
+The pointer object exposes its configured `lease`, `input_id`, and `closed`
+state. `game.input.status(pointer.input_id)` returns its current native receipt.
+To capture a rendered pressed state, request a frame-relative screenshot while
+the pointer context is still open and choose a lease that comfortably covers
+the capture:
+
+```python
+with game.pointer((100, 100), lease=10) as pointer:
+    pressed = game.screenshot(after_frames=1)
+    assert game.input.status(pointer.input_id).state == "started"
+```
+
 ## Synchronization and observation
 
 Use application events and published state instead of sleeps:
@@ -213,6 +315,13 @@ revision = game.state("ui").revision
 game.click(button)
 state = game.wait_for_state("ui.busy", False, after_revision=revision)
 ```
+
+`wait_frames(count)` is useful when rendered-frame evidence is specifically
+required. Its default timeout is `max(5, count / 30)` seconds; an explicit
+`timeout` overrides that calculation. Timeout errors include the initial and
+last observed frame, whether frames advanced, the current lifecycle stage, and
+a best-effort engine health result. Frame waits do not replace semantic state or
+event waits.
 
 Run application commands:
 
@@ -262,10 +371,65 @@ shot = game.screenshot(resolution_multiplier=0.5)
 print(shot.path, shot.width, shot.height, shot.sha256)
 ```
 
+Screenshot pixels and pointer input both use top-left window orientation. The
+native capture flips graphics readback rows before publishing the PNG, so pixel
+coordinates in the receipt correspond to input coordinates. Defold world
+coordinates are a different space: a generic `height - world_y` conversion is
+not reliable with cameras, projections, viewports, scaling, or letterboxing.
+`game.convert_point(...)` converts among the advertised top-left window,
+client, display-pixel, backbuffer, viewport, and normalized-viewport spaces;
+world transforms must be published by the application when needed.
+
+Large black regions are not automatically classified as capture corruption
+because they may be legitimate game content. When a capture looks suspicious,
+retain its receipt and PNG, capture an adjacent frame with
+`screenshot(after_frames=1)`, inspect live scene state, and compare the two with
+`game.visual.difference(...)`. The receipt's frame, scene sequence, dimensions,
+and SHA-256 make the evidence reproducible without silently replacing it.
+
 The engine capture remains available at `shot.raw["source_path"]`; the returned
 receipt points to a bilinear-downscaled PNG with updated dimensions and hash.
 Downscaling requires `wait=True`. Agents should normally start with `0.5` and
 use full resolution only when fine detail matters.
+
+## Runtime logs
+
+Public project and engine connection helpers start a bounded background
+collector against Defold's engine log service as soon as the Automation Bridge
+client is available. Recent output and errors can then be queried without
+depending on the editor console:
+
+```python
+recent = game.logs.tail(100)
+errors = game.logs.tail(100, contains="ERROR:")
+for line in errors:
+    print(line)
+```
+
+The filter is a case-sensitive substring match. Filtering happens before the
+limit is applied, so the second example returns up to 100 matching errors, not
+only errors among the last 100 unfiltered lines. The collector retains the most
+recent 10,000 lines and is stopped by `game.close_engine()`.
+
+Collection begins at the earliest successful bridge connection. Messages
+emitted before the wrapper discovers the engine service port cannot be recovered
+from Defold's forward-only log service; use `project.console` only when those
+earliest build or startup messages are required.
+
+`game.log_stream()` opens Defold's live TCP log stream. Start it before an
+operation when every subsequent line matters; `game.read_logs()` is also
+forward-only:
+
+```python
+with game.log_stream(read_timeout=0.1) as logs:
+    game.click(button)
+    game.wait_for_state("tutorial.phase", "waiting_for_pickup")
+    while line := logs.readline(timeout=0.1):
+        print(line)
+```
+
+`project.console` remains available when the full editor snapshot or structured
+console regions are needed.
 
 Pixel comparisons are explicitly namespaced:
 

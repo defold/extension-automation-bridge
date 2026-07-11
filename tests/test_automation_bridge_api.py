@@ -1144,6 +1144,42 @@ class EngineClientUnitTest(unittest.TestCase):
                 bridge.read_logs(duration=1.0, limit=2, idle_timeout=0.05),
             )
 
+    def test_logs_tail_buffers_engine_stream_and_filters_errors(self):
+        bridge = FakeEngineClient()
+        with FakeLogServer(
+            [
+                b"0 OK\n",
+                b"INFO:GAME: started\n",
+                b"ERROR:SCRIPT: missing value\n",
+                b"INFO:GAME: continuing\n",
+                b"ERROR:RESOURCE: missing atlas\n",
+            ]
+        ) as server:
+            bridge._engine_info = {"log_port": str(server.port)}
+            bridge.logs.start()
+            lines = wait_until(
+                lambda: bridge.logs.tail(100),
+                timeout=1.0,
+                interval=0.01,
+                predicate=lambda value: len(value) == 4,
+            )
+
+        self.assertEqual(
+            ["INFO:GAME: continuing", "ERROR:RESOURCE: missing atlas"],
+            lines[-2:],
+        )
+        self.assertEqual(
+            ["ERROR:SCRIPT: missing value", "ERROR:RESOURCE: missing atlas"],
+            bridge.logs.tail(100, contains="ERROR:"),
+        )
+        self.assertEqual([], bridge.logs.tail(0))
+        bridge.logs.close()
+
+    def test_logs_tail_validates_limit(self):
+        bridge = EngineClient(1)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            bridge.logs.tail(-1)
+
     def test_profiler_accessor_uses_engine_port(self):
         bridge = EngineClient(12345, timeout=3.0, profiler_url="ws://127.0.0.1:17816/rmt")
 
@@ -1514,6 +1550,47 @@ class EngineClientUnitTest(unittest.TestCase):
         receipt = FrameClient().wait_frames(2, timeout=0.2, interval=0)
 
         self.assertGreaterEqual(receipt["engine_frame"], 12)
+
+    def test_wait_frames_calculates_default_timeout_from_frame_count(self):
+        class FrameClient(EngineClient):
+            def _request(self, method, path, params=None, json_body=None):
+                return {"engine_frame": 10, "scene_sequence": 8}
+
+        with mock.patch("automation_bridge.client.wait_until", return_value={"engine_frame": 490}) as wait:
+            receipt = FrameClient(1).wait_frames(480)
+
+        self.assertEqual(490, receipt["engine_frame"])
+        self.assertEqual(16.0, wait.call_args.kwargs["timeout"])
+
+    def test_wait_frames_timeout_reports_progress_health_and_lifecycle(self):
+        class FrameClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame_requests = 0
+
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/health":
+                    return {
+                        "version": "1",
+                        "capabilities": [],
+                        "lifecycle": {"current_stage": "initial_scene_ready"},
+                    }
+                self.frame_requests += 1
+                return {
+                    "engine_frame": 10 if self.frame_requests == 1 else 11,
+                    "scene_sequence": 4,
+                }
+
+        with self.assertRaises(WaitTimeoutError) as raised:
+            FrameClient().wait_frames(5, timeout=0, interval=0)
+
+        message = str(raised.exception)
+        self.assertIn("initial_frame=10", message)
+        self.assertIn("last_observed_frame=11", message)
+        self.assertIn("frames_advancing=True", message)
+        self.assertIn("lifecycle_stage='initial_scene_ready'", message)
+        self.assertIn("engine_health=reachable", message)
+        self.assertEqual(11, raised.exception.last_value["engine_frame"])
 
     def test_observe_element_counts_distinct_frames(self):
         class ObservationClient(EngineClient):

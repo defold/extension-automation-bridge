@@ -12,6 +12,7 @@ from .client import (
     InputInterruptionScope,
     InputReceipt,
     PointerSession,
+    RuntimeLogs,
     SelectorError,
     UnsupportedCapabilityError,
 )
@@ -41,7 +42,7 @@ def connect(
     required_capabilities=(),
 ) -> Client:
     """Return a client for an already-running engine service."""
-    return Client(
+    client = Client(
         port,
         timeout=timeout,
         profiler_url=profiler_url,
@@ -49,6 +50,10 @@ def connect(
         session_id=session_id,
         required_capabilities=required_capabilities,
     )
+    logs = getattr(client, "logs", None)
+    if logs is not None:
+        logs.start()
+    return client
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]
