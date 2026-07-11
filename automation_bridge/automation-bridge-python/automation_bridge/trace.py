@@ -176,7 +176,7 @@ class TraceSession:
         """Record one application-published state revision."""
         self.record("application_state", {"name": name, "revision": revision, "value": value})
 
-    def record_acknowledgement(self, acknowledgement: Any) -> None:
+    def record_input_acknowledgement(self, acknowledgement: Any) -> None:
         """Record an application acknowledgement for an input/action."""
         self.record("application_acknowledgement", acknowledgement)
 

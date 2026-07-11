@@ -16,17 +16,17 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .nodes import Node
+from .nodes import Element
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
 
 
 JsonDict = Dict[str, Any]
-Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
+Target = Union[Element, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "2.3.0"
+PYTHON_PACKAGE_VERSION = "2.0.0"
 SUPPORTED_API_VERSION_MIN = 1
 SUPPORTED_API_VERSION_MAX = 1
 
@@ -59,7 +59,7 @@ class AutomationBridgeApiError(AutomationBridgeError):
 
 
 class SelectorError(AutomationBridgeError):
-    """Raised when a node selector finds too many or too few nodes."""
+    """Raised when an element selector finds too many or too few elements."""
 
     pass
 
@@ -239,7 +239,7 @@ class InputInterruptionScope:
 class InputController:
     """Queue, receipt, controller-lease, cancellation, and device operations."""
 
-    def __init__(self, bridge: "AutomationBridgeClient"):
+    def __init__(self, bridge: "Client"):
         self._bridge = bridge
 
     def configure(
@@ -342,7 +342,7 @@ class InputController:
 class PointerSession:
     """Leased low-level pointer that guarantees up/cancel cleanup in a context manager."""
 
-    def __init__(self, bridge: "AutomationBridgeClient", receipt: InputReceipt, lease: float):
+    def __init__(self, bridge: "Client", receipt: InputReceipt, lease: float):
         self._bridge = bridge
         self.receipt = receipt
         self.lease = lease
@@ -546,7 +546,7 @@ def _encode_system_reboot(args: Sequence[str]) -> bytes:
     return bytes(payload)
 
 
-class AutomationBridgeClient:
+class Client:
     """High-level client for `/automation-bridge/v1` scene inspection and input control."""
 
     SUPPORTED_API_VERSION_MIN = SUPPORTED_API_VERSION_MIN
@@ -609,23 +609,24 @@ class AutomationBridgeClient:
         return self._input_controller
 
     @classmethod
-    def from_editor(
+    def _from_editor(
         cls,
         editor: Any,
-        build: bool = True,
+        build_command: Optional[str] = None,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
-    ) -> "AutomationBridgeClient":
-        """Build through `editor`, discover the engine port, and wait for health."""
-        if build:
+    ) -> "Client":
+        """Private editor-owned bootstrap hook for engine discovery."""
+        fresh_build = build_command is not None
+        if fresh_build:
             cls._close_candidate_engine_ports(editor)
             time.sleep(0.5)
-            editor.build()
+            editor._build_and_run_command(build_command, timeout=timeout)
 
-        def bridge_after_build() -> Optional["AutomationBridgeClient"]:
+        def bridge_after_build() -> Optional["Client"]:
             service_ports = editor._engine_service_ports()
             registration_ports = editor._current_registration_engine_service_ports()
-            profiler_url = cls._editor_profiler_url(editor, fresh_build=build)
+            profiler_url = cls._editor_profiler_url(editor, fresh_build=fresh_build)
             for service_port in service_ports:
                 if not service_port:
                     continue
@@ -640,7 +641,7 @@ class AutomationBridgeClient:
                     if not editor._validate_cached_engine_health(
                         service_port,
                         health,
-                        fresh_build=build or registration_is_authoritative,
+                        fresh_build=fresh_build or registration_is_authoritative,
                     ):
                         continue
                 except (IncompatibleApiVersionError, UnsupportedCapabilityError):
@@ -662,8 +663,8 @@ class AutomationBridgeClient:
                 return bridge
             return None
 
-        if build and cls._last_build_missing_engine_service_port(editor):
-            return cls._recover_after_stale_build(editor, bridge_after_build, timeout)
+        if fresh_build and cls._last_build_missing_engine_service_port(editor):
+            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
 
         try:
             return cls._wait_for_bridge(
@@ -673,16 +674,24 @@ class AutomationBridgeClient:
                 retry_exceptions=(AutomationBridgeError,),
             )
         except WaitTimeoutError:
-            if not build:
+            if not fresh_build:
                 raise
 
-        return cls._recover_after_stale_build(editor, bridge_after_build, timeout)
+        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
 
     @classmethod
-    def _recover_after_stale_build(cls, editor: Any, bridge_after_build: Any, timeout: float) -> "AutomationBridgeClient":
+    def _recover_after_stale_build(
+        cls,
+        editor: Any,
+        bridge_after_build: Any,
+        timeout: float,
+        build_command: Optional[str],
+    ) -> "Client":
+        if build_command is None:
+            raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
         time.sleep(0.5)
-        editor.build()
+        editor._build_and_run_command(build_command, timeout=timeout)
         return cls._wait_for_bridge(
             bridge_after_build,
             timeout=timeout,
@@ -697,7 +706,7 @@ class AutomationBridgeClient:
         timeout: float,
         message: str,
         retry_exceptions: RetryExceptions = (AutomationBridgeError,),
-    ) -> "AutomationBridgeClient":
+    ) -> "Client":
         """Poll transport failures while surfacing protocol/capability errors immediately."""
         started = time.monotonic()
         deadline = time.monotonic() + timeout
@@ -736,25 +745,6 @@ class AutomationBridgeClient:
             urls = editor._current_registration_remotery_urls()
             return urls[0] if urls else None
         return editor._remotery_url_value()
-
-    @classmethod
-    def from_project(
-        cls,
-        root: Union[str, Path] = ".",
-        build: bool = True,
-        timeout: float = 20.0,
-        required_capabilities: Sequence[str] = (),
-    ) -> "AutomationBridgeClient":
-        """Create an editor client from `root`, then connect to the Automation Bridge API."""
-        from .editor import EditorClient
-
-        editor = EditorClient.from_project(root)
-        return cls.from_editor(
-            editor,
-            build=build,
-            timeout=timeout,
-            required_capabilities=required_capabilities,
-        )
 
     def wait_ready(
         self,
@@ -808,7 +798,7 @@ class AutomationBridgeClient:
         self.require("runtime.lifecycle")
         return self._request("GET", "/lifecycle")
 
-    def require(self, *capabilities: str) -> "AutomationBridgeClient":
+    def require(self, *capabilities: str) -> "Client":
         """Declare mandatory capabilities and fail clearly when any are unavailable.
 
         A declaration may include a minimum feature version as ``name>=2``.
@@ -902,51 +892,51 @@ class AutomationBridgeClient:
             params["include"] = normalized_include
         return self._request("GET", "/scene", params)
 
-    def nodes(self, **selector: Any) -> List[Node]:
-        """Return one server-filtered page of nodes, with exact filters applied natively."""
-        nodes, _, _ = self._select_nodes(selector)
-        return nodes
+    def elements(self, **selector: Any) -> List[Element]:
+        """Return one server-filtered page of inspectable scene elements."""
+        elements, _, _ = self._select_nodes(selector)
+        return elements
 
-    def node(self, **selector: Any) -> Node:
-        """Return exactly one matching node or raise `SelectorError`."""
-        nodes, metadata, selector_text = self._select_nodes(selector)
-        if len(nodes) == 1:
-            return nodes[0]
-        error = SelectorError(self._selector_error("expected exactly one node", selector, selector_text, nodes, metadata))
+    def element(self, **selector: Any) -> Element:
+        """Return exactly one matching element or raise `SelectorError`."""
+        elements, metadata, selector_text = self._select_nodes(selector)
+        if len(elements) == 1:
+            return elements[0]
+        error = SelectorError(self._selector_error("expected exactly one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
 
-    def maybe_node(self, **selector: Any) -> Optional[Node]:
-        """Return zero or one matching node, raising if multiple nodes match."""
-        nodes, metadata, selector_text = self._select_nodes(selector)
-        if len(nodes) <= 1:
-            return nodes[0] if nodes else None
-        error = SelectorError(self._selector_error("expected zero or one node", selector, selector_text, nodes, metadata))
+    def maybe_element(self, **selector: Any) -> Optional[Element]:
+        """Return zero or one matching element, raising if multiple elements match."""
+        elements, metadata, selector_text = self._select_nodes(selector)
+        if len(elements) <= 1:
+            return elements[0] if elements else None
+        error = SelectorError(self._selector_error("expected zero or one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
 
-    def by_id(
+    def element_by_id(
         self,
         id: str,
         include: Optional[Union[str, Iterable[str]]] = "basic,bounds,properties,children",
-    ) -> Node:
-        """Fetch one node by stable Automation Bridge node id."""
+    ) -> Element:
+        """Fetch one element by stable Automation Bridge element id."""
         params: Dict[str, Any] = {"id": id}
         normalized_include = _normalize_include(include)
         if normalized_include:
             params["include"] = normalized_include
-        return Node(self._request("GET", "/node", params)["node"])
+        return Element(self._request("GET", "/node", params)["node"])
 
     def parent(
         self,
-        node_or_id: Union[Node, str],
+        element_or_id: Union[Element, str],
         include: Optional[Union[str, Iterable[str]]] = "basic,bounds,properties",
-    ) -> Node:
-        """Return the parent node for a component or child node."""
-        node = node_or_id if isinstance(node_or_id, Node) else self.by_id(node_or_id, include="basic")
-        if not node.parent_id:
-            raise SelectorError(f"node has no parent: {node.compact()}")
-        return self.by_id(node.parent_id, include=include)
+    ) -> Element:
+        """Return the parent element for a component or child element."""
+        element = element_or_id if isinstance(element_or_id, Element) else self.element_by_id(element_or_id, include="basic")
+        if not element.parent_id:
+            raise SelectorError(f"element has no parent: {element.compact()}")
+        return self.element_by_id(element.parent_id, include=include)
 
     def count(self, **selector: Any) -> int:
         """Return the complete native match count, independent of page size."""
@@ -968,7 +958,7 @@ class AutomationBridgeClient:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue one FIFO click and optionally wait for the native release receipt."""
-        if isinstance(target, Node):
+        if isinstance(target, Element):
             params: Dict[str, Any] = {"id": target.id}
         elif isinstance(target, str):
             params = {"id": target}
@@ -1169,7 +1159,7 @@ class AutomationBridgeClient:
         """
         return EventStream(self, from_cursor=from_cursor)
 
-    def wait_for_ack(
+    def wait_for_input_acknowledgement(
         self,
         input_id: int,
         timeout: float = 10.0,
@@ -1467,11 +1457,11 @@ class AutomationBridgeClient:
         return VisualClient(self)
 
     @property
-    def recording(self) -> "RecordingClient":
+    def video_recording(self) -> "VideoRecordingClient":
         """Return optional video recording helpers."""
-        from .recording import RecordingClient
+        from .recording import VideoRecordingClient
 
-        return RecordingClient(self)
+        return VideoRecordingClient(self)
 
     def trace(
         self,
@@ -1710,34 +1700,34 @@ class AutomationBridgeClient:
         output_path.write_text(text + "\n", encoding="utf-8")
         return output_path
 
-    def format_nodes(self, nodes: Optional[Iterable[Node]] = None, **selector: Any) -> str:
-        """Format nodes as compact one-line diagnostics."""
-        selected = list(nodes if nodes is not None else self.nodes(**selector))
-        return "\n".join(node.compact() for node in selected)
+    def format_elements(self, elements: Optional[Iterable[Element]] = None, **selector: Any) -> str:
+        """Format elements as compact one-line diagnostics."""
+        selected = list(elements if elements is not None else self.elements(**selector))
+        return "\n".join(element.compact() for element in selected)
 
-    def wait_for_node(
+    def wait_for_element(
         self,
         timeout: float = 10.0,
         interval: float = 0.1,
         after_scene_sequence: Optional[int] = None,
         retry_exceptions: RetryExceptions = (SelectorError,),
         **selector: Any,
-    ) -> Node:
-        """Wait for one node, optionally requiring a newer scene sequence."""
-        def one_node() -> Optional[Node]:
-            nodes, _, _ = self._select_nodes(selector)
-            if len(nodes) != 1:
+    ) -> Element:
+        """Wait for one element, optionally requiring a newer scene sequence."""
+        def one_element() -> Optional[Element]:
+            elements, _, _ = self._select_nodes(selector)
+            if len(elements) != 1:
                 return None
-            node = nodes[0]
-            if after_scene_sequence is not None and node.scene_sequence <= after_scene_sequence:
+            element = elements[0]
+            if after_scene_sequence is not None and element.scene_sequence <= after_scene_sequence:
                 return None
-            return node
+            return element
 
         return wait_until(
-            one_node,
+            one_element,
             timeout=timeout,
             interval=interval,
-            message=f"node did not appear after scene sequence {after_scene_sequence}: {selector}",
+            message=f"element did not appear after scene sequence {after_scene_sequence}: {selector}",
             retry_exceptions=retry_exceptions,
             scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
         )
@@ -1755,7 +1745,7 @@ class AutomationBridgeClient:
             lambda: self.count(**selector),
             timeout=timeout,
             interval=interval,
-            message=f"node count did not become {expected}: {selector}",
+            message=f"element count did not become {expected}: {selector}",
             retry_exceptions=retry_exceptions,
             scene_sequence=lambda: getattr(self, "_last_scene_sequence", None),
             predicate=lambda count: count == expected,
@@ -1778,7 +1768,7 @@ class AutomationBridgeClient:
             message=f"engine frame did not reach {target}",
         )
 
-    def observe_node(
+    def observe_element(
         self,
         minimum_frames: int = 3,
         timeout: float = 10.0,
@@ -1786,7 +1776,7 @@ class AutomationBridgeClient:
         identity: str = "logical",
         **selector: Any,
     ) -> ObservationReceipt:
-        """Require one node identity across distinct frames and return its observation span."""
+        """Require one element identity across distinct frames and return its observation span."""
         if minimum_frames <= 0:
             raise ValueError("minimum_frames must be positive")
         if identity not in {"logical", "snapshot", "instance"}:
@@ -1794,7 +1784,7 @@ class AutomationBridgeClient:
         observation: Dict[str, Any] = {}
 
         def sample() -> Optional[ObservationReceipt]:
-            node = self.maybe_node(**selector)
+            node = self.maybe_element(**selector)
             if node is None:
                 observation.clear()
                 return None
@@ -1821,7 +1811,7 @@ class AutomationBridgeClient:
             if observation["frames"] < minimum_frames:
                 return None
             return ObservationReceipt(
-                node=observation["node"],
+                element=observation["node"],
                 identity=observation["identity"],
                 first_frame=observation["first_frame"],
                 last_frame=observation["last_frame"],
@@ -1834,17 +1824,17 @@ class AutomationBridgeClient:
             sample,
             timeout=timeout,
             interval=interval,
-            message=f"node was not observed for {minimum_frames} distinct frames: {selector}",
+            message=f"element was not observed for {minimum_frames} distinct frames: {selector}",
         )
 
     def wait_for_disappearance(
         self,
-        node_id: str,
+        element_id: str,
         timeout: float = 10.0,
         interval: float = 0.02,
     ) -> ObservationReceipt:
         """Wait until a snapshot id is absent and return its last and disappearance receipts."""
-        first = self.maybe_node(id=node_id)
+        first = self.maybe_element(id=element_id)
         last = first
         first_frame = first.engine_frame if first else 0
         first_sequence = first.scene_sequence if first else 0
@@ -1852,7 +1842,7 @@ class AutomationBridgeClient:
 
         def disappeared() -> Optional[ObservationReceipt]:
             nonlocal last, observed
-            node = self.maybe_node(id=node_id)
+            node = self.maybe_element(id=element_id)
             if node is not None:
                 if last is None or node.engine_frame != last.engine_frame:
                     observed += 1
@@ -1860,8 +1850,8 @@ class AutomationBridgeClient:
                 return None
             current = self._request("GET", "/frame")
             return ObservationReceipt(
-                node=last,
-                identity=(last.logical_id or last.snapshot_id) if last else node_id,
+                element=last,
+                identity=(last.logical_id or last.snapshot_id) if last else element_id,
                 first_frame=first_frame,
                 last_frame=last.engine_frame if last else first_frame,
                 first_scene_sequence=first_sequence,
@@ -1875,7 +1865,7 @@ class AutomationBridgeClient:
             disappeared,
             timeout=timeout,
             interval=interval,
-            message=f"node did not disappear: {node_id}",
+            message=f"element did not disappear: {element_id}",
         )
 
     def _request(
@@ -2020,12 +2010,12 @@ class AutomationBridgeClient:
             return {}
         return {key: _encode_param(value) for key, value in params.items() if value is not None}
 
-    def _select_nodes(self, selector: Mapping[str, Any]) -> Tuple[List[Node], JsonDict, str]:
+    def _select_nodes(self, selector: Mapping[str, Any]) -> Tuple[List[Element], JsonDict, str]:
         self._validate_selector(selector)
         limit = selector.get("limit", 50)
         params = self._server_params(selector, limit=limit)
         data = self._request("GET", "/nodes", params)
-        server_nodes = [Node(node) for node in data.get("nodes", []) if isinstance(node, dict)]
+        server_nodes = [Element(node) for node in data.get("nodes", []) if isinstance(node, dict)]
         filtered = [node for node in server_nodes if self._matches_client_filters(node, selector)]
         data = dict(data)
         data["_nodes"] = server_nodes
@@ -2051,7 +2041,7 @@ class AutomationBridgeClient:
                 params[key] = selector[key]
         return params
 
-    def _matches_client_filters(self, node: Node, selector: Mapping[str, Any]) -> bool:
+    def _matches_client_filters(self, node: Element, selector: Mapping[str, Any]) -> bool:
         if selector.get("enabled") is not None and node.enabled != bool(selector["enabled"]):
             return False
         if selector.get("kind") is not None and node.kind != selector["kind"]:
@@ -2072,7 +2062,7 @@ class AutomationBridgeClient:
     def _validate_selector(self, selector: Mapping[str, Any]) -> None:
         unknown = set(selector) - self._SELECTOR_KEYS
         if unknown:
-            raise TypeError(f"unknown node selector keys: {', '.join(sorted(unknown))}")
+            raise TypeError(f"unknown element selector keys: {', '.join(sorted(unknown))}")
 
     def _has_client_filters(self, selector: Mapping[str, Any]) -> bool:
         return any(selector.get(key) is not None for key in self._CLIENT_FILTERS)
@@ -2080,14 +2070,14 @@ class AutomationBridgeClient:
     @staticmethod
     def _selector_text(selector: Mapping[str, Any]) -> str:
         parts = [f"{key}={value!r}" for key, value in sorted(selector.items()) if value is not None]
-        return ", ".join(parts) if parts else "<all nodes>"
+        return ", ".join(parts) if parts else "<all elements>"
 
     def _selector_error(
         self,
         prefix: str,
         selector: Mapping[str, Any],
         selector_text: str,
-        nodes: Sequence[Node],
+        nodes: Sequence[Element],
         metadata: Mapping[str, Any],
     ) -> str:
         candidates = metadata.get("_nodes", [])
@@ -2105,7 +2095,7 @@ class AutomationBridgeClient:
         excluded = metadata.get("excluded")
         if isinstance(excluded, Mapping) and any(excluded.values()):
             lines.append(
-                "matching nodes excluded by state: "
+                "matching elements excluded by state: "
                 f"visibility={excluded.get('visibility', 0)}, "
                 f"enabled={excluded.get('enabled', 0)}, bounds={excluded.get('bounds', 0)}"
             )
@@ -2132,16 +2122,16 @@ class AutomationBridgeClient:
             lines.append("suggestion: add name_exact, text_exact, path, logical_id, or instance_id")
         return "\n".join(lines)
 
-    def _nearest_selector_nodes(self, selector: Mapping[str, Any], maximum: int = 5000) -> List[Node]:
+    def _nearest_selector_nodes(self, selector: Mapping[str, Any], maximum: int = 5000) -> List[Element]:
         """Fetch bounded complete pages only while formatting a failed direct selector."""
-        candidates: List[Node] = []
+        candidates: List[Element] = []
         cursor: Optional[str] = None
         while len(candidates) < maximum:
             params: Dict[str, Any] = {"limit": min(500, maximum - len(candidates)), "include": "basic"}
             if cursor is not None:
                 params["cursor"] = cursor
             data = self._request("GET", "/nodes", params)
-            candidates.extend(Node(raw) for raw in data.get("nodes", []) if isinstance(raw, dict))
+            candidates.extend(Element(raw) for raw in data.get("nodes", []) if isinstance(raw, dict))
             cursor = data.get("next_cursor")
             if not cursor:
                 break
@@ -2168,23 +2158,23 @@ class AutomationBridgeClient:
 
     @staticmethod
     def _is_node_ref(target: Target) -> bool:
-        return isinstance(target, (Node, str))
+        return isinstance(target, (Element, str))
 
     @staticmethod
     def _node_id(target: Target) -> str:
-        if isinstance(target, Node):
+        if isinstance(target, Element):
             return target.id
         if isinstance(target, str):
             return target
-        raise TypeError(f"target is not a node reference: {target!r}")
+        raise TypeError(f"target is not an element reference: {target!r}")
 
     def _point(self, target: Union[Target, float, int], y: Optional[float] = None) -> Tuple[Any, Any]:
-        if isinstance(target, Node):
-            center = target.center or self.by_id(target.id, include="basic,bounds").center
+        if isinstance(target, Element):
+            center = target.center or self.element_by_id(target.id, include="basic,bounds").center
             if center:
                 return center["x"], center["y"]
         elif isinstance(target, str):
-            center = self.by_id(target, include="basic,bounds").center
+            center = self.element_by_id(target, include="basic,bounds").center
             if center:
                 return center["x"], center["y"]
         elif isinstance(target, Mapping):

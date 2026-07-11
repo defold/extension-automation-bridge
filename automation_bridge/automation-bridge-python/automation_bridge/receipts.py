@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .nodes import Node
+from .nodes import Element
 
 
 @dataclass(frozen=True)
@@ -73,9 +73,9 @@ class ScreenshotReceipt:
 
 @dataclass(frozen=True)
 class ObservationReceipt:
-    """Frame/sequence evidence collected while observing a transient node."""
+    """Frame/sequence evidence collected while observing a transient element."""
 
-    node: Optional[Node]
+    element: Optional[Element]
     identity: str
     first_frame: int
     last_frame: int
@@ -88,7 +88,7 @@ class ObservationReceipt:
     def as_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable form suitable for trace output."""
         return {
-            "node": self.node.raw if self.node else None,
+            "element": self.element.raw if self.element else None,
             "identity": self.identity,
             "first_frame": self.first_frame,
             "last_frame": self.last_frame,

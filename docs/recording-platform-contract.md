@@ -72,7 +72,7 @@ the current runtime supports the native implementation.
 
 ## Python ownership
 
-`bridge.recording` is deliberately a thin HTTP controller. It validates the
+`game.video_recording` is deliberately a thin HTTP controller. It validates the
 small public option set, resolves and creates the output directory, and returns
 a context-managed session. Context exit always requests native finalization and
 does not replace an exception already raised by the automated workflow.

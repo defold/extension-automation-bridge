@@ -1,4 +1,4 @@
-"""Typed snapshot wrappers for Automation Bridge node responses."""
+"""Typed snapshot wrappers for Automation Bridge scene elements."""
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 @dataclass(frozen=True)
 class Bounds:
-    """Screen, center, and normalized bounds for a runtime node snapshot."""
+    """Screen, center, and normalized bounds for a runtime element snapshot."""
 
     raw: Mapping[str, Any]
 
@@ -40,8 +40,8 @@ class Bounds:
 
 
 @dataclass(frozen=True)
-class Node:
-    """Snapshot wrapper around one node object returned by `/automation-bridge/v1`."""
+class Element:
+    """Snapshot of one inspectable game object, component, or GUI element."""
 
     raw: Dict[str, Any]
 
@@ -56,7 +56,7 @@ class Node:
 
     @property
     def instance_id(self) -> Optional[str]:
-        """Return Defold's instance identifier when this node has an HInstance."""
+        """Return Defold's instance identifier when this element has an HInstance."""
         return self.raw.get("instance_id")
 
     @property
@@ -101,7 +101,7 @@ class Node:
 
     @property
     def parent_id(self) -> Optional[str]:
-        """Return the parent node id, if this snapshot has one."""
+        """Return the parent element id, if this snapshot has one."""
         return self.raw.get("parent")
 
     @property
@@ -150,11 +150,11 @@ class Node:
         return bounds.center
 
     @property
-    def children(self) -> List["Node"]:
+    def children(self) -> List["Element"]:
         children = self.raw.get("children", [])
         if not isinstance(children, list):
             return []
-        return [Node(child) for child in children if isinstance(child, dict)]
+        return [Element(child) for child in children if isinstance(child, dict)]
 
     def compact(self) -> str:
         """Return a one-line diagnostic summary for selector errors and logs."""

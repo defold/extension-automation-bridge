@@ -831,7 +831,7 @@ namespace dmAutomationBridge
         return 0;
     }
 
-    static int LuaAck(lua_State* L)
+    static int LuaAcknowledgeInput(lua_State* L)
     {
         DM_LUA_STACK_CHECK(L, 0);
         lua_Number input_number = luaL_checknumber(L, 1);
@@ -909,7 +909,7 @@ namespace dmAutomationBridge
             {"emit", LuaEmit},
             {"publish", LuaPublish},
             {"command", LuaCommand},
-            {"ack", LuaAck},
+            {"acknowledge_input", LuaAcknowledgeInput},
             {"annotate", LuaAnnotate},
             {0, 0}
         };

@@ -1,6 +1,6 @@
 - Use the Python wrapper for scripts and tests: add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path`, then import `automation_bridge`.
 - Python wrapper notes: `automation_bridge/automation-bridge-python/AGENTS.md`
 - Python wrapper user/API docs: `automation_bridge/automation-bridge-python/README.md`
-- Public APIs have Python docstrings; use `help(AutomationBridgeClient)` or `help(AutomationBridgeClient.drag)` for quick in-code reference.
-- Typical bootstrap: `AutomationBridgeClient.from_project(".", build=True)`
+- Public APIs have Python docstrings; use `help(engine.Client)` or `help(engine.Client.drag)` for quick in-code reference.
+- Typical bootstrap: `editor.open_project(".").build_and_run()`
 - Raw native endpoint docs: `automation_bridge/README.md`

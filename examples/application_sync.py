@@ -1,19 +1,19 @@
 """Race-free application synchronization example."""
 
-from automation_bridge import AutomationBridgeClient
+from automation_bridge import editor
 
 
-bridge = AutomationBridgeClient.from_project(".", build=True)
+game = editor.open_project(".").build_and_run()
 
-with bridge.events(from_cursor="now") as events:
-    before = bridge.state("sample.game")
-    result = bridge.command("sample.reset", {"request_id": "example-1"})
+with game.events(from_cursor="now") as events:
+    before = game.state("sample.game")
+    result = game.command("sample.reset", {"request_id": "example-1"})
     completed = events.wait(
         "sample.reset_complete",
         where={"request_id": "example-1"},
         timeout=10,
     )
-    state = bridge.wait_for_state(
+    state = game.wait_for_state(
         "sample.game.item_count",
         0,
         after_revision=before.revision,
@@ -21,4 +21,4 @@ with bridge.events(from_cursor="now") as events:
     )
 
 print(result["result"], completed.sequence, state.revision)
-bridge.mark("reset_visible", {"request_id": "example-1"})
+game.mark("reset_visible", {"request_id": "example-1"})

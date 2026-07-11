@@ -2,13 +2,13 @@
 
 from pathlib import Path
 
-from automation_bridge import AutomationBridgeClient
+from automation_bridge import editor
 
 
-bridge = AutomationBridgeClient.from_project(".", build=True)
+game = editor.open_project(".").build_and_run()
 artifact_directory = Path("artifacts")
 
-with bridge.trace(
+with game.trace(
     artifact_directory / "gesture.trace.json",
     screenshots="on_error",
     prerequisites={
@@ -18,7 +18,7 @@ with bridge.trace(
         "external_services": "offline",
     },
 ) as trace:
-    gesture = bridge.gestures.generate_drag(
+    gesture = game.gestures.generate_drag(
         (100, 100),
         (600, 400),
         seed=42,
@@ -27,5 +27,5 @@ with bridge.trace(
         max_acceleration=8000,
     )
     # Requires the native multi-point gesture capability.
-    receipt = bridge.drag_path(**gesture)
-    trace.record_acknowledgement({"input_id": receipt.input_id, "accepted": True})
+    receipt = game.drag_path(**gesture)
+    trace.record_input_acknowledgement({"input_id": receipt.input_id, "accepted": True})

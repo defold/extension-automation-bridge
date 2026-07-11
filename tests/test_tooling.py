@@ -11,9 +11,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import AutomationBridgeClient  # noqa: E402
+from automation_bridge import engine  # noqa: E402
+EngineClient = engine.Client
 from automation_bridge.gestures import GestureConstraintError, GestureGenerator  # noqa: E402
-from automation_bridge.recording import RecordingClient  # noqa: E402
+VideoRecordingClient = engine.VideoRecordingClient
 from automation_bridge.trace import TraceError, TraceSession  # noqa: E402
 
 
@@ -54,7 +55,7 @@ class GestureGeneratorTest(unittest.TestCase):
             GestureGenerator().generate_drag((0, 0), (100, 0), seed=1, duration=1.0, max_velocity=50)
 
 
-class RecordingTest(unittest.TestCase):
+class VideoRecordingTest(unittest.TestCase):
     class Bridge:
         def __init__(self, fail_stop=False):
             self.requests = []
@@ -87,7 +88,7 @@ class RecordingTest(unittest.TestCase):
     def test_start_uses_native_endpoint_and_context_finalizes(self):
         with tempfile.TemporaryDirectory() as directory:
             bridge = self.Bridge()
-            with RecordingClient(bridge).start(Path(directory) / "capture.mp4", size=(320, 240), fps=24) as recording:
+            with VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4", size=(320, 240), fps=24) as recording:
                 self.assertTrue(recording.metadata.active)
             self.assertTrue(recording.metadata.finalized)
             self.assertEqual((320, 240, 24), (recording.metadata.width, recording.metadata.height, recording.metadata.fps))
@@ -96,10 +97,10 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual({"width": 320, "height": 240, "fps": 24},
                              {key: start[2][key] for key in ("width", "height", "fps")})
             self.assertNotIn("audio", start[2])
-            self.assertEqual(["recording_started", "recording_stopped"], [kind for kind, _ in bridge.traces])
+        self.assertEqual(["video_recording_started", "video_recording_stopped"], [kind for kind, _ in bridge.traces])
 
     def test_capabilities_are_reported_by_engine(self):
-        capabilities = RecordingClient(self.Bridge()).capabilities()
+        capabilities = VideoRecordingClient(self.Bridge()).capabilities()
         self.assertTrue(capabilities.available)
         self.assertTrue(capabilities.application_audio)
         self.assertEqual(("h264",), capabilities.video_codecs)
@@ -108,14 +109,14 @@ class RecordingTest(unittest.TestCase):
     def test_explicit_audio_false_is_sent_for_portable_video_only_capture(self):
         bridge = self.Bridge()
         with tempfile.TemporaryDirectory() as directory:
-            session = RecordingClient(bridge).start(Path(directory) / "capture.mp4", audio=False)
+            session = VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4", audio=False)
             self.assertFalse(bridge.requests[0][2]["audio"])
             session.stop()
 
     def test_original_exception_survives_native_finalization_failure(self):
         bridge = self.Bridge(fail_stop=True)
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(KeyboardInterrupt, "stop now"):
-            with RecordingClient(bridge).start(Path(directory) / "capture.mp4"):
+            with VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4"):
                 raise KeyboardInterrupt("stop now")
 
 
@@ -154,7 +155,7 @@ class TraceTest(unittest.TestCase):
                 })
                 trace.record_event({"name": "complete", "scene_sequence": 8})
                 trace.record_state("ui", 3, {"busy": False})
-                trace.record_acknowledgement({"input_id": 8, "accepted": True})
+                trace.record_input_acknowledgement({"input_id": 8, "accepted": True})
                 trace.record_profiler({"first_frame": 100, "last_frame": 110})
                 trace.record_selector_error({"name_exact": "missing"}, RuntimeError("no match"))
 
@@ -191,7 +192,7 @@ class TraceTest(unittest.TestCase):
 
 class ClientToolingTest(unittest.TestCase):
     def test_active_trace_automatically_records_input_request_and_receipt(self):
-        client = AutomationBridgeClient(1234)
+        client = EngineClient(1234)
         client.health = lambda: {"version": 1, "capabilities": ["input.click"]}
         client.screen = lambda: {"window": {"width": 100, "height": 100}}
         client.scene = lambda: {"scene_sequence": 4}

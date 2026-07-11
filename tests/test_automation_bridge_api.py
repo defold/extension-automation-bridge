@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import importlib.util
 import json
+import math
 import os
 import socket
 import struct
@@ -20,18 +22,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
 import automation_bridge as automation_bridge_package  # noqa: E402
-from automation_bridge import (  # noqa: E402
+from automation_bridge import editor, engine  # noqa: E402
+from automation_bridge.engine import (  # noqa: E402
     AutomationBridgeApiError,
-    AutomationBridgeClient,
-    AutomationBridgeError,
-    DefoldInstallation,
-    EditorClient,
+    Error as AutomationBridgeError,
     EventBufferOverflow,
     EventStream,
     IncompatibleApiVersionError,
     InputExecutionError,
     InputReceipt,
-    Node,
+    Element,
     ProfilerClient,
     ProfilerDataError,
     ScreenshotReceipt,
@@ -39,6 +39,9 @@ from automation_bridge import (  # noqa: E402
     WaitTimeoutError,
     wait_until,
 )
+EngineClient = engine.Client
+EditorApiClient = editor.Client
+InstallationType = editor.Installation
 from automation_bridge.client import EngineLogStream, _encode_system_reboot  # noqa: E402
 from automation_bridge.profiler import (  # noqa: E402
     ProfilerCapture,
@@ -54,6 +57,9 @@ from automation_bridge.remotery import (  # noqa: E402
     parse_property_frame,
     parse_sample_frame,
 )
+
+
+EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi.json").read_text(encoding="utf-8"))
 
 
 def _read_automation_bridge_png(path):
@@ -138,9 +144,9 @@ def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
     return max(counts)
 
 
-class AutomationBridgeClientUnitTest(unittest.TestCase):
+class EngineClientUnitTest(unittest.TestCase):
     def test_public_surface_excludes_removed_aliases_and_backend_types(self):
-        bridge = AutomationBridgeClient(1)
+        bridge = EngineClient(1)
         removed_client_names = {
             "get", "post", "put", "delete", "post_json", "put_json",
             "optional", "assert_node", "wait_for_appearance",
@@ -148,9 +154,45 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             "recording_capabilities", "recording_permission_diagnostics",
         }
         self.assertTrue(all(not hasattr(bridge, name) for name in removed_client_names))
-        self.assertFalse(hasattr(Node({"parent": "root"}), "parent"))
-        self.assertFalse(any(name.startswith("Remotery") for name in automation_bridge_package.__all__))
-        self.assertLessEqual(len(automation_bridge_package.__all__), 25)
+        self.assertFalse(hasattr(Element({"parent": "root"}), "parent"))
+        self.assertEqual(["editor", "engine"], automation_bridge_package.__all__)
+        for removed in ("AutomationBridgeClient", "EditorClient", "Node", "Element"):
+            self.assertFalse(hasattr(automation_bridge_package, removed))
+        for removed in ("node", "nodes", "maybe_node", "by_id", "wait_for_node", "wait_for_ack", "recording"):
+            self.assertFalse(hasattr(bridge, removed))
+        self.assertTrue(hasattr(bridge, "element"))
+        self.assertTrue(hasattr(bridge, "wait_for_input_acknowledgement"))
+        self.assertTrue(hasattr(bridge, "video_recording"))
+        for removed in (
+            "RecordingClient", "RecordingSession", "RecordingCapabilities",
+            "RecordingMetadata", "RecordingError", "Node",
+        ):
+            self.assertFalse(hasattr(engine, removed))
+        for removed in ("from_project", "from_editor"):
+            self.assertFalse(hasattr(engine, removed))
+        self.assertFalse(hasattr(editor, "Extensions"))
+
+    def test_engine_connect_forwards_the_complete_connection_contract(self):
+        sentinel = object()
+        with mock.patch.object(engine, "Client", return_value=sentinel) as client:
+            actual = engine.connect(
+                51337,
+                timeout=4.5,
+                profiler_url="ws://localhost:17815/rmt",
+                client_id="client",
+                session_id="session",
+                required_capabilities=("scene", "input.drag"),
+            )
+
+        self.assertIs(sentinel, actual)
+        client.assert_called_once_with(
+            51337,
+            timeout=4.5,
+            profiler_url="ws://localhost:17815/rmt",
+            client_id="client",
+            session_id="session",
+            required_capabilities=("scene", "input.drag"),
+        )
 
     def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
         class ScriptedClient:
@@ -185,6 +227,22 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(5, other.sequence)
         self.assertEqual(2, len(client.requests))
 
+    def test_wait_for_input_acknowledgement_uses_full_protocol_event_name(self):
+        game = EngineClient(1)
+        stream = mock.Mock()
+        expected = mock.sentinel.acknowledgement
+        stream.wait.return_value = expected
+
+        actual = game.wait_for_input_acknowledgement(42, timeout=3.0, events=stream)
+
+        self.assertIs(expected, actual)
+        stream.wait.assert_called_once_with(
+            "input.acknowledged",
+            where={"input_id": 42},
+            event_type="acknowledgement",
+            timeout=3.0,
+        )
+
     def test_event_stream_reports_ring_overflow(self):
         class OverflowClient:
             timeout = 10.0
@@ -201,7 +259,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(10, raised.exception.oldest_cursor)
 
     def test_wait_for_state_can_require_a_new_revision(self):
-        class StateClient(AutomationBridgeClient):
+        class StateClient(EngineClient):
             def __init__(self):
                 super().__init__(12345)
                 self.requests = []
@@ -221,8 +279,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(3, result.revision)
         self.assertEqual(2, bridge.requests[1][2]["after_revision"])
 
-    def test_semantic_node_metadata_is_typed(self):
-        node = Node(
+    def test_semantic_element_metadata_is_typed(self):
+        element = Element(
             {
                 "id": "n:1",
                 "automation_id": "operation_status",
@@ -231,12 +289,12 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual("operation_status", node.automation_id)
-        self.assertEqual("status_ready", node.localization_key)
-        self.assertEqual("status", node.role)
+        self.assertEqual("operation_status", element.automation_id)
+        self.assertEqual("status_ready", element.localization_key)
+        self.assertEqual("status", element.role)
 
     def test_command_and_marker_encode_bounded_json(self):
-        class ApplicationClient(AutomationBridgeClient):
+        class ApplicationClient(EngineClient):
             def __init__(self):
                 super().__init__(12345)
                 self.requests = []
@@ -274,7 +332,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             raise IncompatibleApiVersionError("unsupported")
 
         with self.assertRaises(IncompatibleApiVersionError):
-            AutomationBridgeClient._wait_for_bridge(incompatible_probe, timeout=1.0, message="not ready")
+            EngineClient._wait_for_bridge(incompatible_probe, timeout=1.0, message="not ready")
 
         self.assertEqual([True], calls)
 
@@ -296,7 +354,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         metadata = bridge.trace_metadata()
 
-        self.assertEqual("2.1.0", metadata["python_package_version"])
+        self.assertEqual("2.0.0", metadata["python_package_version"])
         self.assertEqual("1.1.0", metadata["native_version"])
         self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
 
@@ -325,7 +383,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
                 encoding="utf-8",
             )
-            editor = EditorClient(root, port=12345)
+            editor = EditorApiClient(root, port=12345)
 
             accepted = editor._validate_cached_engine_health(
                 43210,
@@ -345,7 +403,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
                 encoding="utf-8",
             )
-            editor = EditorClient(root, port=12345)
+            editor = EditorApiClient(root, port=12345)
 
             accepted = editor._validate_cached_engine_health(
                 43210,
@@ -385,13 +443,255 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 ]),
                 encoding="utf-8",
             )
-            with mock.patch.object(EditorClient, "installation_registry_path", return_value=registry):
-                installations = EditorClient.installations()
-                latest = EditorClient.latest_installation()
+            with mock.patch.object(EditorApiClient, "_installation_registry_path", return_value=registry):
+                installations = editor.installations()
+                latest = editor.latest_installation()
 
         self.assertEqual([newer_launcher, older_launcher], [item.launcher_path for item in installations])
-        self.assertIsInstance(latest, DefoldInstallation)
+        self.assertIsInstance(latest, InstallationType)
         self.assertEqual(newer_launcher, latest.launcher_path)
+
+    def test_editor_namespaces_expose_only_supported_automation_operations(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+
+        self.assertFalse(hasattr(project, "extensions"))
+        self.assertFalse(hasattr(project, "window"))
+        self.assertFalse(hasattr(project, "help"))
+        for removed in ("from_project", "build", "is_running", "console_lines", "engine_service_port"):
+            self.assertFalse(hasattr(project, removed))
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(202, b"")) as request:
+            project.commands.hot_reload()
+            project.debugger.step_over()
+            project.build_and_run_html5()
+        self.assertEqual(3, request.call_count)
+
+        parameters = EDITOR_OPENAPI["paths"]["/command/{command}"]["post"]["parameters"]
+        advertised = set(parameters[0]["schema"]["enum"])
+        self.assertEqual(advertised, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
+        self.assertFalse(editor._SUPPORTED_COMMANDS & editor._EXCLUDED_COMMANDS)
+        self.assertEqual({("/eval", "post")}, editor._EXCLUDED_PATHS)
+        advertised_paths = {
+            (path, method)
+            for path, operations in EDITOR_OPENAPI["paths"].items()
+            for method in operations
+        }
+        self.assertEqual(advertised_paths, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
+
+    def test_every_editor_command_wrapper_uses_its_advertised_command(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        expected_empty_commands = [
+            "hot-reload", "rebundle", "reload-extensions", "reload-stylesheets",
+            "debugger-start", "debugger-stop", "debugger-break", "debugger-continue",
+            "debugger-detach", "debugger-step-into", "debugger-step-out",
+            "debugger-step-over", "build-html5",
+        ]
+
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(202, b"")) as request:
+            project.commands.hot_reload()
+            project.commands.rebundle()
+            project.commands.reload_extensions()
+            project.commands.reload_stylesheets()
+            project.debugger.start()
+            project.debugger.stop()
+            project.debugger.break_()
+            project.debugger.continue_()
+            project.debugger.detach()
+            project.debugger.step_into()
+            project.debugger.step_out()
+            project.debugger.step_over()
+            project.build_and_run_html5()
+
+        actual_commands = [call.args[0].rsplit("/", 1)[-1] for call in request.call_args_list]
+        self.assertEqual(expected_empty_commands, actual_commands)
+        self.assertTrue(all(call.kwargs["method"] == "POST" for call in request.call_args_list))
+
+    def test_editor_fetch_libraries_parses_results_and_reports_failure(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        response = {
+            "success": True,
+            "libraries": [
+                {"uri": "https://example.test/one.zip", "success": True},
+                {"uri": "https://example.test/two.zip", "success": False, "message": "missing"},
+            ],
+        }
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, response)) as request:
+            result = project.commands.fetch_libraries(timeout=7)
+        self.assertTrue(result.success)
+        self.assertEqual((True, False), tuple(item.success for item in result.libraries))
+        self.assertEqual("missing", result.libraries[1].message)
+        self.assertEqual(7, request.call_args.kwargs["timeout"])
+
+        with mock.patch("automation_bridge.editor.request_json", return_value=(500, {"success": False})):
+            with self.assertRaises(editor.CommandError):
+                project.commands.fetch_libraries()
+
+    def test_editor_console_read_and_context_managed_stream(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        snapshot_body = {
+            "lines": ["first", "second"],
+            "regions": [{"type": "stdout", "from": 0, "to": 2}, "ignored"],
+        }
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, snapshot_body)):
+            snapshot = project.console.read()
+        self.assertEqual(("first", "second"), snapshot.lines)
+        self.assertEqual("stdout", snapshot.regions[0].raw["type"])
+
+        response = mock.MagicMock()
+        response.readline.side_effect = [b"streamed line\r\n", b""]
+        with mock.patch("automation_bridge.editor.urllib.request.urlopen", return_value=response) as urlopen:
+            with project.console.stream(connect_timeout=3, read_timeout=1.5) as stream:
+                self.assertEqual("streamed line", stream.readline())
+                self.assertIsNone(stream.readline())
+        urlopen.assert_called_once_with("http://localhost:12345/console/stream", timeout=3)
+        response.fp.raw._sock.settimeout.assert_called_with(1.5)
+        response.close.assert_called_once_with()
+
+    def test_editor_reference_search_encodes_filters_and_validates_response(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch(
+            "automation_bridge.editor.request_raw",
+            return_value=(200, b'[{"name":"go.property"},null]'),
+        ) as request:
+            result = project.reference.search(environment="runtime", language="lua", query="go property")
+        self.assertEqual([{"name": "go.property"}], result)
+        url = request.call_args.args[0]
+        self.assertEqual(
+            {"environment": ["runtime"], "language": ["lua"], "q": ["go property"]},
+            urllib.parse.parse_qs(urllib.parse.urlsplit(url).query),
+        )
+
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(200, b'{"not":"a list"}')):
+            with self.assertRaises(editor.HttpError):
+                project.reference.search()
+
+    def test_editor_build_error_preserves_typed_source_location(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        issue = {
+            "severity": "error",
+            "message": "unexpected token",
+            "resource": "/main/main.script",
+            "range": {
+                "start": {"line": 7, "character": 3},
+                "end": {"line": 7, "character": 8},
+            },
+        }
+        with (
+            mock.patch.object(project, "_console_lines", return_value=[]),
+            mock.patch.object(project, "_engine_service_port_value", return_value=None),
+            mock.patch("automation_bridge.editor.request_json", return_value=(400, {"success": False, "issues": [issue]})),
+        ):
+            with self.assertRaises(editor.BuildError) as raised:
+                project._build_and_run_command("build")
+
+        actual = raised.exception.issues[0]
+        self.assertEqual("/main/main.script", actual.resource)
+        self.assertEqual((7, 3), (actual.range.start.line, actual.range.start.character))
+        self.assertEqual((7, 8), (actual.range.end.line, actual.range.end.character))
+
+    def test_editor_build_workflows_delegate_with_explicit_command_names(self):
+        project = EditorApiClient(".", port=12345)
+        sentinel = object()
+        with mock.patch.object(EngineClient, "_from_editor", return_value=sentinel) as connect:
+            self.assertIs(sentinel, project.build_and_run(timeout=12, required_capabilities=("scene",)))
+            self.assertIs(sentinel, project.clean_build_and_run(timeout=13))
+            self.assertIs(sentinel, project.connect_engine(timeout=14))
+        self.assertEqual("build", connect.call_args_list[0].kwargs["build_command"])
+        self.assertEqual("clean-build", connect.call_args_list[1].kwargs["build_command"])
+        self.assertIsNone(connect.call_args_list[2].kwargs["build_command"])
+
+    def test_editor_preferences_catalog_and_custom_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        preference = project.preferences.CODE_FONT_SIZE
+
+        self.assertEqual("code/font/size", preference.path)
+        self.assertEqual(12.0, preference.default)
+        self.assertIn("Font size", preference.description)
+        self.assertEqual(preference, project.preferences.describe("code/font/size"))
+        self.assertIn(preference, project.preferences.list(prefix="code", type="number"))
+        self.assertIsNone(project.preferences.describe("my-extension/custom"))
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.getcode.return_value = 200
+        response.read.return_value = b"16"
+        with mock.patch("automation_bridge.preferences.urllib.request.urlopen", return_value=response) as urlopen:
+            self.assertEqual(16, project.preferences.get(preference))
+            project.preferences.set("my-extension/custom", True)
+        self.assertEqual(2, urlopen.call_count)
+
+        descriptions_path = ROOT / "automation_bridge/automation-bridge-python/tools/preference_descriptions.json"
+        descriptions = json.loads(descriptions_path.read_text(encoding="utf-8"))
+        all_preferences = project.preferences.list(include_groups=True)
+        self.assertEqual({item.path for item in all_preferences}, set(descriptions))
+
+    def test_editor_preferences_filter_scope_groups_and_validate_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        groups = project.preferences.list(prefix="scene/grid", include_groups=True)
+        self.assertTrue(any(item.group for item in groups))
+        self.assertTrue(all(item.path == "scene/grid" or item.path.startswith("scene/grid/") for item in groups))
+        project_scoped = project.preferences.list(scope="project")
+        self.assertTrue(project_scoped)
+        self.assertTrue(all(item.scope == "project" and not item.group for item in project_scoped))
+        with self.assertRaises(ValueError):
+            project.preferences.get("")
+        with self.assertRaises(TypeError):
+            project.preferences.describe(42)
+
+    def test_preference_catalog_generator_fixture_and_failures(self):
+        script_path = ROOT / "automation_bridge/automation-bridge-python/tools/sync_preferences.py"
+        spec = importlib.util.spec_from_file_location("sync_preferences_for_test", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = (ROOT / "tests/fixtures/preferences_schema.clj").read_text(encoding="utf-8")
+        marker = "(def default-schema"
+        schema = module.Reader(fixture[fixture.index(marker) + len(marker):]).read()
+        generated = module.catalog(schema)
+        descriptions = {item["path"]: f"Description for {item['path']}" for item in generated}
+        generated = module.catalog(schema, descriptions)
+        by_path = {item["path"]: item for item in generated}
+
+        self.assertEqual("project", by_path["code/font-size"]["scope"])
+        self.assertEqual("CODE_FONT_SIZE", by_path["code/font-size"]["name"])
+        self.assertEqual(["light", "dark"], by_path["code/theme"]["enum_values"])
+        self.assertEqual({"step": 1}, by_path["code/font-size"]["ui"])
+        with self.assertRaisesRegex(RuntimeError, "missing curated preference descriptions"):
+            module.catalog(schema, {})
+        collision = {
+            "type": "object",
+            "properties": {
+                "a-b": {"type": "string"},
+                "a_b": {"type": "string"},
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "constant collision"):
+            module.catalog(collision)
+
+    def test_editor_installation_registry_paths_cover_supported_platforms(self):
+        with mock.patch("automation_bridge.editor.sys.platform", "darwin"), mock.patch.object(Path, "home", return_value=Path("/home/me")):
+            self.assertEqual(Path("/home/me/Library/Application Support/Defold/installations.json"), editor.installation_registry_path())
+        with mock.patch("automation_bridge.editor.sys.platform", "win32"), mock.patch.dict(os.environ, {"LOCALAPPDATA": "C:/Users/me/AppData/Local"}):
+            self.assertEqual(Path("C:/Users/me/AppData/Local/Defold/installations.json"), editor.installation_registry_path())
+        with mock.patch("automation_bridge.editor.sys.platform", "linux"), mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/state"}):
+            self.assertEqual(Path("/state/Defold/installations.json"), editor.installation_registry_path())
+
+    def test_lua_public_api_uses_only_full_acknowledgement_name(self):
+        source = (ROOT / "automation_bridge/src/automation_bridge_application.cpp").read_text(encoding="utf-8")
+        self.assertIn('{"acknowledge_input", LuaAcknowledgeInput}', source)
+        self.assertNotIn('{"ack", LuaAcknowledgeInput}', source)
+
+    def test_editor_unsupported_operation_is_reported_from_openapi(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {}}
+        with self.assertRaises(editor.UnsupportedOperationError):
+            project.commands.hot_reload()
 
     def test_editor_from_project_reuses_running_editor(self):
         with tempfile.TemporaryDirectory() as root:
@@ -399,10 +699,10 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             internal.mkdir()
             with FakeHttpServer(b'{"openapi":"3.0.3"}') as server:
                 (internal / "editor.port").write_text(str(server.port), encoding="utf-8")
-                editor = EditorClient.from_project(root)
+                editor_client = editor.open_project(root)
 
-        self.assertEqual(server.port, editor.port)
-        self.assertEqual("editor_reused", editor.lifecycle_events[-1]["stage"])
+        self.assertEqual(server.port, editor_client.port)
+        self.assertEqual("editor_reused", editor_client.lifecycle_events[-1]["stage"])
 
     def test_editor_from_project_launches_latest_installation_when_port_is_missing(self):
         with tempfile.TemporaryDirectory() as root:
@@ -420,11 +720,11 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 return process
 
             with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
-                with mock.patch.object(EditorClient, "is_running", return_value=True):
-                    editor = EditorClient.from_project(root, launcher=launcher, timeout=0.2)
+                with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
+                    editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
 
-        self.assertEqual(54321, editor.port)
-        self.assertEqual("editor_started", editor.lifecycle_events[-1]["stage"])
+        self.assertEqual(54321, editor_client.port)
+        self.assertEqual("editor_started", editor_client.lifecycle_events[-1]["stage"])
         self.assertEqual([str(launcher), str(project_file)], popen.call_args.args[0])
         self.assertEqual(project_root, popen.call_args.kwargs["cwd"])
 
@@ -432,7 +732,9 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
         with tempfile.TemporaryDirectory() as root:
             with FakeHttpServer(png) as server:
-                preview = EditorClient(root, port=server.port).preview(
+                editor_client = EditorApiClient(root, port=server.port)
+                editor_client._openapi_document = {"paths": {"/preview/{path}": {"get": {}}}}
+                preview = editor_client.preview.render(
                     "gui/main menu.gui",
                     width=320,
                     height=180,
@@ -446,9 +748,9 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
     def test_editor_preview_rejects_invalid_dimensions_before_request(self):
         with tempfile.TemporaryDirectory() as root:
-            editor = EditorClient(root, port=12345)
+            editor = EditorApiClient(root, port=12345)
             with self.assertRaisesRegex(ValueError, "width"):
-                editor.preview("main/main.collection", width=0)
+                editor.preview.render("main/main.collection", width=0)
 
     def test_editor_preview_scales_project_display_dimensions(self):
         png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
@@ -458,7 +760,9 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with FakeHttpServer(png) as server:
-                preview = EditorClient(root, port=server.port).preview(
+                editor_client = EditorApiClient(root, port=server.port)
+                editor_client._openapi_document = {"paths": {"/preview/{path}": {"get": {}}}}
+                preview = editor_client.preview.render(
                     "main/main.collection",
                     resolution_multiplier=0.5,
                 )
@@ -471,18 +775,18 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
     def test_editor_preview_validates_resolution_multiplier(self):
         with tempfile.TemporaryDirectory() as root:
-            editor = EditorClient(root, port=12345)
+            editor = EditorApiClient(root, port=12345)
             with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
-                editor.preview("main/main.collection", resolution_multiplier=0.001)
+                editor.preview.render("main/main.collection", resolution_multiplier=0.001)
             with self.assertRaisesRegex(ValueError, "mutually exclusive"):
-                editor.preview("main/main.collection", width=320, resolution_multiplier=0.5)
+                editor.preview.render("main/main.collection", width=320, resolution_multiplier=0.5)
 
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
             def count(self, **selector):
                 return 0
 
-        self.assertEqual(0, AutomationBridgeClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
+        self.assertEqual(0, EngineClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
 
     def test_system_reboot_payload(self):
         self.assertEqual(b"\x0a\x01a\x12\x02bc", _encode_system_reboot(("a", "bc")))
@@ -525,7 +829,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
     def test_click_visualize_false_is_encoded(self):
         with FakeHttpServer(b'{"ok":true,"data":{"input_id":1,"state":"accepted"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
+            bridge = EngineClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.click(10, 20, wait=0, visualize=False)
 
@@ -543,7 +847,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
     def test_drag_visualize_false_is_encoded(self):
         with FakeHttpServer(b'{"ok":true,"data":{"input_id":2,"state":"accepted"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
+            bridge = EngineClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.drag((10, 20), (30, 40), duration=0.1, wait=0, visualize=False)
 
@@ -580,6 +884,33 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(7, params["expected_scene_sequence"])
         self.assertEqual("test-client", params["client_id"])
         self.assertEqual("test-session", params["session_id"])
+
+    def test_drag_path_serializes_quadratic_and_cubic_curves(self):
+        bridge = FakeInputClient()
+
+        bridge.drag_path([(0, 0), (20, 40), (60, 0)], [0.3], path="quadratic", wait=False)
+        _, _, quadratic = bridge.api_requests[-1]
+        self.assertEqual("quadratic", quadratic["path"])
+        self.assertEqual("0,0;20,40;60,0", quadratic["points"])
+        self.assertEqual("0.3", quadratic["durations"])
+
+        bridge.drag_path(
+            [(0, 0), (20, 40), (40, 40), (60, 0)],
+            [0.4],
+            path="cubic",
+            wait=False,
+        )
+        _, _, cubic = bridge.api_requests[-1]
+        self.assertEqual("cubic", cubic["path"])
+        self.assertEqual("0,0;20,40;40,40;60,0", cubic["points"])
+        self.assertEqual("0.4", cubic["durations"])
+
+    def test_drag_path_rejects_invalid_curve_control_points(self):
+        bridge = FakeInputClient()
+        with self.assertRaisesRegex(ValueError, "quadratic.*exactly three"):
+            bridge.drag_path([(0, 0), (1, 1)], [0.1], path="quadratic", wait=False)
+        with self.assertRaisesRegex(ValueError, "cubic.*exactly four"):
+            bridge.drag_path([(0, 0), (1, 1), (2, 2)], [0.1], path="cubic", wait=False)
 
     def test_input_wait_uses_native_status_until_released(self):
         bridge = FakeInputClient(statuses=["started", "released"])
@@ -725,10 +1056,10 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             def _remotery_url_value(self):
                 return "ws://127.0.0.1:17815/rmt"
 
-        self.assertIsNone(AutomationBridgeClient._editor_profiler_url(FakeEditor(), fresh_build=True))
+        self.assertIsNone(EngineClient._editor_profiler_url(FakeEditor(), fresh_build=True))
         self.assertEqual(
             "ws://127.0.0.1:17815/rmt",
-            AutomationBridgeClient._editor_profiler_url(FakeEditor(), fresh_build=False),
+            EngineClient._editor_profiler_url(FakeEditor(), fresh_build=False),
         )
 
     def test_engine_log_stream_reads_lines(self):
@@ -798,7 +1129,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
 
     def test_profiler_accessor_uses_engine_port(self):
-        bridge = AutomationBridgeClient(12345, timeout=3.0, profiler_url="ws://127.0.0.1:17816/rmt")
+        bridge = EngineClient(12345, timeout=3.0, profiler_url="ws://127.0.0.1:17816/rmt")
 
         profiler = bridge.profiler
 
@@ -878,7 +1209,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             "INFO:ENGINE: Automation Bridge endpoint registered",
         ]
 
-        self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorClient._latest_registration_remotery_urls(lines))
+        self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorApiClient._latest_registration_remotery_urls(lines))
 
     def test_parse_remotery_sample_frame(self):
         frame = parse_sample_frame(_remotery_sample_frame_body(), {1: "Frame", 2: "Update"})
@@ -1002,8 +1333,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(8.0, update.self.avg_ms)
         self.assertEqual(100, capture.counter("Memory/Used").last_value)
 
-    def test_node_exposes_snapshot_and_generational_identity(self):
-        node = __import__("automation_bridge").Node(
+    def test_element_exposes_snapshot_and_generational_identity(self):
+        node = engine.Element(
             {
                 "id": "n:1",
                 "snapshot_id": "n:1",
@@ -1025,7 +1356,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(99, node.engine_frame)
 
     def test_exact_selectors_and_count_stay_server_side(self):
-        class SelectorClient(AutomationBridgeClient):
+        class SelectorClient(EngineClient):
             def __init__(self):
                 super().__init__(1)
                 self.requests = []
@@ -1042,7 +1373,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 }
 
         bridge = SelectorClient()
-        nodes = bridge.nodes(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
+        nodes = bridge.elements(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
         count = bridge.count(name_exact="Play", enabled=True)
 
         self.assertEqual(1, len(nodes))
@@ -1053,7 +1384,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
     def test_click_forwards_expected_scene_sequence(self):
         with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
-            AutomationBridgeClient(server.port, timeout=1.0).click(
+            EngineClient(server.port, timeout=1.0).click(
                 "n:1", wait=0, expected_scene_sequence=42
             )
 
@@ -1062,7 +1393,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
     def test_convert_point_uses_json_body(self):
         response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
         with FakeHttpServer(response) as server:
-            point = AutomationBridgeClient(server.port, timeout=1.0).convert_point(
+            point = EngineClient(server.port, timeout=1.0).convert_point(
                 (0.5, 0.5), "normalized_viewport", "window"
             )
 
@@ -1074,7 +1405,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         )
 
     def test_screenshot_waits_for_native_complete_receipt(self):
-        class ScreenshotClient(AutomationBridgeClient):
+        class ScreenshotClient(EngineClient):
             def __init__(self):
                 super().__init__(1)
                 self.status_calls = 0
@@ -1118,7 +1449,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
             source.write_bytes(_rgba_png(4, 2, pixels))
 
-            class ScreenshotClient(AutomationBridgeClient):
+            class ScreenshotClient(EngineClient):
                 def __init__(self):
                     super().__init__(1)
 
@@ -1147,14 +1478,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), receipt.sha256)
 
     def test_screenshot_validates_resolution_multiplier(self):
-        bridge = AutomationBridgeClient(1)
+        bridge = EngineClient(1)
         with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
             bridge.screenshot(resolution_multiplier=0.001)
         with self.assertRaisesRegex(ValueError, "wait=True"):
             bridge.screenshot(wait=False, resolution_multiplier=0.5)
 
     def test_wait_frames_uses_native_frame_receipts(self):
-        class FrameClient(AutomationBridgeClient):
+        class FrameClient(EngineClient):
             def __init__(self):
                 super().__init__(1)
                 self.frame = 10
@@ -1168,14 +1499,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(receipt["engine_frame"], 12)
 
-    def test_observe_node_counts_distinct_frames(self):
-        class ObservationClient(AutomationBridgeClient):
+    def test_observe_element_counts_distinct_frames(self):
+        class ObservationClient(EngineClient):
             def __init__(self):
                 super().__init__(1)
                 self.frame = 3
 
-            def maybe_node(self, **selector):
-                node = __import__("automation_bridge").Node(
+            def maybe_element(self, **selector):
+                node = engine.Element(
                     {
                         "id": "n:1",
                         "logical_id": "instance:1:g2",
@@ -1186,7 +1517,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 self.frame += 1
                 return node
 
-        receipt = ObservationClient().observe_node(minimum_frames=3, timeout=0.2, interval=0)
+        receipt = ObservationClient().observe_element(minimum_frames=3, timeout=0.2, interval=0)
 
         self.assertEqual("instance:1:g2", receipt.identity)
         self.assertEqual(3, receipt.observed_frames)
@@ -1201,8 +1532,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(0.0, difference(black, transparent_black))
         self.assertEqual(0.25, difference(black, transparent_black, include_alpha=True))
 
-    def test_recording_context_abort_hook_cannot_mask_interrupt(self):
-        class RecordingClient:
+    def test_profiler_recording_context_abort_hook_cannot_mask_interrupt(self):
+        class ProfilerConnectionStub:
             connected = True
 
             def __init__(self):
@@ -1218,7 +1549,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             def join(self, timeout=None):
                 pass
 
-        client = RecordingClient()
+        client = ProfilerConnectionStub()
         hook_causes = []
 
         def failing_abort_hook(cause, capture):
@@ -1239,8 +1570,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual("recording stop", str(hook_causes[0]))
         self.assertEqual(1, client.stopped)
 
-    def test_recording_finalize_hook_receives_capture(self):
-        class RecordingClient:
+    def test_profiler_recording_finalize_hook_receives_capture(self):
+        class ProfilerConnectionStub:
             connected = True
 
             def stop(self):
@@ -1248,7 +1579,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         captures = []
         recording = ProfilerRecording(
-            RecordingClient(),
+            ProfilerConnectionStub(),
             close_on_stop=True,
             on_finalize=captures.append,
         )
@@ -1337,7 +1668,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             )
 
 
-class FakeEngineClient(AutomationBridgeClient):
+class FakeEngineClient(EngineClient):
     def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
         self.engine_posts = []
@@ -1379,7 +1710,7 @@ class FakeEngineClient(AutomationBridgeClient):
         return self._engine_info
 
 
-class FakeInputClient(AutomationBridgeClient):
+class FakeInputClient(EngineClient):
     def __init__(self, statuses=None):
         super().__init__(12345, client_id="test-client", session_id="test-session")
         self.api_requests = []
@@ -1788,13 +2119,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
             remotery_port = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_PORT")
             if remotery_url is None and remotery_port:
                 remotery_url = f"ws://127.0.0.1:{remotery_port}/rmt"
-            cls.bridge = AutomationBridgeClient(int(port), profiler_url=remotery_url)
+            cls.bridge = EngineClient(int(port), profiler_url=remotery_url)
             cls.bridge.wait_ready()
             return
 
         try:
-            cls.editor = EditorClient.from_project(ROOT)
-        except FileNotFoundError as exc:
+            cls.editor = editor.open_project(ROOT, start_if_needed=False)
+        except (FileNotFoundError, editor.NotRunningError) as exc:
             raise unittest.SkipTest(str(exc)) from exc
 
     @classmethod
@@ -1819,7 +2150,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
         for run_index in range(run_count):
             if self.editor is not None:
-                self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+                self.bridge = self.editor.build_and_run(timeout=20)
                 self.__class__.bridge = self.bridge
                 self.bridge.wait_ready()
                 if previous_port is not None:
@@ -1839,10 +2170,89 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
+    def test_drag_item_along_cubic_curve_and_closed_circle(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
+
+        for _ in range(2):
+            before = self.label_count("L1")
+            self.bridge.click(spawner)
+            wait_until(lambda: self.label_count("L1") > before, timeout=2, message="curved-drag item missing")
+
+        before = self.label_count("L1")
+        first, second = self.parents_for_label("L1")[:2]
+        screen = self.bridge.screen()["window"]
+        start = first.center
+        target = second.center
+        dx = target["x"] - start["x"]
+        dy = target["y"] - start["y"]
+        distance = max(1.0, math.hypot(dx, dy))
+        bend = min(140.0, max(70.0, distance * 0.6))
+        normal_x = -dy / distance
+        normal_y = dx / distance
+
+        def controls(side):
+            return tuple(
+                (
+                    min(screen["width"] - 8.0, max(8.0, start["x"] + dx * fraction + normal_x * bend * side)),
+                    min(screen["height"] - 8.0, max(8.0, start["y"] + dy * fraction + normal_y * bend * side)),
+                )
+                for fraction in (1.0 / 3.0, 2.0 / 3.0)
+            )
+
+        positive_controls = controls(1.0)
+        negative_controls = controls(-1.0)
+
+        def bend_score(points):
+            return sum(abs(dx * (point[1] - start["y"]) - dy * (point[0] - start["x"])) / distance for point in points)
+
+        control_one, control_two = max((positive_controls, negative_controls), key=bend_score)
+        curved = self.bridge.drag_path(
+            [start, control_one, control_two, target],
+            [0.45],
+            path="cubic",
+            easing="ease_in_out",
+        )
+        self.assertEqual("released", curved.state)
+        self.wait_for_merge("L1", before, "L2")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="circular-drag item missing")
+        item_label = self.bridge.element(type="labelc", text="L1", visible=True)
+        item = self.bridge.parent(item_label)
+        center_x = float(item.center["x"])
+        center_y = float(item.center["y"])
+        right_space = screen["width"] - center_x - 8.0
+        left_space = center_x - 8.0
+        direction = 1.0 if right_space >= left_space else -1.0
+        horizontal_space = right_space if direction > 0 else left_space
+        radius = min(70.0, horizontal_space / 2.0, center_y - 8.0, screen["height"] - center_y - 8.0)
+        self.assertGreaterEqual(radius, 30.0, "test item has insufficient room for a visible circular drag")
+        circle_center_x = center_x + direction * radius
+        start_angle = math.pi if direction > 0 else 0.0
+        segment_count = 24
+        circle = [
+            (
+                circle_center_x + radius * math.cos(start_angle + 2.0 * math.pi * index / segment_count),
+                center_y + radius * math.sin(start_angle + 2.0 * math.pi * index / segment_count),
+            )
+            for index in range(segment_count + 1)
+        ]
+        circular = self.bridge.drag_path(
+            circle,
+            [0.02] * segment_count,
+            path="sampled",
+            easing="linear",
+        )
+        self.assertEqual("released", circular.state)
+        self.assertEqual(before + 1, self.label_count("L1"))
+
     def test_drag_negative_duration_is_rejected(self):
         self.ensure_running_bridge()
         self.reset_if_popup_is_visible()
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
 
         start_count = self.label_count("L1")
         self.bridge.click(spawner)
@@ -1900,7 +2310,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         if self.editor is None and self.bridge.profiler_url is None:
             raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for profiler tests")
         self.reset_if_popup_is_visible()
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         observations = []
 
         self.record_sprite_counter(observations, "initial")
@@ -1940,7 +2350,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.merge_label("L2")
         self.record_sprite_counter(observations, "drag merge L2")
 
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         for index in range(4):
             before = self.label_count("L1")
             self.bridge.click(spawner)
@@ -1961,7 +2371,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual(1, self.label_count("L4"))
         self.record_sprite_counter(observations, "finish merge L3")
 
-        restart = self.bridge.node(name_exact="restart", enabled=True)
+        restart = self.bridge.element(name_exact="restart", enabled=True)
         self.bridge.click(restart, wait=0.4)
         self.assertEqual(0, len(self.item_labels()))
         self.record_sprite_counter(observations, "restart")
@@ -1975,7 +2385,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             return
         if self.editor is None:
             raise unittest.SkipTest("no Automation Bridge engine or Defold editor is available")
-        self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+        self.bridge = self.editor.build_and_run(timeout=20)
         self.__class__.bridge = self.bridge
         self.bridge.wait_ready()
 
@@ -2011,7 +2421,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def run_automation_bridge_api_end_to_end(self):
         health = self.bridge.health()
         self.assertEqual("1", health["version"])
-        self.assertEqual("1.1.0", health["native_version"])
+        self.assertEqual("1.3.0", health["native_version"])
         self.assertIn("scene", health["capabilities"])
         self.assertIn("input.click", health["capabilities"])
         self.assertIn("scene.pagination", health["capabilities"])
@@ -2044,14 +2454,14 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertGreater(scene["scene_sequence"], 0)
         self.assertIn("snapshot_id", scene["root"])
 
-        spawner = self.bridge.node(
+        spawner = self.bridge.element(
             type="goc",
             name_exact="/spawner",
             visible=True,
             include=["basic", "bounds", "properties"],
             limit=20,
         )
-        spawner_detail = self.bridge.by_id(spawner.id)
+        spawner_detail = self.bridge.element_by_id(spawner.id)
         self.assertEqual("/spawner", spawner_detail.name)
         self.assertGreaterEqual(len(spawner_detail.children), 2)
         self.assertIsNotNone(spawner_detail.instance_id)
@@ -2079,7 +2489,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("key", special_key["kind"])
 
         self.finish_merge_game()
-        gui_nodes = self.bridge.nodes(
+        gui_nodes = self.bridge.elements(
             type="gui_node",
             limit=100,
             include=["basic", "bounds", "properties"],
@@ -2101,11 +2511,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         restart = next(node for node in gui_nodes if node.name == "restart")
         self.bridge.click(restart, wait=0.4)
         self.assertEqual(0, len(self.item_labels()))
-        panel = self.bridge.node(name_exact="panel")
+        panel = self.bridge.element(name_exact="panel")
         self.assertFalse(panel.enabled)
 
     def assert_game_object_bounds_follow_child_component(self):
-        fixture = self.bridge.node(
+        fixture = self.bridge.element(
             type="goc",
             name_exact="/bounds_fixture",
             visible=True,
@@ -2161,7 +2571,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def finish_merge_game(self):
         self.merge_label("L2")
 
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         for _ in range(4):
             self.bridge.click(spawner)
         self.merge_label("L1")
@@ -2182,12 +2592,12 @@ class AutomationBridgeApiTest(unittest.TestCase):
         )
 
     def reset_if_popup_is_visible(self):
-        restart = self.bridge.maybe_node(name_exact="restart")
+        restart = self.bridge.maybe_element(name_exact="restart")
         if restart and restart.enabled:
             self.bridge.click(restart, wait=0.4)
 
     def item_labels(self):
-        nodes = self.bridge.nodes(type="labelc", limit=100)
+        nodes = self.bridge.elements(type="labelc", limit=100)
         return [node.text for node in nodes if node.text != "SPAWN"]
 
     def label_count(self, label):
@@ -2196,7 +2606,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def parents_for_label(self, label):
         def resolve_parents():
             parents = []
-            nodes = self.bridge.nodes(type="labelc", text=label, limit=100)
+            nodes = self.bridge.elements(type="labelc", text=label, limit=100)
             for node in nodes:
                 try:
                     parents.append(self.bridge.parent(node))

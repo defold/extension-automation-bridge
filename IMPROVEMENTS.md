@@ -133,7 +133,7 @@ uncoordinated clients silently drive the same HID state.
 Replace Python wall-clock guessing with a native status/completion mechanism:
 
 ```python
-result = bridge.drag(start, target, duration=0.4, wait="released")
+result = game.drag(start, target, duration=0.4, wait="released")
 print(result.input_id, result.start_frame, result.release_frame)
 ```
 
@@ -156,7 +156,7 @@ The server must own the whole gesture so the pointer is pressed once, follows
 all segments, and is released once:
 
 ```python
-bridge.drag_path(
+game.drag_path(
     [start, probe_left, probe_right, target],
     durations=[0.15, 0.22, 0.18],
     easing=["ease_in", "ease_in_out", "ease_out"],
@@ -184,7 +184,7 @@ pointer timing without a series of independent drags.
 Expose an advanced API on top of the same native gesture state machine:
 
 ```python
-with bridge.pointer(start, lease=2.0) as pointer:
+with game.pointer(start, lease=2.0) as pointer:
     pointer.move(left, duration=0.2, easing="ease_in_out")
     pointer.hold(0.1)
     pointer.move(target, duration=0.3, easing="ease_out")
@@ -198,10 +198,10 @@ persistent connection with disconnect handling.
 ### 5. Expose queue inspection, cancellation, and flush semantics
 
 ```python
-bridge.input.pending()
-bridge.input.status(input_id)
-bridge.input.cancel(input_id, release=True)
-bridge.input.flush(release=True)
+game.input.pending()
+game.input.status(input_id)
+game.input.cancel(input_id, release=True)
+game.input.flush(release=True)
 ```
 
 Cancellation must define what happens to active mouse buttons, touch contacts,
@@ -212,8 +212,8 @@ partially typed keys, visualization, and later queued events.
 Report and select the injected device explicitly:
 
 ```python
-bridge.input.configure(device="mouse", visualize=False)
-bridge.drag(..., device="touch", pointer_id=0)
+game.input.configure(device="mouse", visualize=False)
+game.drag(..., device="touch", pointer_id=0)
 ```
 
 `auto`, `mouse`, and `touch` should be capability-gated. Avoid injecting both
@@ -251,8 +251,8 @@ engine instance id, and scene sequence.
 The server should retain a bounded event ring buffer and support a cursor:
 
 ```python
-with bridge.events(from_cursor="now") as events:
-    bridge.drag(start, target, wait="released")
+with game.events(from_cursor="now") as events:
+    game.drag(start, target, wait="released")
     events.wait("operation_complete")
 ```
 
@@ -277,8 +277,8 @@ end)
 ```
 
 ```python
-bridge.command("load_test_fixture", {"name": "standard"})
-bridge.wait_for_state("ui.busy", False)
+game.command("load_test_fixture", {"name": "standard"})
+game.wait_for_state("ui.busy", False)
 ```
 
 Requirements:
@@ -296,7 +296,7 @@ The native bridge can truthfully report that down/move/up events were injected.
 The application may optionally acknowledge the semantic outcome:
 
 ```lua
-automation_bridge.ack(input_id, {
+automation_bridge.acknowledge_input(input_id, {
     accepted = false,
     reason = "input_locked"
 })
@@ -323,8 +323,8 @@ Return `scene_sequence` from `/scene`, `/nodes`, `/node`, screenshots, and input
 receipts. Allow stale-target protection:
 
 ```python
-scene = bridge.scene()
-bridge.click(node, expected_scene_sequence=scene["scene_sequence"])
+scene = game.scene()
+game.click(element, expected_scene_sequence=scene["scene_sequence"])
 ```
 
 If the sequence changed before node-id resolution, return a structured
@@ -348,7 +348,7 @@ Expose named rectangles and transforms for spaces the bridge can know:
 - normalized viewport coordinates.
 
 ```python
-point = bridge.convert_point(
+point = game.convert_point(
     (540, 960),
     from_space="backbuffer",
     to_space="window",
@@ -398,7 +398,7 @@ automation_bridge.annotate(node_url, {
 ```
 
 ```python
-bridge.node(automation_id="operation_status")
+game.element(automation_id="operation_status")
 ```
 
 Rendered text and current locale can still be exposed when the application
@@ -416,9 +416,9 @@ filters and makes `count()` correct for large scenes.
 ### 17. Add transient-node observation primitives
 
 ```python
-bridge.wait_for_node(..., after_scene_sequence=sequence)
-bridge.wait_for_disappearance(node_id=old.id)
-bridge.observe_node(..., minimum_frames=3)
+game.wait_for_element(..., after_scene_sequence=sequence)
+game.wait_for_disappearance(element_id=old.id)
+game.observe_element(..., minimum_frames=3)
 ```
 
 Define whether identity is snapshot id, instance id, or semantic automation
@@ -442,7 +442,7 @@ When a selector returns zero or multiple nodes, include:
 Treat screenshot capture as an asynchronous operation with an id:
 
 ```python
-shot = bridge.screenshot(after_frames=2, wait=True)
+shot = game.screenshot(after_frames=2, wait=True)
 print(shot.path, shot.frame, shot.width, shot.height, shot.sha256)
 ```
 
@@ -454,13 +454,13 @@ not infer completion from `exists() && size > 0` alone.
 ### 20. Add frame and stability waits
 
 ```python
-bridge.wait_frames(2)
-bridge.visual.wait_for_stable_frame(
+game.wait_frames(2)
+game.visual.wait_for_stable_frame(
     region=content_region,
     consecutive_frames=3,
     tolerance=0.01,
 )
-bridge.visual.wait_for_region_change(before, region=content_region)
+game.visual.wait_for_region_change(before, region=content_region)
 ```
 
 Specify the pixel metric, alpha handling, scaling, consecutive-frame count,
@@ -475,8 +475,8 @@ events/state. Visual stability is the generic fallback.
 Core assertions should use scene/state data:
 
 ```python
-bridge.node(automation_id="operation_status", visible=True)
-bridge.wait_for_state("ui.workflow_step", "complete")
+game.element(automation_id="operation_status", visible=True)
+game.wait_for_state("ui.workflow_step", "complete")
 ```
 
 Pixel/template/OCR assertions belong in an optional visual package so the base
@@ -489,7 +489,7 @@ client can remain dependency-free.
 The desired API is still valuable:
 
 ```python
-recording = bridge.recording.start(
+recording = game.video_recording.start(
     "session.mp4",
     size=(1080, 1920),
     fps=30,
@@ -520,9 +520,9 @@ does not solve application-audio capture by itself.
 ### 23. Add timeline markers independent of the recorder
 
 ```python
-bridge.mark("workflow_started")
-bridge.mark("result_visible")
-bridge.mark("workflow_complete")
+game.mark("workflow_started")
+game.mark("result_visible")
+game.mark("workflow_complete")
 ```
 
 Markers should enter the trace/event timeline with native and recording-clock
@@ -550,7 +550,7 @@ wait, screenshot wait, and recorder finalization.
 Build optional path generators on top of the native path/easing API:
 
 ```python
-gesture = bridge.gestures.generate_drag(
+gesture = game.gestures.generate_drag(
     start,
     target,
     seed=42,
@@ -559,7 +559,7 @@ gesture = bridge.gestures.generate_drag(
     lateral_offset=(-35, 35),
     control_points=2,
 )
-bridge.drag_path(**gesture)
+game.drag_path(**gesture)
 ```
 
 The helper should return the generated points/timings for traceability. Bounds,
@@ -569,7 +569,7 @@ variation cannot create discontinuous or physically implausible motion.
 ### 26. Add trace and diagnostic bundles
 
 ```python
-with bridge.trace("session.trace.json", screenshots="on_error"):
+with game.trace("session.trace.json", screenshots="on_error"):
     run_workflow()
 ```
 
@@ -641,13 +641,13 @@ Trace files should record both native and Python package versions.
 Inspection, application events/state/commands, tracing, and lifecycle control
 can remain useful when graphics, screenshots, native windows, or HID injection
 are unavailable. Headless builds should expose the subset they support rather
-than disabling the entire bridge.
+than disabling the entire game.
 
 The Python wrapper should accept required and optional capabilities:
 
 ```python
-bridge.require("application.events", "application.commands")
-{name: bridge.supports(name) for name in ("scene", "screenshot", "input.drag")}
+game.require("application.events", "application.commands")
+{name: game.supports(name) for name in ("scene", "screenshot", "input.drag")}
 ```
 
 CI diagnostics should clearly distinguish unsupported capabilities from

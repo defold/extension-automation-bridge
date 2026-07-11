@@ -202,7 +202,7 @@ def difference(
 
 
 class VisualClient:
-    """Explicit visual fallback package for an AutomationBridgeClient."""
+    """Explicit visual fallback package for an Client."""
 
     def __init__(self, bridge: Any):
         self.bridge = bridge

@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 
-class RecordingError(RuntimeError):
+class VideoRecordingError(RuntimeError):
     """Raised when a native recording cannot be started or finalized."""
 
 
 @dataclass(frozen=True)
-class RecordingCapabilities:
+class VideoRecordingCapabilities:
     """Capabilities reported by the native recorder in the running engine."""
 
     backend: str
@@ -25,7 +25,7 @@ class RecordingCapabilities:
     reason: Optional[str] = None
 
     @classmethod
-    def from_raw(cls, raw: Mapping[str, Any]) -> "RecordingCapabilities":
+    def from_raw(cls, raw: Mapping[str, Any]) -> "VideoRecordingCapabilities":
         return cls(
             backend=str(raw.get("backend", "native")),
             available=bool(raw.get("available", False)),
@@ -41,7 +41,7 @@ class RecordingCapabilities:
 
 
 @dataclass(frozen=True)
-class RecordingMetadata:
+class VideoRecordingMetadata:
     """Native state and output metadata for one recording."""
 
     path: Optional[str]
@@ -62,7 +62,7 @@ class RecordingMetadata:
     failure: Optional[str] = None
 
     @classmethod
-    def from_raw(cls, raw: Mapping[str, Any]) -> "RecordingMetadata":
+    def from_raw(cls, raw: Mapping[str, Any]) -> "VideoRecordingMetadata":
         return cls(
             path=raw.get("path"),
             backend=str(raw.get("backend", "native")),
@@ -87,21 +87,21 @@ class RecordingMetadata:
         return asdict(self)
 
 
-class RecordingClient:
+class VideoRecordingClient:
     """Control the platform recorder embedded in the running Defold engine."""
 
     def __init__(self, bridge: Any):
         self.bridge = bridge
 
-    def capabilities(self) -> RecordingCapabilities:
+    def capabilities(self) -> VideoRecordingCapabilities:
         """Return native recorder availability without starting capture."""
-        return RecordingCapabilities.from_raw(
+        return VideoRecordingCapabilities.from_raw(
             self.bridge.request("GET", "/recording/capabilities")
         )
 
-    def status(self) -> RecordingMetadata:
+    def status(self) -> VideoRecordingMetadata:
         """Return the current or most recently finalized recording state."""
-        return RecordingMetadata.from_raw(
+        return VideoRecordingMetadata.from_raw(
             self.bridge.request("GET", "/recording/status")
         )
 
@@ -112,7 +112,7 @@ class RecordingClient:
         size: Optional[Tuple[int, int]] = None,
         fps: int = 30,
         audio: Optional[bool] = None,
-    ) -> "RecordingSession":
+    ) -> "VideoRecordingSession":
         """Start recording the current game window to an H.264 MP4 file.
 
         The recorder runs inside the engine, selects the largest on-screen
@@ -141,19 +141,19 @@ class RecordingClient:
         output.parent.mkdir(parents=True, exist_ok=True)
         params["path"] = str(output)
         raw = self.bridge.request("POST", "/recording/start", json=params)
-        metadata = RecordingMetadata.from_raw(raw)
-        self.bridge._trace_record("recording_started", metadata.to_dict())
-        return RecordingSession(self, metadata)
+        metadata = VideoRecordingMetadata.from_raw(raw)
+        self.bridge._trace_record("video_recording_started", metadata.to_dict())
+        return VideoRecordingSession(self, metadata)
 
 
-class RecordingSession:
+class VideoRecordingSession:
     """A native recording that finalizes its MP4 when stopped or exited."""
 
-    def __init__(self, client: RecordingClient, metadata: RecordingMetadata):
+    def __init__(self, client: VideoRecordingClient, metadata: VideoRecordingMetadata):
         self.client = client
         self.metadata = metadata
 
-    def __enter__(self) -> "RecordingSession":
+    def __enter__(self) -> "VideoRecordingSession":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
@@ -164,13 +164,13 @@ class RecordingSession:
                 raise
         return False
 
-    def stop(self) -> RecordingMetadata:
+    def stop(self) -> VideoRecordingMetadata:
         """Stop capture, finalize the MP4, and return native metadata."""
         if not self.metadata.active:
             return self.metadata
         raw = self.client.bridge.request("POST", "/recording/stop")
-        self.metadata = RecordingMetadata.from_raw(raw)
+        self.metadata = VideoRecordingMetadata.from_raw(raw)
         if not self.metadata.finalized:
-            raise RecordingError(self.metadata.failure or "the native recorder did not finalize its MP4 output")
-        self.client.bridge._trace_record("recording_stopped", self.metadata.to_dict())
+            raise VideoRecordingError(self.metadata.failure or "the native recorder did not finalize its MP4 output")
+        self.client.bridge._trace_record("video_recording_stopped", self.metadata.to_dict())
         return self.metadata

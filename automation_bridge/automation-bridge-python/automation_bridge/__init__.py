@@ -1,48 +1,5 @@
-"""Focused public API for the Automation Bridge Python wrapper."""
+"""Automation Bridge 3.0 public namespaces."""
 
-from .client import (
-    AutomationBridgeApiError,
-    AutomationBridgeClient,
-    AutomationBridgeError,
-    HttpError,
-    IncompatibleApiVersionError,
-    InputExecutionError,
-    InputReceipt,
-    SelectorError,
-    UnsupportedCapabilityError,
-)
-from .editor import DefoldInstallation, EditorClient
-from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
-from .nodes import Bounds, Node
-from .profiler import ProfilerClient, ProfilerDataError, ResourceProfileEntry
-from .receipts import ObservationReceipt, ScreenshotReceipt
-from .waits import WaitTimeoutError, wait_until
+from . import editor, engine
 
-
-__all__ = [
-    "AutomationBridgeApiError",
-    "AutomationBridgeClient",
-    "AutomationBridgeError",
-    "Bounds",
-    "CommandTimeout",
-    "DefoldInstallation",
-    "EditorClient",
-    "Event",
-    "EventBufferOverflow",
-    "EventStream",
-    "HttpError",
-    "IncompatibleApiVersionError",
-    "InputExecutionError",
-    "InputReceipt",
-    "Node",
-    "ObservationReceipt",
-    "ProfilerClient",
-    "ProfilerDataError",
-    "ResourceProfileEntry",
-    "ScreenshotReceipt",
-    "SelectorError",
-    "StateSnapshot",
-    "UnsupportedCapabilityError",
-    "WaitTimeoutError",
-    "wait_until",
-]
+__all__ = ["editor", "engine"]

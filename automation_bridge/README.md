@@ -515,7 +515,7 @@ Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-enco
 Native input receipts describe only bridge lifecycle stages such as accepted, started, and released. An application can separately report its semantic decision:
 
 ```lua
-automation_bridge.ack(input_id, {
+automation_bridge.acknowledge_input(input_id, {
     accepted = false,
     reason = "input_locked",
 })

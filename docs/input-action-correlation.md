@@ -2,7 +2,7 @@
 
 ## Brief
 
-Automation Bridge assigns an id to each accepted native input action and can report when its down, move, and release events are injected. An opt-in Defold application may then call `automation_bridge.ack(input_id, result)` to report a semantic outcome such as accepted, blocked, or intercepted.
+Automation Bridge assigns an id to each accepted native input action and can report when its down, move, and release events are injected. An opt-in Defold application may then call `automation_bridge.acknowledge_input(input_id, result)` to report a semantic outcome such as accepted, blocked, or intercepted.
 
 The public `dmHID` mutation API carries device state only. `dmHID::SetMouseButton`, `dmHID::SetMousePosition`, `dmHID::AddTouch`, `dmHID::SetKey`, and `dmHID::AddKeyboardChar` do not accept provenance. The public `dmGameObject::InputAction` and the Lua action table therefore cannot identify which Automation Bridge action changed that state. Guessing from coordinates or frame timing becomes ambiguous when physical and injected devices overlap.
 
@@ -66,7 +66,7 @@ namespace dmHID
 ```lua
 function on_input(self, action_id, action)
     if action.provenance_tag then
-        automation_bridge.ack(action.provenance_tag, {
+        automation_bridge.acknowledge_input(action.provenance_tag, {
             accepted = not self.input_locked,
             reason = self.input_locked and "input_locked" or nil,
         })

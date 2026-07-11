@@ -10,13 +10,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import AutomationBridgeClient  # noqa: E402
+from automation_bridge import editor  # noqa: E402
 
 
-def center_xy(node):
-    if not node.bounds:
-        raise AssertionError(f"node has no bounds: {node.compact()}")
-    center = node.bounds.center
+def center_xy(element):
+    if not element.bounds:
+        raise AssertionError(f"element has no bounds: {element.compact()}")
+    center = element.bounds.center
     return float(center["x"]), float(center["y"])
 
 
@@ -26,14 +26,15 @@ def main():
     parser.add_argument("--keep-open", action="store_true", help="leave the engine running after the smoke test")
     args = parser.parse_args()
 
-    bridge = AutomationBridgeClient.from_project(ROOT, build=not args.no_build)
+    project = editor.open_project(ROOT)
+    game = project.connect_engine() if args.no_build else project.build_and_run()
     try:
         try:
-            bridge.resize(960, 640)
+            game.resize(960, 640)
         except Exception as exc:  # noqa: BLE001 - window resizing is a desktop-only convenience.
             print(f"warning: could not resize engine window: {exc}", file=sys.stderr)
 
-        fixture = bridge.node(
+        fixture = game.element(
             type="goc",
             name_exact="/bounds_fixture",
             visible=True,
@@ -55,12 +56,12 @@ def main():
                 f"distance={distance:.2f}"
             )
 
-        bridge.click(fixture, wait=0.1)
+        game.click(fixture, wait=0.1)
         print("ok: bounds_fixture game object center follows its offset sprite child")
         print(f"parent center=({fixture_x:.1f},{fixture_y:.1f}) sprite center=({sprite_x:.1f},{sprite_y:.1f})")
     finally:
         if not args.keep_open:
-            bridge.close_engine()
+            game.close_engine()
 
 
 if __name__ == "__main__":

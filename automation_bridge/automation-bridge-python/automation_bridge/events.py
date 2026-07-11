@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
-    from .client import AutomationBridgeClient
+    from .client import Client
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class EventStream:
     action inside the context is sent.
     """
 
-    def __init__(self, client: "AutomationBridgeClient", from_cursor: Union[str, int] = "now"):
+    def __init__(self, client: "Client", from_cursor: Union[str, int] = "now"):
         self.client = client
         cursor_data = client.request("GET", "/events/cursor")
         if from_cursor == "now":
