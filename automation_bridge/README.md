@@ -99,8 +99,7 @@ Game object bounds are projected from configured `display.width` and `display.he
 `display` is retained for compatibility and describes configured project
 content, not global monitor bounds. `display_pixels` is limited to the drawable
 window because public Defold APIs do not expose monitor or decorated outer-window
-rectangles. See [`docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md`](../docs/DEFOLD_PUBLIC_AUTOMATION_GEOMETRY.md)
-for the required upstream API proposal.
+rectangles.
 
 ## Nodes
 
@@ -192,8 +191,7 @@ curl -fsS "$BASE/health" | python3 -m json.tool
 
 The raw title, bootstrap path, executable path, and user paths are not returned.
 `build_identity` is currently a non-secret configuration fingerprint rather than a
-resource-content digest. The missing public Defold build/headless/lifecycle APIs are
-specified in [`docs/defold-headless-lifecycle-api.md`](../docs/defold-headless-lifecycle-api.md).
+resource-content digest.
 
 ### `GET /automation-bridge/v1/lifecycle`
 
@@ -322,7 +320,7 @@ curl -fsS "$BASE/node?id=n:0123456789abcdef&include=bounds,properties,children" 
 
 All click, drag, path, pointer, and key actions share one FIFO. Only the first action advances during an engine update, so independent gestures cannot overwrite the same HID state. Every mutating request carries `client_id`, `session_id`, and `request_id`; keep ids compact on query endpoints because Defold bounds the complete request resource. The first client/session acquires the controller lease and other clients receive `input_controller_busy` until that lease expires. Observer endpoints remain readable without the lease.
 
-Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch. The proposed engine-side fix is specified in [`docs/defold-hid-device-capability-query.md`](../docs/defold-hid-device-capability-query.md).
+Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch.
 
 When resolving a node id, pass `expected_scene_sequence` to reject a changed
 snapshot with HTTP 409 `stale_scene`. Input receipts include the scene sequence
@@ -525,7 +523,7 @@ automation_bridge.acknowledge_input(input_id, {
 })
 ```
 
-Acknowledgements are retained as `type="acknowledgement"`, `name="input.acknowledged"` events whose data contains `input_id` and `result`. They do not claim which script consumed an action. Automatic propagation of a native injection id into Defold's Lua input action requires an engine API that does not currently exist; see [`docs/input-action-correlation.md`](../docs/input-action-correlation.md).
+Acknowledgements are retained as `type="acknowledgement"`, `name="input.acknowledged"` events whose data contains `input_id` and `result`. They do not claim which script consumed an action. Automatic propagation of a native injection id into Defold's Lua input action is not currently available.
 
 ### Semantic annotations
 

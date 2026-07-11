@@ -20,7 +20,7 @@ function init(self)
 end
 
 -- Call this only after the application has correlated a bridge input id with
--- its semantic outcome. See docs/input-action-correlation.md.
+-- its semantic outcome.
 local function acknowledge_rejected_input(input_id)
     automation_bridge.acknowledge_input(input_id, {
         accepted = false,
