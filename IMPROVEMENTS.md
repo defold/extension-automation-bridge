@@ -500,8 +500,9 @@ recording = bridge.recording.start(
 The macOS implementation lives in the native extension and uses
 ScreenCaptureKit to select the current Defold process window and record H.264
 MP4 with optional application audio. Python is only a thin controller; it does
-not launch FFmpeg or another recorder process. Other platforms report the
-capability as unsupported until they receive native implementations.
+not launch FFmpeg or another recorder process. Windows uses Windows Graphics
+Capture plus Media Foundation for video-only H.264 MP4; application audio
+remains capability-gated until its native implementation is added.
 
 It should provide:
 

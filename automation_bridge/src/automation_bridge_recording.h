@@ -22,6 +22,10 @@ namespace dmAutomationBridge
     };
 
     bool IsNativeRecordingSupported();
+    bool IsNativeRecordingAudioSupported();
+    const char* NativeRecordingBackendName();
+    const char* NativeRecordingMinimumPlatformVersion();
+    const char* NativeRecordingUnsupportedReason();
     void GetNativeRecordingStatus(RecordingStatus* status);
     bool StartNativeRecording(const char* path, uint32_t width, uint32_t height,
                               uint32_t fps, bool audio, RecordingStatus* status);

@@ -4,3 +4,8 @@ platforms:
   osx:
     context:
       frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "ScreenCaptureKit"]
+
+  win32:
+    context:
+      flags: ["-std=c++17"]
+      libs: ["d3d11", "dxgi", "dwmapi", "mf", "mfplat", "mfreadwrite", "mfuuid", "ole32", "runtimeobject", "windowsapp"]

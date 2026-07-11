@@ -1,4 +1,4 @@
-"""Native video recording for the running Defold engine on macOS."""
+"""Native video recording for the running Defold engine."""
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,13 +21,13 @@ class RecordingCapabilities:
     frame_rate: bool
     containers: Tuple[str, ...]
     video_codecs: Tuple[str, ...]
-    minimum_macos_version: Optional[str] = None
+    minimum_platform_version: Optional[str] = None
     reason: Optional[str] = None
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any]) -> "RecordingCapabilities":
         return cls(
-            backend=str(raw.get("backend", "screen_capture_kit")),
+            backend=str(raw.get("backend", "native")),
             available=bool(raw.get("available", False)),
             application_window=bool(raw.get("application_window", False)),
             application_audio=bool(raw.get("application_audio", False)),
@@ -35,7 +35,7 @@ class RecordingCapabilities:
             frame_rate=bool(raw.get("frame_rate", False)),
             containers=tuple(str(value) for value in raw.get("containers", ())),
             video_codecs=tuple(str(value) for value in raw.get("video_codecs", ())),
-            minimum_macos_version=raw.get("minimum_macos_version"),
+            minimum_platform_version=raw.get("minimum_platform_version"),
             reason=raw.get("reason"),
         )
 
@@ -65,7 +65,7 @@ class RecordingMetadata:
     def from_raw(cls, raw: Mapping[str, Any]) -> "RecordingMetadata":
         return cls(
             path=raw.get("path"),
-            backend=str(raw.get("backend", "screen_capture_kit")),
+            backend=str(raw.get("backend", "native")),
             active=bool(raw.get("active", False)),
             finalized=bool(raw.get("finalized", False)),
             audio=bool(raw.get("audio", False)),
@@ -88,7 +88,7 @@ class RecordingMetadata:
 
 
 class RecordingClient:
-    """Control the macOS recorder embedded in the running Defold engine."""
+    """Control the platform recorder embedded in the running Defold engine."""
 
     def __init__(self, bridge: Any):
         self.bridge = bridge
@@ -111,20 +111,22 @@ class RecordingClient:
         *,
         size: Optional[Tuple[int, int]] = None,
         fps: int = 30,
-        audio: bool = True,
+        audio: Optional[bool] = None,
     ) -> "RecordingSession":
         """Start recording the current game window to an H.264 MP4 file.
 
         The recorder runs inside the engine, selects the largest on-screen
         window owned by the current Defold process, and captures only its
-        undecorated game content. macOS 15 or newer and Screen Recording
-        permission for the game process are required.
+        undecorated game content. Omitted ``audio`` uses the backend default:
+        enabled on macOS and disabled by the current Windows implementation.
         """
         if isinstance(fps, bool) or not isinstance(fps, int) or not 1 <= fps <= 60:
             raise ValueError("fps must be an integer between 1 and 60")
-        if not isinstance(audio, bool):
-            raise TypeError("audio must be a boolean")
-        params: Dict[str, Any] = {"fps": fps, "audio": audio}
+        if audio is not None and not isinstance(audio, bool):
+            raise TypeError("audio must be a boolean or None")
+        params: Dict[str, Any] = {"fps": fps}
+        if audio is not None:
+            params["audio"] = audio
         if size is not None:
             if (
                 not isinstance(size, tuple)

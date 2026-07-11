@@ -1,6 +1,6 @@
 #include "automation_bridge_recording.h"
 
-#if !defined(DM_PLATFORM_OSX)
+#if !defined(DM_PLATFORM_OSX) && !defined(DM_PLATFORM_WINDOWS)
 
 #include <string.h>
 
@@ -10,12 +10,32 @@ namespace dmAutomationBridge
     {
         memset(status, 0, sizeof(*status));
         status->m_Supported = false;
-        strcpy(status->m_Failure, "native video recording is available on macOS 15 or newer");
+        strcpy(status->m_Failure, NativeRecordingUnsupportedReason());
     }
 
     bool IsNativeRecordingSupported()
     {
         return false;
+    }
+
+    bool IsNativeRecordingAudioSupported()
+    {
+        return false;
+    }
+
+    const char* NativeRecordingBackendName()
+    {
+        return "unsupported";
+    }
+
+    const char* NativeRecordingMinimumPlatformVersion()
+    {
+        return "";
+    }
+
+    const char* NativeRecordingUnsupportedReason()
+    {
+        return "native video recording is available on supported macOS and Windows desktop runtimes";
     }
 
     void GetNativeRecordingStatus(RecordingStatus* status)

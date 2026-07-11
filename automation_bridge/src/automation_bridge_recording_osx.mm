@@ -182,6 +182,26 @@ namespace dmAutomationBridge
         return false;
     }
 
+    bool IsNativeRecordingAudioSupported()
+    {
+        return IsNativeRecordingSupported();
+    }
+
+    const char* NativeRecordingBackendName()
+    {
+        return "screen_capture_kit";
+    }
+
+    const char* NativeRecordingMinimumPlatformVersion()
+    {
+        return "macOS 15.0";
+    }
+
+    const char* NativeRecordingUnsupportedReason()
+    {
+        return "native video recording requires macOS 15 or newer";
+    }
+
     void GetNativeRecordingStatus(RecordingStatus* status)
     {
         @autoreleasepool
@@ -191,7 +211,7 @@ namespace dmAutomationBridge
             status->m_Supported = IsNativeRecordingSupported();
             if (!status->m_Supported && status->m_Failure[0] == 0)
             {
-                SetFailure(status, @"native video recording requires macOS 15 or newer");
+                SetFailure(status, [NSString stringWithUTF8String:NativeRecordingUnsupportedReason()]);
             }
             else if (g_Delegate)
             {
@@ -226,7 +246,7 @@ namespace dmAutomationBridge
             if (!IsNativeRecordingSupported())
             {
                 [RecordingLock() lock];
-                SetFailure(&g_Status, @"native video recording requires macOS 15 or newer");
+                SetFailure(&g_Status, [NSString stringWithUTF8String:NativeRecordingUnsupportedReason()]);
                 g_Starting = false;
                 *status = g_Status;
                 [RecordingLock() unlock];

@@ -26,7 +26,7 @@ JsonDict = Dict[str, Any]
 Target = Union[Node, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "2.2.0"
+PYTHON_PACKAGE_VERSION = "2.3.0"
 SUPPORTED_API_VERSION_MIN = 1
 SUPPORTED_API_VERSION_MAX = 1
 

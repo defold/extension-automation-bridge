@@ -752,7 +752,10 @@ namespace dmAutomationBridge
         if (IsNativeRecordingSupported())
         {
             AppendCapability(&names, &versions, &first, "recording.video");
-            AppendCapability(&names, &versions, &first, "recording.application_audio");
+            if (IsNativeRecordingAudioSupported())
+            {
+                AppendCapability(&names, &versions, &first, "recording.application_audio");
+            }
         }
         StringBufferAppend(out, "[ ");
         StringBufferAppend(out, names.m_Data ? names.m_Data : "");
@@ -2120,7 +2123,9 @@ namespace dmAutomationBridge
         StringBufferAppend(out, status->m_Active ? "true" : "false");
         StringBufferAppend(out, ",\"finalized\":");
         StringBufferAppend(out, status->m_Finalized ? "true" : "false");
-        StringBufferAppend(out, ",\"backend\":\"screen_capture_kit\",\"container\":\"mp4\",\"video_codec\":\"h264\"");
+        StringBufferAppend(out, ",\"backend\":");
+        AppendJsonString(out, NativeRecordingBackendName());
+        StringBufferAppend(out, ",\"container\":\"mp4\",\"video_codec\":\"h264\"");
         StringBufferAppend(out, ",\"audio\":");
         StringBufferAppend(out, status->m_Audio ? "true" : "false");
         StringBufferAppend(out, ",\"width\":");
@@ -2169,17 +2174,21 @@ namespace dmAutomationBridge
         GetNativeRecordingStatus(&status);
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"backend\":\"screen_capture_kit\",\"available\":");
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"backend\":");
+        AppendJsonString(&response, NativeRecordingBackendName());
+        StringBufferAppend(&response, ",\"available\":");
         StringBufferAppend(&response, status.m_Supported ? "true" : "false");
         StringBufferAppend(&response, ",\"application_window\":");
         StringBufferAppend(&response, status.m_Supported ? "true" : "false");
         StringBufferAppend(&response, ",\"application_audio\":");
-        StringBufferAppend(&response, status.m_Supported ? "true" : "false");
+        StringBufferAppend(&response, status.m_Supported && IsNativeRecordingAudioSupported() ? "true" : "false");
         StringBufferAppend(&response, ",\"resize_output\":");
         StringBufferAppend(&response, status.m_Supported ? "true" : "false");
         StringBufferAppend(&response, ",\"frame_rate\":");
         StringBufferAppend(&response, status.m_Supported ? "true" : "false");
-        StringBufferAppend(&response, ",\"containers\":[\"mp4\"],\"video_codecs\":[\"h264\"],\"minimum_macos_version\":\"15.0\",\"reason\":");
+        StringBufferAppend(&response, ",\"containers\":[\"mp4\"],\"video_codecs\":[\"h264\"],\"minimum_platform_version\":");
+        AppendJsonString(&response, NativeRecordingMinimumPlatformVersion());
+        StringBufferAppend(&response, ",\"reason\":");
         if (!status.m_Supported && status.m_Failure[0]) AppendJsonString(&response, status.m_Failure); else StringBufferAppend(&response, "null");
         StringBufferAppend(&response, "}}\n");
         RequestSendJson(ctx, 200, &response);
@@ -2196,7 +2205,7 @@ namespace dmAutomationBridge
     {
         if (!IsNativeRecordingSupported())
         {
-            RequestSendError(ctx, 501, "recording_unsupported", "native video recording requires macOS 15 or newer");
+            RequestSendError(ctx, 501, "recording_unsupported", NativeRecordingUnsupportedReason());
             return;
         }
         const char* path = RequestGetParam(ctx, "path");
@@ -2222,10 +2231,15 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 400, "bad_request", "fps must be an integer between 1 and 60");
             return;
         }
-        bool audio = true;
+        bool audio = IsNativeRecordingAudioSupported();
         if (!IsEmpty(RequestGetParam(ctx, "audio")) && !RequestGetBoolParam(ctx, "audio", &audio))
         {
             RequestSendError(ctx, 400, "bad_request", "audio must be a boolean");
+            return;
+        }
+        if (audio && !IsNativeRecordingAudioSupported())
+        {
+            RequestSendError(ctx, 501, "recording_audio_unsupported", "application audio is not supported by this recording backend; use audio=false");
             return;
         }
         RecordingStatus status;

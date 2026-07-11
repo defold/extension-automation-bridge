@@ -316,22 +316,24 @@ bridge.drag_path(**gesture)
 
 ## Recording and traces
 
-Video recording is native, macOS-specific, and namespaced. It records the
-running Defold process's largest on-screen window to H.264 MP4 using
-ScreenCaptureKit (macOS 15 or newer):
+Video recording is native and namespaced. It records the running Defold
+process's largest on-screen window to H.264 MP4 using ScreenCaptureKit on
+macOS 15+ or Windows Graphics Capture and Media Foundation on Windows 10
+version 1903+:
 
 ```python
 capabilities = bridge.recording.capabilities()
 
-with bridge.recording.start("capture.mp4", size=(960, 540), fps=30, audio=True):
+with bridge.recording.start("capture.mp4", size=(960, 540), fps=30):
     bridge.click(button)
 ```
 
 The recorder runs in the game process, automatically selects that process's
 window, crops it to the undecorated game content area, and finalizes the file
-when the context exits. The first capture may
-trigger macOS Screen Recording permission. No FFmpeg installation or external
-recorder process is used.
+when the context exits. Omitted `audio` uses the platform default: enabled on
+macOS and disabled on Windows. The current Windows backend is video-only and
+rejects `audio=True`. The first macOS capture may trigger Screen Recording
+permission. No FFmpeg installation or external recorder process is used.
 
 Diagnostic traces remain a client-bound context because they intercept client
 operations:

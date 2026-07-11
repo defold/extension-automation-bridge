@@ -12,8 +12,8 @@ Find `<engine_service_port>` in the editor console line:
 INFO:ENGINE: Engine service started on port <port>
 ```
 
-No Lua setup is required for scene inspection, input, screenshots, native macOS
-video recording, events, or timeline markers. The application-defined Lua API
+No Lua setup is required for scene inspection, input, screenshots, native
+desktop video recording, events, or timeline markers. The application-defined Lua API
 is debug-only and must be enabled explicitly:
 
 ```ini
@@ -432,7 +432,7 @@ Completed receipts include capture frame/sequence, dimensions, and SHA-256. The
 PNG is first written to a temporary path and atomically renamed before `complete`
 is visible.
 
-## Native video recording (macOS)
+## Native video recording (macOS and Windows)
 
 The extension selects its own largest on-screen window, resolves the matching
 `NSWindow` content frame, and records only that undecorated game area with
@@ -442,12 +442,21 @@ launch FFmpeg or any other helper process. Screen Recording permission is
 granted to the running game process; the first request may cause the system
 permission prompt.
 
+On Windows 10 version 1903 or newer, the extension selects the largest visible
+top-level window owned by the current Defold process, captures it with Windows
+Graphics Capture, and crops frames to its Win32 client area. Windows 11 corner
+rounding is disabled for the recording session and restored afterward. Frames
+are resized as requested and encoded to H.264 MP4 with Media Foundation. The
+Windows backend is currently video-only; `audio=true` returns
+`recording_audio_unsupported` instead of recording another audio source.
+
 - `GET /recording/capabilities` reports runtime availability, output format,
   codec, resizing, frame-rate, and application-audio support.
 - `GET /recording/status` reports the active or most recently finalized capture.
 - `POST /recording/start` accepts `path`, optional paired `width` and `height`,
   integer `fps` from 1 through 60 (default 30), and boolean `audio` (default
-  true). It automatically selects a window owned by the current process.
+  true on macOS and false on Windows). It automatically selects a window owned
+  by the current process.
 - `POST /recording/stop` stops capture and waits until the MP4 is finalized.
 
 ```sh

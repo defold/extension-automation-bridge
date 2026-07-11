@@ -67,10 +67,11 @@ class RecordingTest(unittest.TestCase):
                 return {"backend": "screen_capture_kit", "available": True,
                         "application_window": True, "application_audio": True,
                         "resize_output": True, "frame_rate": True,
-                        "containers": ["mp4"], "video_codecs": ["h264"]}
+                        "containers": ["mp4"], "video_codecs": ["h264"],
+                        "minimum_platform_version": "macOS 15.0"}
             if path == "/recording/start":
                 return {"path": json["path"], "active": True, "finalized": False,
-                        "audio": json["audio"], "width": json.get("width", 800),
+                        "audio": json.get("audio", True), "width": json.get("width", 800),
                         "height": json.get("height", 600), "fps": json["fps"]}
             if path == "/recording/stop":
                 if self.fail_stop:
@@ -92,8 +93,9 @@ class RecordingTest(unittest.TestCase):
             self.assertEqual((320, 240, 24), (recording.metadata.width, recording.metadata.height, recording.metadata.fps))
             start = bridge.requests[0]
             self.assertEqual(("POST", "/recording/start"), start[:2])
-            self.assertEqual({"width": 320, "height": 240, "fps": 24, "audio": True},
-                             {key: start[2][key] for key in ("width", "height", "fps", "audio")})
+            self.assertEqual({"width": 320, "height": 240, "fps": 24},
+                             {key: start[2][key] for key in ("width", "height", "fps")})
+            self.assertNotIn("audio", start[2])
             self.assertEqual(["recording_started", "recording_stopped"], [kind for kind, _ in bridge.traces])
 
     def test_capabilities_are_reported_by_engine(self):
@@ -101,6 +103,14 @@ class RecordingTest(unittest.TestCase):
         self.assertTrue(capabilities.available)
         self.assertTrue(capabilities.application_audio)
         self.assertEqual(("h264",), capabilities.video_codecs)
+        self.assertEqual("macOS 15.0", capabilities.minimum_platform_version)
+
+    def test_explicit_audio_false_is_sent_for_portable_video_only_capture(self):
+        bridge = self.Bridge()
+        with tempfile.TemporaryDirectory() as directory:
+            session = RecordingClient(bridge).start(Path(directory) / "capture.mp4", audio=False)
+            self.assertFalse(bridge.requests[0][2]["audio"])
+            session.stop()
 
     def test_original_exception_survives_native_finalization_failure(self):
         bridge = self.Bridge(fail_stop=True)
