@@ -719,14 +719,30 @@ class EngineClientUnitTest(unittest.TestCase):
                 (internal / "editor.port").write_text("54321", encoding="utf-8")
                 return process
 
-            with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
-                with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
-                    editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
+            with mock.patch("automation_bridge.editor.sys.platform", "linux"):
+                with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
+                    with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
+                        editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
 
         self.assertEqual(54321, editor_client.port)
         self.assertEqual("editor_started", editor_client.lifecycle_events[-1]["stage"])
         self.assertEqual([str(launcher), str(project_file)], popen.call_args.args[0])
         self.assertEqual(project_root, popen.call_args.kwargs["cwd"])
+
+    def test_editor_refuses_to_launch_gui_from_restricted_macos_sandbox(self):
+        with tempfile.TemporaryDirectory() as root:
+            project_root = Path(root).resolve()
+            (project_root / "game.project").write_text("[project]\ntitle = Test\n", encoding="utf-8")
+            launcher = project_root / "Defold"
+            launcher.touch()
+
+            with mock.patch("automation_bridge.editor.sys.platform", "darwin"):
+                with mock.patch.dict(os.environ, {"CODEX_SANDBOX": "seatbelt"}):
+                    with mock.patch("automation_bridge.editor.subprocess.Popen") as popen:
+                        with self.assertRaisesRegex(editor.LaunchError, "escalated/unsandboxed"):
+                            editor.open_project(root, launcher=launcher, timeout=0.2)
+
+        popen.assert_not_called()
 
     def test_editor_preview_returns_png_and_encodes_dimensions(self):
         png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)

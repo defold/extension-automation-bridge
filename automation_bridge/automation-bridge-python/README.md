@@ -71,6 +71,13 @@ The editor bootstrap discovers `.internal/editor.port`, launches Defold when
 needed, rejects stale engine ports, and waits for Automation Bridge health.
 Pass `start_if_needed=False` to require an already-running editor.
 
+On macOS, run a bootstrap that may launch Defold outside restricted agent
+sandboxes. A GUI process inherits its Python parent's sandbox and cannot
+register with WindowServer or LaunchServices. The wrapper refuses to launch
+Defold when Codex marks the process as sandboxed and raises `LaunchError` with
+instructions to start Defold manually or rerun with escalated execution. An
+already-running healthy editor can still be reused without escalation.
+
 Installation discovery and preview rendering are explicit:
 
 ```python

@@ -5,6 +5,12 @@
   then import `editor` and `engine` from `automation_bridge`.
 - Typical bootstrap:
   `game = editor.open_project(".").build_and_run()`.
+- On macOS, a bootstrap that may launch Defold must run with
+  escalated/unsandboxed execution. A GUI process inherits the agent command's
+  sandbox and otherwise cannot register with WindowServer or LaunchServices.
+  Reusing an already healthy editor is safe without escalation; probe with
+  `editor.open_project(".", start_if_needed=False)` when uncertain, then rerun
+  the normal bootstrap with escalation if no editor is running.
 - Treat public docstrings as the exact callable API; for example, use
   `help(engine.Client)` or `help(engine.Client.drag)`. The wrapper overview and
   examples are in `automation_bridge/automation-bridge-python/README.md`.

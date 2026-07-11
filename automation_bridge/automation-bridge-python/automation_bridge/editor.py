@@ -81,6 +81,11 @@ class BuildError(CommandError):
         super().__init__(f"Defold build failed: {list(self.issues)!r}")
 
 
+def _macos_gui_launch_is_sandboxed() -> bool:
+    """Return whether Codex marked this macOS process as Seatbelt-restricted."""
+    return sys.platform == "darwin" and bool(os.environ.get("CODEX_SANDBOX"))
+
+
 class PreviewError(Error):
     """Raised when an editor preview cannot be rendered."""
 
@@ -404,6 +409,12 @@ class Client:
         launcher_path = Path(launcher).expanduser().resolve() if launcher is not None else cls._latest_installation().launcher_path
         if not launcher_path.is_file():
             raise FileNotFoundError(f"Defold launcher is missing: {launcher_path}")
+        if _macos_gui_launch_is_sandboxed():
+            raise LaunchError(
+                "Defold cannot be launched from this restricted macOS sandbox; "
+                "start Defold manually or rerun the Automation Bridge bootstrap "
+                "with escalated/unsandboxed execution"
+            )
         try:
             process = subprocess.Popen(
                 [str(launcher_path), str(project_file)],
