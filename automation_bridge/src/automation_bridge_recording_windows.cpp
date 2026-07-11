@@ -24,6 +24,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <wrl/client.h>
 #include <wrl/event.h>
+#include <wrl/implements.h>
 
 #include <dmsdk/dlib/time.h>
 
@@ -39,6 +40,36 @@ namespace CaptureAbi = ABI::Windows::Graphics::Capture;
 namespace Direct3DAbi = ABI::Windows::Graphics::DirectX::Direct3D11;
 namespace Direct3DInterop = Windows::Graphics::DirectX::Direct3D11;
 typedef __FITypedEventHandler_2_Windows__CGraphics__CCapture__CDirect3D11CaptureFramePool_IInspectable FrameArrivedHandler;
+
+class AgileFrameArrivedHandler
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::WinRtClassicComMix>,
+          FrameArrivedHandler,
+          Microsoft::WRL::FtmBase>
+{
+    InspectableClass(L"AutomationBridge.AgileFrameArrivedHandler", BaseTrust);
+
+public:
+    typedef void (*Callback)(void*, CaptureAbi::IDirect3D11CaptureFramePool*);
+
+    HRESULT RuntimeClassInitialize(void* context, Callback callback)
+    {
+        m_Context = context;
+        m_Callback = callback;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP Invoke(CaptureAbi::IDirect3D11CaptureFramePool* sender,
+                         IInspectable*) override
+    {
+        m_Callback(m_Context, sender);
+        return S_OK;
+    }
+
+private:
+    void* m_Context;
+    Callback m_Callback;
+};
 
 namespace dmAutomationBridge
 {
@@ -245,6 +276,9 @@ namespace dmAutomationBridge
                 m_FramePool->remove_FrameArrived(m_FrameToken);
             CloseInspectable(m_Session.Get());
             CloseInspectable(m_FramePool.Get());
+            m_FrameHandler.Reset();
+            m_Session.Reset();
+            m_FramePool.Reset();
 
             // FramePool is free-threaded. Taking this lock after closing it waits
             // for an in-flight callback before the sink writer is finalized.
@@ -361,13 +395,19 @@ namespace dmAutomationBridge
             if (FAILED(result)) return result;
             result = m_FramePool->CreateCaptureSession(m_Item.Get(), &m_Session);
             if (FAILED(result)) return result;
-            m_FrameHandler = Microsoft::WRL::Callback<FrameArrivedHandler>(
-                [this](CaptureAbi::IDirect3D11CaptureFramePool* sender, IInspectable*) -> HRESULT {
-                    OnFrame(sender);
-                    return S_OK;
-                });
-            if (!m_FrameHandler) return E_OUTOFMEMORY;
+            ComPtr<AgileFrameArrivedHandler> frame_handler =
+                Microsoft::WRL::Make<AgileFrameArrivedHandler>();
+            if (!frame_handler) return E_OUTOFMEMORY;
+            result = frame_handler->RuntimeClassInitialize(this, &WindowsRecorder::DispatchFrame);
+            if (FAILED(result)) return result;
+            m_FrameHandler = frame_handler;
             return m_FramePool->add_FrameArrived(m_FrameHandler.Get(), &m_FrameToken);
+        }
+
+        static void DispatchFrame(void* context,
+                                  CaptureAbi::IDirect3D11CaptureFramePool* sender)
+        {
+            static_cast<WindowsRecorder*>(context)->OnFrame(sender);
         }
 
         HRESULT SetMediaAttributeSize(IMFAttributes* attributes, REFGUID key, uint32_t width, uint32_t height)
