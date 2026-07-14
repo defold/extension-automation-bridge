@@ -339,22 +339,9 @@ namespace dmAutomationBridge
             pixels.m_Data[i + 2] = b;
         }
 
-        // ReadPixels rows use the graphics API's bottom-left origin. Publish
-        // top-left rows so screenshot regions use the same coordinates as HID,
-        // scene bounds, and coordinate conversion responses.
-        uint32_t stride = width * 4;
-        for (uint32_t y = 0; y < height / 2; ++y)
-        {
-            uint8_t* top = pixels.m_Data + y * stride;
-            uint8_t* bottom = pixels.m_Data + (height - y - 1) * stride;
-            for (uint32_t x = 0; x < stride; ++x)
-            {
-                uint8_t value = top[x];
-                top[x] = bottom[x];
-                bottom[x] = value;
-            }
-        }
-
+        // Defold's graphics adapters normalize ReadPixels rows to top-left
+        // display order. Preserve that order so PNG pixels use the same
+        // coordinates as HID, scene bounds, and coordinate conversion.
         bool ok = EncodePngRgba(&pixels, width, height, png);
         ArrayFree(&pixels);
         return ok;

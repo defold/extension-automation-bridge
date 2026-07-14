@@ -404,7 +404,8 @@ Use `text` for UTF-8 or `keys` for a brace-wrapped special key such as URL-encod
 Schedules an atomic post-render PNG capture. `after_frames` may defer capture by
 up to 600 rendered callbacks. The accepted receipt includes a `capture_id` and
 must be completed through the status endpoint; file size polling is not a
-completion protocol.
+completion protocol. PNG rows use the same top-left window orientation as input,
+scene bounds, and coordinate conversion responses.
 
 ```sh
 curl -fsS "$BASE/screenshot" | python3 -m json.tool

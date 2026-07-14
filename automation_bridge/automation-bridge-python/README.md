@@ -371,8 +371,9 @@ shot = game.screenshot(resolution_multiplier=0.5)
 print(shot.path, shot.width, shot.height, shot.sha256)
 ```
 
-Screenshot pixels and pointer input both use top-left window orientation. The
-native capture flips graphics readback rows before publishing the PNG, so pixel
+Screenshot pixels and pointer input both use top-left window orientation.
+Defold's graphics adapters already normalize readback rows to display order, so
+the native capture preserves their order when publishing the PNG and pixel
 coordinates in the receipt correspond to input coordinates. Defold world
 coordinates are a different space: a generic `height - world_y` conversion is
 not reliable with cameras, projections, viewports, scaling, or letterboxing.

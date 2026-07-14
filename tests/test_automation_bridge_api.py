@@ -130,7 +130,7 @@ def _point_segment_distance(px, py, start, end):
 
 def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
     width, height, pixels = _read_automation_bridge_png(path)
-    counts = [0, 0]
+    count = 0
     for i in range(0, len(pixels), 4):
         r, g, b, a = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
         if not (a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25):
@@ -138,10 +138,25 @@ def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
         pixel_index = i // 4
         x = pixel_index % width
         row = pixel_index // width
-        for index, y in enumerate((row, height - 1 - row)):
-            if _point_segment_distance(x + 0.5, y + 0.5, start, end) <= max_distance:
-                counts[index] += 1
-    return max(counts)
+        if _point_segment_distance(x + 0.5, row + 0.5, start, end) <= max_distance:
+            count += 1
+    return count
+
+
+def _count_light_pixels_in_rect(path, rect):
+    width, height, pixels = _read_automation_bridge_png(path)
+    x0 = max(0, min(width, math.floor(float(rect["x"]))))
+    y0 = max(0, min(height, math.floor(float(rect["y"]))))
+    x1 = max(x0, min(width, math.ceil(float(rect["x"]) + float(rect["w"]))))
+    y1 = max(y0, min(height, math.ceil(float(rect["y"]) + float(rect["h"]))))
+    count = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            offset = (y * width + x) * 4
+            r, g, b, a = pixels[offset : offset + 4]
+            if a > 0 and r >= 220 and g >= 220 and b >= 220:
+                count += 1
+    return count
 
 
 class EngineClientUnitTest(unittest.TestCase):
@@ -2397,6 +2412,26 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
         finally:
             time.sleep(1.0)
+
+    def test_screenshot_rows_match_top_left_scene_bounds(self):
+        self.ensure_running_bridge()
+        fixture = self.bridge.element(
+            type="goc",
+            name_exact="/bounds_fixture",
+            visible=True,
+            include=["basic", "bounds"],
+        )
+        self.assertIsNotNone(fixture.bounds)
+
+        screenshot = self.bridge.screenshot(wait=True, timeout=5)
+        bounds = dict(fixture.bounds.screen)
+        mirrored = dict(bounds)
+        mirrored["y"] = screenshot.height - float(bounds["y"]) - float(bounds["h"])
+        aligned_light_pixels = _count_light_pixels_in_rect(screenshot, bounds)
+        mirrored_light_pixels = _count_light_pixels_in_rect(screenshot, mirrored)
+
+        self.assertGreater(aligned_light_pixels, 20, (screenshot, bounds))
+        self.assertGreater(aligned_light_pixels, mirrored_light_pixels + 20, (screenshot, bounds, mirrored))
 
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
