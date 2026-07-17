@@ -3,7 +3,7 @@ name: AutomationBridge
 platforms:
   osx:
     context:
-      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "ScreenCaptureKit"]
+      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "Foundation", "Metal", "ScreenCaptureKit"]
 
   win32:
     context:

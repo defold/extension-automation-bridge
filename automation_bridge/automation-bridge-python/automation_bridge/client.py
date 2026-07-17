@@ -1562,6 +1562,13 @@ class Client:
 
         return VideoRecordingClient(self)
 
+    @property
+    def metal_capture(self) -> "MetalCaptureClient":
+        """Return optional Metal GPU trace capture helpers for macOS."""
+        from .metal import MetalCaptureClient
+
+        return MetalCaptureClient(self)
+
     def trace(
         self,
         path: Union[str, Path],

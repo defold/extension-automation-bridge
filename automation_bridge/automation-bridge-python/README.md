@@ -52,7 +52,8 @@ The package root exposes only `editor` and `engine`.
   `set_landscape()`, `convert_point(...)`, `reboot(...)`, and
   `close_engine()`.
 - Capture and diagnostics: screenshots, historical `game.logs`, live engine
-  logs, profiling, visual comparison, tracing, and `game.video_recording`.
+  logs, profiling, visual comparison, tracing, `game.video_recording`, and
+  `game.metal_capture` on supported macOS/Metal runtimes.
 - Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
 
 ## Bootstrap
@@ -458,7 +459,21 @@ gesture = game.gestures.generate_drag(
 game.drag_path(**gesture)
 ```
 
-## Recording and traces
+## Metal capture, recording, and traces
+
+On macOS with Defold's Metal adapter, capture complete rendered frames to an
+Apple `.gputrace` document:
+
+```python
+capture = game.metal_capture.start("captures/frame.gputrace", frames=1)
+print(capture.path, capture.frames_captured)
+```
+
+The engine must be launched with `METAL_CAPTURE_ENABLED=1`, and health must
+advertise `metal.capture`. `start()` creates the parent directory, schedules the
+capture, and waits for `complete` by default; pass `wait=False`, inspect
+`status()`, or call `stop()` for explicit lifecycle control. Analyze the result
+with Xcode or, when installed, `gpudebug`.
 
 Video recording is native and namespaced. It records the running Defold
 process's largest on-screen window to H.264 MP4 using ScreenCaptureKit on

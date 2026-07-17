@@ -29,6 +29,17 @@ namespace dmAutomationBridge
     static const uint32_t MAX_APPLICATION_JSON_DEPTH = 16;
     static const uint32_t MAX_JSON_REQUEST_BYTES = 64 * 1024;
     static const uint32_t MAX_JSON_NESTING = 16;
+    static const uint32_t MAX_METAL_CAPTURE_FRAMES = 10000;
+
+    enum MetalCaptureState
+    {
+        METAL_CAPTURE_IDLE,
+        METAL_CAPTURE_PENDING,
+        METAL_CAPTURE_CAPTURING,
+        METAL_CAPTURE_COMPLETE,
+        METAL_CAPTURE_CANCELED,
+        METAL_CAPTURE_FAILED
+    };
 
     template <typename T>
     struct Array
@@ -339,6 +350,12 @@ namespace dmAutomationBridge
         ScreenshotCapture       m_Screenshot;
         Array<ScreenshotCapture> m_ScreenshotHistory;
         uint64_t                m_ScreenshotCounter;
+        MetalCaptureState       m_MetalCaptureState;
+        uint32_t                m_MetalCaptureFrames;
+        uint32_t                m_MetalCaptureFramesCaptured;
+        bool                    m_MetalCaptureStopRequested;
+        char                    m_MetalCapturePath[1024];
+        char                    m_MetalCaptureError[512];
         uint32_t                m_DisplayWidth;
         uint32_t                m_DisplayHeight;
         bool                    m_ApplicationApiEnabled;
@@ -587,6 +604,13 @@ namespace dmAutomationBridge
     bool AppendCommandJson(StringBuffer* out, uint64_t command_id);
     bool CancelCommand(uint64_t command_id, const char** error);
     bool AddTimelineMarker(const char* name, const char* data_json, uint64_t recording_timestamp_us, bool has_recording_timestamp, uint64_t* event_sequence, uint64_t* native_timestamp_us);
+
+    bool IsMetalCaptureSupported();
+    bool ScheduleMetalCapture(const char* path, uint32_t frames);
+    bool RequestMetalCaptureStop();
+    void ProcessPendingMetalCaptureStart();
+    void ProcessMetalCapturePostRender();
+    void StopMetalCapture();
 
     void RegisterWebEndpoint(dmExtension::AppParams* params);
     void UnregisterWebEndpoint();

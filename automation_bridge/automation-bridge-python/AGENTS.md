@@ -33,8 +33,8 @@
   `raw["source_path"]`. `project.preview.render(...)` provides the equivalent
   editor-side render without running the game.
 - Optional diagnostics are intentionally namespaced under `game.visual`,
-  `game.gestures`, `game.video_recording`, `game.profiler`, and
-  `game.trace(...)`.
+  `game.gestures`, `game.video_recording`, `game.metal_capture`, `game.profiler`,
+  and `game.trace(...)`.
 - Public docstrings are the exact API reference (`help(engine.Client.drag)`). See
   `README.md` for workflows and examples, and `../README.md` for raw endpoints.
 - Run tests from the repository root with:

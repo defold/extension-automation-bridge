@@ -59,9 +59,10 @@ Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`,
 `screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
 `screenshot_pending`, `recording_unsupported`, `recording_active`,
-`recording_inactive`, `recording_start_failed`, `recording_stop_failed`, and
+`recording_inactive`, `recording_start_failed`, `recording_stop_failed`,
+`metal_capture_unsupported`, `metal_capture_active`, `metal_capture_inactive`, and
 `unsupported_capability`. The latter names a feature
-omitted by the current graphics, game-object, window, or HID backend.
+omitted by the current platform, graphics, game-object, window, or HID backend.
 
 ## Coordinates
 
@@ -174,7 +175,8 @@ Response `data` includes:
 - `capabilities`: supported capability names for runtime health/lifecycle,
   diagnostics, scene inspection, screen/coordinate operations, input and input
   devices, events, markers, frame waits, application synchronization, screenshots,
-  and native video recording. Backend-dependent names are omitted when unavailable.
+  native video recording, and Metal GPU trace capture. Backend-dependent names are
+  omitted when unavailable.
 - `capability_versions`: capability-to-version map for feature negotiation.
 - `native_version`, `api_version_min`, and `api_version_max`: native package and API compatibility information.
 - `identity`: opaque engine instance, process id where portable, wall/monotonic start timestamps, hashed project identity, and hashed build-configuration identity.
@@ -547,3 +549,128 @@ inserts a `marker` event. Native monotonic time is always recorded. The optional
 recording timestamp is caller-supplied, allowing a client to correlate markers
 with its own media or trace clock. Native video recording does not add this
 correlation automatically.
+
+## Metal GPU trace capture (macOS)
+
+### `/automation-bridge/v1/metal`
+
+Captures complete rendered frames to a Metal `.gputrace` on macOS when Defold is using the Metal graphics adapter. Launch the engine with `METAL_CAPTURE_ENABLED=1`; the parent directory of the requested output path must already exist.
+
+Schedule a one-frame capture:
+
+```sh
+curl -fsS -X POST --get \
+  --data-urlencode "path=/tmp/fontgen.gputrace" \
+  "$BASE/metal" | python3 -m json.tool
+```
+
+Use `frames` to capture more than one frame:
+
+```sh
+curl -fsS -X POST --get \
+  --data-urlencode "path=/tmp/fontgen.gputrace" \
+  --data-urlencode "frames=60" \
+  "$BASE/metal" | python3 -m json.tool
+```
+
+`POST` returns `202` with state `pending`. Capture starts at the next pre-render callback and stops after the requested number of post-render callbacks. Poll status with:
+
+```sh
+curl -fsS "$BASE/metal" | python3 -m json.tool
+```
+
+Request an early stop with:
+
+```sh
+curl -fsS -X DELETE "$BASE/metal" | python3 -m json.tool
+```
+
+Status data includes `state` (`idle`, `pending`, `capturing`, `complete`, `canceled`, or `failed`), `path`, `frames`, `frames_captured`, `stop_requested`, and `error` when startup failed.
+
+#### Analyze the capture with `gpudebug`
+
+Apple's `gpudebug` command-line tool can replay and inspect the resulting trace without opening Xcode's graphical Metal debugger. It is part of the newer Apple GPU command-line tooling and requires an Xcode/macOS combination that provides it. Check availability first:
+
+```sh
+xcrun --find gpudebug
+man gpudebug
+```
+
+If `xcrun` cannot find it, use a newer Xcode and macOS release that includes `gpudebug`, or open the `.gputrace` in Xcode instead.
+
+Start an interactive session:
+
+```sh
+gpudebug -t /tmp/fontgen.gputrace
+```
+
+At the `gpudebug>` prompt, begin by exploring the trace:
+
+```text
+status
+list
+go commands
+list --all
+```
+
+Navigate into a command buffer, render or compute encoder, and draw or dispatch shown by `list`. The exact names depend on the trace:
+
+```text
+go cb0/re0/draw0
+info
+info pipeline
+go vertex
+list --all
+go ..
+go fragment
+list --all
+```
+
+Useful commands include:
+
+- `list` or `list --all`: show children and the actions available for each node.
+- `go <name-or-path>`: navigate through command buffers, encoders, draws, dispatches, bindings, API calls, and resources.
+- `info` or `info <child>`: inspect draw/dispatch arguments, encoder state, pipeline state, resource metadata, and bindings.
+- `find <text>`: search labels, names, and summaries throughout the trace.
+- `next` and `prev`: step between neighboring draws, dispatches, or other sibling nodes.
+- `fetch <attachment-or-resource>`: export a texture, buffer, attachment, or counter series for external inspection. For example, `fetch color0` writes the selected draw's color attachment to an image file.
+- `profile`: inspect or collect GPU profiling data when supported by the replay device.
+- `help` and `<command> ?`: discover commands and command-specific options.
+
+A practical visual-debugging sequence is:
+
+```text
+go commands
+list --all
+go cb0/re0/draw0
+info pipeline
+fetch color0
+next
+fetch color0
+```
+
+Compare fetched attachments before and after suspicious draws, and inspect the pipeline plus vertex/fragment bindings where the output first changes incorrectly.
+
+For scripted analysis, create one persistent session and reuse the session id printed by the first command:
+
+```sh
+gpudebug -t /tmp/fontgen.gputrace -c "list"
+gpudebug -s 412 -c "go commands/cb0/re0/draw0" -c "info pipeline"
+gpudebug -s 412 -c "fetch color0"
+gpudebug --terminate 412
+```
+
+Replace `412` and the node path with values reported for your trace. Reusing a session avoids loading and preparing the trace for every command.
+
+For a single isolated query:
+
+```sh
+gpudebug --oneshot \
+  -t /tmp/fontgen.gputrace \
+  -c "go commands/cb0/re0/draw0" \
+  -c "info pipeline"
+```
+
+The root normally exposes `commands`, `performance`, `api_calls`, and `resources`. Prefer following the actions printed by `list` rather than assuming a particular command-buffer or draw path.
+
+See Apple's [interactive `gpudebug` walkthrough](https://developer.apple.com/documentation/xcode/debugging-with-interactive-command-line-tools) and [scripted/agent workflow](https://developer.apple.com/documentation/xcode/investigating-gpu-issues-with-ai-agents) for further examples.

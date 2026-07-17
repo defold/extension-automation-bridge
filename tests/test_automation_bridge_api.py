@@ -178,6 +178,7 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertTrue(hasattr(bridge, "element"))
         self.assertTrue(hasattr(bridge, "wait_for_input_acknowledgement"))
         self.assertTrue(hasattr(bridge, "video_recording"))
+        self.assertTrue(hasattr(bridge, "metal_capture"))
         for removed in (
             "RecordingClient", "RecordingSession", "RecordingCapabilities",
             "RecordingMetadata", "RecordingError", "Node",

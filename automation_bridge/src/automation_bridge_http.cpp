@@ -749,6 +749,10 @@ namespace dmAutomationBridge
         {
             AppendCapability(&names, &versions, &first, "screenshot");
         }
+        if (IsMetalCaptureSupported())
+        {
+            AppendCapability(&names, &versions, &first, "metal.capture");
+        }
         if (IsNativeRecordingSupported())
         {
             AppendCapability(&names, &versions, &first, "recording.video");
@@ -2487,6 +2491,129 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static const char* MetalCaptureStateName(MetalCaptureState state)
+    {
+        switch (state)
+        {
+            case METAL_CAPTURE_PENDING:   return "pending";
+            case METAL_CAPTURE_CAPTURING: return "capturing";
+            case METAL_CAPTURE_COMPLETE:  return "complete";
+            case METAL_CAPTURE_CANCELED:  return "canceled";
+            case METAL_CAPTURE_FAILED:    return "failed";
+            default:                      return "idle";
+        }
+    }
+
+    static void AppendMetalCaptureJson(StringBuffer* response)
+    {
+        StringBufferAppend(response, "{\"state\":");
+        AppendJsonString(response, MetalCaptureStateName(g_AutomationBridge.m_MetalCaptureState));
+        StringBufferAppend(response, ",\"path\":");
+        AppendJsonString(response, g_AutomationBridge.m_MetalCapturePath);
+        StringBufferAppend(response, ",\"frames\":");
+        AppendNumber(response, (double)g_AutomationBridge.m_MetalCaptureFrames);
+        StringBufferAppend(response, ",\"frames_captured\":");
+        AppendNumber(response, (double)g_AutomationBridge.m_MetalCaptureFramesCaptured);
+        StringBufferAppend(response, ",\"stop_requested\":");
+        StringBufferAppend(response, g_AutomationBridge.m_MetalCaptureStopRequested ? "true" : "false");
+        if (!IsEmpty(g_AutomationBridge.m_MetalCaptureError))
+        {
+            StringBufferAppend(response, ",\"error\":");
+            AppendJsonString(response, g_AutomationBridge.m_MetalCaptureError);
+        }
+        StringBufferAppendChar(response, '}');
+    }
+
+    static bool HasSuffix(const char* value, const char* suffix)
+    {
+        if (!value || !suffix)
+        {
+            return false;
+        }
+        size_t value_length = strlen(value);
+        size_t suffix_length = strlen(suffix);
+        return value_length >= suffix_length && strcmp(value + value_length - suffix_length, suffix) == 0;
+    }
+
+    static void HandleMetalGet(RequestContext* ctx)
+    {
+        if (!IsMetalCaptureSupported())
+        {
+            RequestSendError(ctx, 501, "metal_capture_unsupported", "Metal GPU trace capture is not supported by the current platform and graphics adapter");
+            return;
+        }
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendMetalCaptureJson(&response);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
+    static void HandleMetalPost(RequestContext* ctx)
+    {
+        if (!IsMetalCaptureSupported())
+        {
+            RequestSendError(ctx, 501, "metal_capture_unsupported", "Metal GPU trace capture is not supported by the current platform and graphics adapter");
+            return;
+        }
+
+        const char* path = RequestGetParam(ctx, "path");
+        if (IsEmpty(path) || path[0] != '/' || !HasSuffix(path, ".gputrace"))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide an absolute path ending in .gputrace");
+            return;
+        }
+        if (strlen(path) >= sizeof(g_AutomationBridge.m_MetalCapturePath))
+        {
+            RequestSendError(ctx, 414, "metal_capture_path_too_long", "Metal capture path is too long");
+            return;
+        }
+
+        uint32_t frames = 1;
+        const char* frames_text = RequestGetParam(ctx, "frames");
+        if (!IsEmpty(frames_text) && !RequestGetUIntParam(ctx, "frames", &frames, MAX_METAL_CAPTURE_FRAMES))
+        {
+            RequestSendError(ctx, 400, "bad_request", "frames must be a positive integer no greater than 10000");
+            return;
+        }
+
+        if (!ScheduleMetalCapture(path, frames))
+        {
+            RequestSendError(ctx, 409, "metal_capture_active", "a Metal capture is already pending or active");
+            return;
+        }
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendMetalCaptureJson(&response);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 202, &response);
+    }
+
+    static void HandleMetalDelete(RequestContext* ctx)
+    {
+        if (!IsMetalCaptureSupported())
+        {
+            RequestSendError(ctx, 501, "metal_capture_unsupported", "Metal GPU trace capture is not supported by the current platform and graphics adapter");
+            return;
+        }
+        if (!RequestMetalCaptureStop())
+        {
+            RequestSendError(ctx, 409, "metal_capture_inactive", "no Metal capture is pending or active");
+            return;
+        }
+
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendMetalCaptureJson(&response);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 202, &response);
+    }
+
     static void SendMethodNotAllowed(RequestContext* ctx, const char* methods)
     {
         StringBuffer response;
@@ -2551,7 +2678,10 @@ namespace dmAutomationBridge
         {"/commands", "GET", HandleCommandStatus},
         {"/commands", "DELETE", HandleCommandCancel},
         {"/markers", "POST", HandleMarker},
-        {"/screenshot/status", "GET", HandleScreenshotStatus}
+        {"/screenshot/status", "GET", HandleScreenshotStatus},
+        {"/metal", "GET", HandleMetalGet},
+        {"/metal", "POST", HandleMetalPost},
+        {"/metal", "DELETE", HandleMetalDelete}
     };
 
     void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request)

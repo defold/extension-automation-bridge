@@ -27,3 +27,11 @@
   application events/state/acknowledgements when semantic completion matters.
 - Screenshot creation is asynchronous: poll `/screenshot/status` for its atomic
   `complete` receipt; file size is not completion evidence.
+- On macOS with the Metal adapter,
+  `POST /metal?path=/absolute/output.gputrace&frames=1` schedules a frame capture;
+  poll `GET /metal` for completion or use `DELETE /metal` to stop early. Launch
+  with `METAL_CAPTURE_ENABLED=1`.
+- When available, analyze a completed trace with
+  `gpudebug -t /absolute/output.gputrace`; use `list`, `go`, `info`, `find`, and
+  `fetch` to inspect commands, pipelines, bindings, and attachments. Check
+  installation with `xcrun --find gpudebug`.
