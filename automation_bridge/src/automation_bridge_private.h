@@ -19,6 +19,17 @@ namespace dmAutomationBridge
     static const char* API_VERSION = "1";
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
+    static const uint32_t MAX_METAL_CAPTURE_FRAMES = 10000;
+
+    enum MetalCaptureState
+    {
+        METAL_CAPTURE_IDLE,
+        METAL_CAPTURE_PENDING,
+        METAL_CAPTURE_CAPTURING,
+        METAL_CAPTURE_COMPLETE,
+        METAL_CAPTURE_CANCELED,
+        METAL_CAPTURE_FAILED
+    };
 
     template <typename T>
     struct Array
@@ -163,6 +174,12 @@ namespace dmAutomationBridge
         bool                    m_ScreenshotPending;
         uint32_t                m_ScreenshotCounter;
         char                    m_ScreenshotPath[1024];
+        MetalCaptureState       m_MetalCaptureState;
+        uint32_t                m_MetalCaptureFrames;
+        uint32_t                m_MetalCaptureFramesCaptured;
+        bool                    m_MetalCaptureStopRequested;
+        char                    m_MetalCapturePath[1024];
+        char                    m_MetalCaptureError[512];
         uint32_t                m_DisplayWidth;
         uint32_t                m_DisplayHeight;
     };
@@ -350,6 +367,13 @@ namespace dmAutomationBridge
     bool BuildScreenshotPath(char* path, uint32_t path_size);
     bool ScheduleScreenshot(const char* path);
     void ProcessPendingScreenshot();
+
+    bool IsMetalCaptureSupported();
+    bool ScheduleMetalCapture(const char* path, uint32_t frames);
+    bool RequestMetalCaptureStop();
+    void ProcessPendingMetalCaptureStart();
+    void ProcessMetalCapturePostRender();
+    void StopMetalCapture();
 
     void RegisterWebEndpoint(dmExtension::AppParams* params);
     void UnregisterWebEndpoint();

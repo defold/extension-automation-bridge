@@ -1,1 +1,6 @@
 name: AutomationBridge
+
+platforms:
+  osx:
+    context:
+      frameworks: [Foundation, Metal]

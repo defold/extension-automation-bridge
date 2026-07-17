@@ -15,4 +15,6 @@
 - Input endpoints: `POST /input/click?id=...` or `x/y`; `POST /input/drag?from_id=...&to_id=...&duration=...` or `x1/y1/x2/y2`; `POST /input/key?text=...` or URL-encoded `keys=%7BKEY_ENTER%7D`.
 - Mouse/touch input visualization is on by default. Use `visualize=0` on click/drag endpoints when the overlay would interfere with diagnostics.
 - `GET /screenshot` schedules capture and returns a file path; wait until that file exists and has nonzero size.
+- On macOS with the Metal adapter, `POST /metal?path=/absolute/output.gputrace&frames=1` schedules a frame capture; poll `GET /metal` for completion or use `DELETE /metal` to stop early. Launch with `METAL_CAPTURE_ENABLED=1`.
+- When available, analyze a completed trace with `gpudebug -t /absolute/output.gputrace`; use `list`, `go`, `info`, `find`, and `fetch` to inspect commands, pipelines, bindings, and attachments. Check installation with `xcrun --find gpudebug`.
 - Full endpoint details live in `automation_bridge/README.md`.
