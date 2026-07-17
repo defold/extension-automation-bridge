@@ -37,6 +37,10 @@ namespace dmAutomationBridge
     static ExtensionResult PreRender(ExtensionParams* params)
     {
         DefoldPrivateApiInitialize(params);
+        // Flip() submits the Metal command buffer after CALLBACK_POST_RENDER.
+        // Finish an active capture here so the previous frame is included.
+        ProcessMetalCapturePostRender();
+        ProcessPendingMetalCaptureStart();
         return EXTENSION_RESULT_OK;
     }
 
@@ -87,6 +91,7 @@ namespace dmAutomationBridge
     {
         (void)params;
         UnregisterWebEndpoint();
+        StopMetalCapture();
         FreeAutomationBridgeContext(&g_AutomationBridge);
         InitAutomationBridgeContext(&g_AutomationBridge);
         return dmExtension::RESULT_OK;
