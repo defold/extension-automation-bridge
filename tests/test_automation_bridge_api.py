@@ -1,41 +1,65 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import importlib.util
+import json
+import math
 import os
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import zlib
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
 
-from automation_bridge import (  # noqa: E402
+import automation_bridge as automation_bridge_package  # noqa: E402
+from automation_bridge import editor, engine  # noqa: E402
+from automation_bridge.engine import (  # noqa: E402
     AutomationBridgeApiError,
-    AutomationBridgeClient,
-    AutomationBridgeError,
-    EditorClient,
-    EngineLogStream,
+    Error as AutomationBridgeError,
+    EventBufferOverflow,
+    EventStream,
+    IncompatibleApiVersionError,
+    InputExecutionError,
+    InputReceipt,
+    Element,
     ProfilerClient,
     ProfilerDataError,
-    RemoteryCapture,
-    RemoteryClient,
-    RemoteryProtocolError,
+    ScreenshotReceipt,
+    UnsupportedCapabilityError,
+    WaitTimeoutError,
     wait_until,
 )
-from automation_bridge.client import _encode_system_reboot  # noqa: E402
-from automation_bridge.profiler import parse_resources_data  # noqa: E402
+EngineClient = engine.Client
+EditorApiClient = editor.Client
+InstallationType = editor.Installation
+from automation_bridge.client import EngineLogStream, _encode_system_reboot  # noqa: E402
+from automation_bridge.profiler import (  # noqa: E402
+    ProfilerCapture,
+    ProfilerConnection,
+    ProfilerProtocolError,
+    ProfilerRecording,
+    parse_resources_data,
+)
+from automation_bridge.visual import difference  # noqa: E402
 from automation_bridge.remotery import (  # noqa: E402
     build_message,
     build_sample_name,
     parse_property_frame,
     parse_sample_frame,
 )
+
+
+EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi.json").read_text(encoding="utf-8"))
 
 
 def _read_automation_bridge_png(path):
@@ -80,6 +104,16 @@ def _read_automation_bridge_png(path):
     return width, height, bytes(pixels)
 
 
+def _rgba_png(width, height, pixels):
+    raw = b"".join(b"\0" + pixels[row * width * 4 : (row + 1) * width * 4] for row in range(height))
+
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
 def _point_segment_distance(px, py, start, end):
     x1, y1 = start
     x2, y2 = end
@@ -96,7 +130,7 @@ def _point_segment_distance(px, py, start, end):
 
 def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
     width, height, pixels = _read_automation_bridge_png(path)
-    counts = [0, 0]
+    count = 0
     for i in range(0, len(pixels), 4):
         r, g, b, a = pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]
         if not (a > 0 and r >= 150 and 80 <= g <= 230 and b <= 120 and r > g + 20 and g > b + 25):
@@ -104,19 +138,687 @@ def _count_orange_debug_pixels_near_segment(path, start, end, max_distance=12):
         pixel_index = i // 4
         x = pixel_index % width
         row = pixel_index // width
-        for index, y in enumerate((row, height - 1 - row)):
-            if _point_segment_distance(x + 0.5, y + 0.5, start, end) <= max_distance:
-                counts[index] += 1
-    return max(counts)
+        if _point_segment_distance(x + 0.5, row + 0.5, start, end) <= max_distance:
+            count += 1
+    return count
 
 
-class AutomationBridgeClientUnitTest(unittest.TestCase):
+def _count_light_pixels_in_rect(path, rect):
+    width, height, pixels = _read_automation_bridge_png(path)
+    x0 = max(0, min(width, math.floor(float(rect["x"]))))
+    y0 = max(0, min(height, math.floor(float(rect["y"]))))
+    x1 = max(x0, min(width, math.ceil(float(rect["x"]) + float(rect["w"]))))
+    y1 = max(y0, min(height, math.ceil(float(rect["y"]) + float(rect["h"]))))
+    count = 0
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            offset = (y * width + x) * 4
+            r, g, b, a = pixels[offset : offset + 4]
+            if a > 0 and r >= 220 and g >= 220 and b >= 220:
+                count += 1
+    return count
+
+
+class EngineClientUnitTest(unittest.TestCase):
+    def test_public_surface_excludes_removed_aliases_and_backend_types(self):
+        bridge = EngineClient(1)
+        removed_client_names = {
+            "get", "post", "put", "delete", "post_json", "put_json",
+            "optional", "assert_node", "wait_for_appearance",
+            "wait_for_stable_frame", "wait_for_region_change", "record_video",
+            "recording_capabilities", "recording_permission_diagnostics",
+        }
+        self.assertTrue(all(not hasattr(bridge, name) for name in removed_client_names))
+        self.assertFalse(hasattr(Element({"parent": "root"}), "parent"))
+        self.assertEqual(["editor", "engine"], automation_bridge_package.__all__)
+        for removed in ("AutomationBridgeClient", "EditorClient", "Node", "Element"):
+            self.assertFalse(hasattr(automation_bridge_package, removed))
+        for removed in ("node", "nodes", "maybe_node", "by_id", "wait_for_node", "wait_for_ack", "recording"):
+            self.assertFalse(hasattr(bridge, removed))
+        self.assertTrue(hasattr(bridge, "element"))
+        self.assertTrue(hasattr(bridge, "wait_for_input_acknowledgement"))
+        self.assertTrue(hasattr(bridge, "video_recording"))
+        self.assertTrue(hasattr(bridge, "metal_capture"))
+        for removed in (
+            "RecordingClient", "RecordingSession", "RecordingCapabilities",
+            "RecordingMetadata", "RecordingError", "Node",
+        ):
+            self.assertFalse(hasattr(engine, removed))
+        for removed in ("from_project", "from_editor"):
+            self.assertFalse(hasattr(engine, removed))
+        self.assertFalse(hasattr(editor, "Extensions"))
+
+    def test_engine_connect_forwards_the_complete_connection_contract(self):
+        sentinel = object()
+        with mock.patch.object(engine, "Client", return_value=sentinel) as client:
+            actual = engine.connect(
+                51337,
+                timeout=4.5,
+                profiler_url="ws://localhost:17815/rmt",
+                client_id="client",
+                session_id="session",
+                required_capabilities=("scene", "input.drag"),
+            )
+
+        self.assertIs(sentinel, actual)
+        client.assert_called_once_with(
+            51337,
+            timeout=4.5,
+            profiler_url="ws://localhost:17815/rmt",
+            client_id="client",
+            session_id="session",
+            required_capabilities=("scene", "input.drag"),
+        )
+
+    def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
+        class ScriptedClient:
+            timeout = 10.0
+
+            def __init__(self):
+                self.requests = []
+
+            def request(self, method, path, *, params=None, json=None):
+                self.requests.append((path, params))
+                if path == "/events/cursor":
+                    return {"cursor": 5, "oldest_cursor": 2}
+                if path == "/events":
+                    return {
+                        "events": [
+                            {"sequence": 5, "type": "event", "name": "other", "data": {"id": 1}},
+                            {"sequence": 6, "type": "event", "name": "done", "data": {"id": 42}},
+                        ],
+                        "next_cursor": 7,
+                        "overflow": False,
+                    }
+                raise AssertionError(path)
+
+        client = ScriptedClient()
+        stream = EventStream(client, from_cursor="now")
+
+        done = stream.wait("done", where={"id": 42}, timeout=0.1)
+        other = stream.wait("other", timeout=0.1)
+
+        self.assertEqual(5, client.requests[1][1]["cursor"])
+        self.assertEqual(6, done.sequence)
+        self.assertEqual(5, other.sequence)
+        self.assertEqual(2, len(client.requests))
+
+    def test_wait_for_input_acknowledgement_uses_full_protocol_event_name(self):
+        game = EngineClient(1)
+        stream = mock.Mock()
+        expected = mock.sentinel.acknowledgement
+        stream.wait.return_value = expected
+
+        actual = game.wait_for_input_acknowledgement(42, timeout=3.0, events=stream)
+
+        self.assertIs(expected, actual)
+        stream.wait.assert_called_once_with(
+            "input.acknowledged",
+            where={"input_id": 42},
+            event_type="acknowledgement",
+            timeout=3.0,
+        )
+
+    def test_event_stream_reports_ring_overflow(self):
+        class OverflowClient:
+            timeout = 10.0
+
+            def request(self, method, path, *, params=None, json=None):
+                if path == "/events/cursor":
+                    return {"cursor": 20, "oldest_cursor": 10}
+                return {"events": [], "next_cursor": 10, "oldest_cursor": 10, "latest_cursor": 20, "overflow": True}
+
+        stream = EventStream(OverflowClient(), from_cursor=1)
+        with self.assertRaises(EventBufferOverflow) as raised:
+            stream.poll()
+        self.assertEqual(1, raised.exception.requested_cursor)
+        self.assertEqual(10, raised.exception.oldest_cursor)
+
+    def test_wait_for_state_can_require_a_new_revision(self):
+        class StateClient(EngineClient):
+            def __init__(self):
+                super().__init__(12345)
+                self.requests = []
+
+            def _request(self, method, path, params=None):
+                self.requests.append((method, path, params))
+                if path == "/state":
+                    return {"states": [{"name": "ui", "value": {"busy": False}, "revision": 2}], "revision": 2}
+                if path == "/state/wait":
+                    return {"states": [{"name": "ui", "value": {"busy": True}, "revision": 3}], "revision": 3}
+                raise AssertionError(path)
+
+        bridge = StateClient()
+        result = bridge.wait_for_state("ui.busy", True, after_revision=2, timeout=0.1)
+
+        self.assertTrue(result.value)
+        self.assertEqual(3, result.revision)
+        self.assertEqual(2, bridge.requests[1][2]["after_revision"])
+
+    def test_semantic_element_metadata_is_typed(self):
+        element = Element(
+            {
+                "id": "n:1",
+                "automation_id": "operation_status",
+                "localization_key": "status_ready",
+                "role": "status",
+            }
+        )
+
+        self.assertEqual("operation_status", element.automation_id)
+        self.assertEqual("status_ready", element.localization_key)
+        self.assertEqual("status", element.role)
+
+    def test_command_and_marker_encode_bounded_json(self):
+        class ApplicationClient(EngineClient):
+            def __init__(self):
+                super().__init__(12345)
+                self.requests = []
+
+            def _request(self, method, path, params=None):
+                self.requests.append((method, path, params))
+                if path == "/commands":
+                    return {"command_id": 9, "state": "pending"}
+                if path == "/markers":
+                    return {"event_sequence": 12}
+                raise AssertionError(path)
+
+        bridge = ApplicationClient()
+        accepted = bridge.start_command("test.load_fixture", {"name": "standard"}, timeout=2)
+        marker = bridge.mark("workflow_started", {"case": 7}, recording_timestamp_us=1234)
+
+        self.assertEqual(9, accepted["command_id"])
+        self.assertEqual('{"name":"standard"}', bridge.requests[0][2]["data"])
+        self.assertEqual(2000, bridge.requests[0][2]["timeout_ms"])
+        self.assertEqual(12, marker["event_sequence"])
+        self.assertEqual(1234, bridge.requests[1][2]["recording_timestamp_us"])
+
+    def test_health_rejects_incompatible_native_api_version(self):
+        bridge = FakeEngineClient()
+        bridge._api_version = "2"
+
+        with self.assertRaisesRegex(IncompatibleApiVersionError, "supported native range is 1..1"):
+            bridge.health()
+
+    def test_bridge_startup_does_not_retry_incompatible_api(self):
+        calls = []
+
+        def incompatible_probe():
+            calls.append(True)
+            raise IncompatibleApiVersionError("unsupported")
+
+        with self.assertRaises(IncompatibleApiVersionError):
+            EngineClient._wait_for_bridge(incompatible_probe, timeout=1.0, message="not ready")
+
+        self.assertEqual([True], calls)
+
+    def test_required_capability_reports_backend_and_available_capabilities(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "scene"])
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "application.events"):
+            bridge.require("application.events")
+
+    def test_capability_versions_support_minimum_declarations(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "scene"])
+        bridge._capability_versions_data = {"scene": "2"}
+
+        self.assertTrue(bridge.supports("scene>=2"))
+        self.assertFalse(bridge.supports("scene>=3"))
+
+    def test_trace_metadata_records_native_and_python_versions(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health"])
+
+        metadata = bridge.trace_metadata()
+
+        self.assertEqual("2.0.0", metadata["python_package_version"])
+        self.assertEqual("1.1.0", metadata["native_version"])
+        self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
+
+    def test_headless_capability_subset_keeps_health_and_lifecycle_usable(self):
+        bridge = FakeEngineClient(capabilities=["runtime.health", "runtime.lifecycle", "application.events"])
+        bridge._backend = {"headless": True, "graphics": False, "hid": False}
+
+        health = bridge.health()
+        optional = {
+            capability: bridge.supports(capability)
+            for capability in ("application.events", "scene", "screenshot", "input.drag")
+        }
+
+        self.assertTrue(health["backend"]["headless"])
+        self.assertEqual(
+            {"application.events": True, "scene": False, "screenshot": False, "input.drag": False},
+            optional,
+        )
+
+    def test_editor_rejects_cached_port_reused_by_another_engine_instance(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
+                encoding="utf-8",
+            )
+            editor = EditorApiClient(root, port=12345)
+
+            accepted = editor._validate_cached_engine_health(
+                43210,
+                {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
+                fresh_build=False,
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual("cached_port_rejected", editor.lifecycle_events[-1]["stage"])
+
+    def test_editor_accepts_new_instance_after_fresh_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
+                encoding="utf-8",
+            )
+            editor = EditorApiClient(root, port=12345)
+
+            accepted = editor._validate_cached_engine_health(
+                43210,
+                {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
+                fresh_build=True,
+            )
+
+        self.assertTrue(accepted)
+
+    def test_editor_installations_returns_newest_valid_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            older_launcher = root / "older" / "Defold"
+            newer_launcher = root / "newer" / "Defold"
+            older_launcher.parent.mkdir()
+            newer_launcher.parent.mkdir()
+            older_launcher.touch()
+            newer_launcher.touch()
+            registry = root / "installations.json"
+            registry.write_text(
+                json.dumps([
+                    {
+                        "launcherPath": str(older_launcher),
+                        "installPath": str(older_launcher.parent),
+                        "lastLaunchedAt": "2026-07-06T12:00:00Z",
+                    },
+                    {
+                        "launcherPath": str(root / "missing" / "Defold"),
+                        "installPath": str(root / "missing"),
+                        "lastLaunchedAt": "2026-07-10T12:00:00Z",
+                    },
+                    {
+                        "launcherPath": str(newer_launcher),
+                        "installPath": str(newer_launcher.parent),
+                        "lastLaunchedAt": "2026-07-09T12:00:00Z",
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            with mock.patch.object(EditorApiClient, "_installation_registry_path", return_value=registry):
+                installations = editor.installations()
+                latest = editor.latest_installation()
+
+        self.assertEqual([newer_launcher, older_launcher], [item.launcher_path for item in installations])
+        self.assertIsInstance(latest, InstallationType)
+        self.assertEqual(newer_launcher, latest.launcher_path)
+
+    def test_editor_namespaces_expose_only_supported_automation_operations(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+
+        self.assertFalse(hasattr(project, "extensions"))
+        self.assertFalse(hasattr(project, "window"))
+        self.assertFalse(hasattr(project, "help"))
+        for removed in ("from_project", "build", "is_running", "console_lines", "engine_service_port"):
+            self.assertFalse(hasattr(project, removed))
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(202, b"")) as request:
+            project.commands.hot_reload()
+            project.debugger.step_over()
+            project.build_and_run_html5()
+        self.assertEqual(3, request.call_count)
+
+        parameters = EDITOR_OPENAPI["paths"]["/command/{command}"]["post"]["parameters"]
+        advertised = set(parameters[0]["schema"]["enum"])
+        self.assertEqual(advertised, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
+        self.assertFalse(editor._SUPPORTED_COMMANDS & editor._EXCLUDED_COMMANDS)
+        self.assertEqual({("/eval", "post")}, editor._EXCLUDED_PATHS)
+        advertised_paths = {
+            (path, method)
+            for path, operations in EDITOR_OPENAPI["paths"].items()
+            for method in operations
+        }
+        self.assertEqual(advertised_paths, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
+
+    def test_every_editor_command_wrapper_uses_its_advertised_command(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        expected_empty_commands = [
+            "hot-reload", "rebundle", "reload-extensions", "reload-stylesheets",
+            "debugger-start", "debugger-stop", "debugger-break", "debugger-continue",
+            "debugger-detach", "debugger-step-into", "debugger-step-out",
+            "debugger-step-over", "build-html5",
+        ]
+
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(202, b"")) as request:
+            project.commands.hot_reload()
+            project.commands.rebundle()
+            project.commands.reload_extensions()
+            project.commands.reload_stylesheets()
+            project.debugger.start()
+            project.debugger.stop()
+            project.debugger.break_()
+            project.debugger.continue_()
+            project.debugger.detach()
+            project.debugger.step_into()
+            project.debugger.step_out()
+            project.debugger.step_over()
+            project.build_and_run_html5()
+
+        actual_commands = [call.args[0].rsplit("/", 1)[-1] for call in request.call_args_list]
+        self.assertEqual(expected_empty_commands, actual_commands)
+        self.assertTrue(all(call.kwargs["method"] == "POST" for call in request.call_args_list))
+
+    def test_editor_fetch_libraries_parses_results_and_reports_failure(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        response = {
+            "success": True,
+            "libraries": [
+                {"uri": "https://example.test/one.zip", "success": True},
+                {"uri": "https://example.test/two.zip", "success": False, "message": "missing"},
+            ],
+        }
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, response)) as request:
+            result = project.commands.fetch_libraries(timeout=7)
+        self.assertTrue(result.success)
+        self.assertEqual((True, False), tuple(item.success for item in result.libraries))
+        self.assertEqual("missing", result.libraries[1].message)
+        self.assertEqual(7, request.call_args.kwargs["timeout"])
+
+        with mock.patch("automation_bridge.editor.request_json", return_value=(500, {"success": False})):
+            with self.assertRaises(editor.CommandError):
+                project.commands.fetch_libraries()
+
+    def test_editor_console_read_and_context_managed_stream(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        snapshot_body = {
+            "lines": ["first", "second"],
+            "regions": [{"type": "stdout", "from": 0, "to": 2}, "ignored"],
+        }
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, snapshot_body)):
+            snapshot = project.console.read()
+        self.assertEqual(("first", "second"), snapshot.lines)
+        self.assertEqual("stdout", snapshot.regions[0].raw["type"])
+
+        response = mock.MagicMock()
+        response.readline.side_effect = [b"streamed line\r\n", b""]
+        with mock.patch("automation_bridge.editor.urllib.request.urlopen", return_value=response) as urlopen:
+            with project.console.stream(connect_timeout=3, read_timeout=1.5) as stream:
+                self.assertEqual("streamed line", stream.readline())
+                self.assertIsNone(stream.readline())
+        urlopen.assert_called_once_with("http://localhost:12345/console/stream", timeout=3)
+        response.fp.raw._sock.settimeout.assert_called_with(1.5)
+        response.close.assert_called_once_with()
+
+    def test_editor_reference_search_encodes_filters_and_validates_response(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch(
+            "automation_bridge.editor.request_raw",
+            return_value=(200, b'[{"name":"go.property"},null]'),
+        ) as request:
+            result = project.reference.search(environment="runtime", language="lua", query="go property")
+        self.assertEqual([{"name": "go.property"}], result)
+        url = request.call_args.args[0]
+        self.assertEqual(
+            {"environment": ["runtime"], "language": ["lua"], "q": ["go property"]},
+            urllib.parse.parse_qs(urllib.parse.urlsplit(url).query),
+        )
+
+        with mock.patch("automation_bridge.editor.request_raw", return_value=(200, b'{"not":"a list"}')):
+            with self.assertRaises(editor.HttpError):
+                project.reference.search()
+
+    def test_editor_build_error_preserves_typed_source_location(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        issue = {
+            "severity": "error",
+            "message": "unexpected token",
+            "resource": "/main/main.script",
+            "range": {
+                "start": {"line": 7, "character": 3},
+                "end": {"line": 7, "character": 8},
+            },
+        }
+        with (
+            mock.patch.object(project, "_console_lines", return_value=[]),
+            mock.patch.object(project, "_engine_service_port_value", return_value=None),
+            mock.patch("automation_bridge.editor.request_json", return_value=(400, {"success": False, "issues": [issue]})),
+        ):
+            with self.assertRaises(editor.BuildError) as raised:
+                project._build_and_run_command("build")
+
+        actual = raised.exception.issues[0]
+        self.assertEqual("/main/main.script", actual.resource)
+        self.assertEqual((7, 3), (actual.range.start.line, actual.range.start.character))
+        self.assertEqual((7, 8), (actual.range.end.line, actual.range.end.character))
+
+    def test_editor_build_workflows_delegate_with_explicit_command_names(self):
+        project = EditorApiClient(".", port=12345)
+        sentinel = object()
+        with mock.patch.object(EngineClient, "_from_editor", return_value=sentinel) as connect:
+            self.assertIs(sentinel, project.build_and_run(timeout=12, required_capabilities=("scene",)))
+            self.assertIs(sentinel, project.clean_build_and_run(timeout=13))
+            self.assertIs(sentinel, project.connect_engine(timeout=14))
+        self.assertEqual("build", connect.call_args_list[0].kwargs["build_command"])
+        self.assertEqual("clean-build", connect.call_args_list[1].kwargs["build_command"])
+        self.assertIsNone(connect.call_args_list[2].kwargs["build_command"])
+
+    def test_editor_preferences_catalog_and_custom_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        preference = project.preferences.CODE_FONT_SIZE
+
+        self.assertEqual("code/font/size", preference.path)
+        self.assertEqual(12.0, preference.default)
+        self.assertIn("Font size", preference.description)
+        self.assertEqual(preference, project.preferences.describe("code/font/size"))
+        self.assertIn(preference, project.preferences.list(prefix="code", type="number"))
+        self.assertIsNone(project.preferences.describe("my-extension/custom"))
+
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.getcode.return_value = 200
+        response.read.return_value = b"16"
+        with mock.patch("automation_bridge.preferences.urllib.request.urlopen", return_value=response) as urlopen:
+            self.assertEqual(16, project.preferences.get(preference))
+            project.preferences.set("my-extension/custom", True)
+        self.assertEqual(2, urlopen.call_count)
+
+        descriptions_path = ROOT / "automation_bridge/automation-bridge-python/tools/preference_descriptions.json"
+        descriptions = json.loads(descriptions_path.read_text(encoding="utf-8"))
+        all_preferences = project.preferences.list(include_groups=True)
+        self.assertEqual({item.path for item in all_preferences}, set(descriptions))
+
+    def test_editor_preferences_filter_scope_groups_and_validate_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        groups = project.preferences.list(prefix="scene/grid", include_groups=True)
+        self.assertTrue(any(item.group for item in groups))
+        self.assertTrue(all(item.path == "scene/grid" or item.path.startswith("scene/grid/") for item in groups))
+        project_scoped = project.preferences.list(scope="project")
+        self.assertTrue(project_scoped)
+        self.assertTrue(all(item.scope == "project" and not item.group for item in project_scoped))
+        with self.assertRaises(ValueError):
+            project.preferences.get("")
+        with self.assertRaises(TypeError):
+            project.preferences.describe(42)
+
+    def test_preference_catalog_generator_fixture_and_failures(self):
+        script_path = ROOT / "automation_bridge/automation-bridge-python/tools/sync_preferences.py"
+        spec = importlib.util.spec_from_file_location("sync_preferences_for_test", script_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fixture = (ROOT / "tests/fixtures/preferences_schema.clj").read_text(encoding="utf-8")
+        marker = "(def default-schema"
+        schema = module.Reader(fixture[fixture.index(marker) + len(marker):]).read()
+        generated = module.catalog(schema)
+        descriptions = {item["path"]: f"Description for {item['path']}" for item in generated}
+        generated = module.catalog(schema, descriptions)
+        by_path = {item["path"]: item for item in generated}
+
+        self.assertEqual("project", by_path["code/font-size"]["scope"])
+        self.assertEqual("CODE_FONT_SIZE", by_path["code/font-size"]["name"])
+        self.assertEqual(["light", "dark"], by_path["code/theme"]["enum_values"])
+        self.assertEqual({"step": 1}, by_path["code/font-size"]["ui"])
+        with self.assertRaisesRegex(RuntimeError, "missing curated preference descriptions"):
+            module.catalog(schema, {})
+        collision = {
+            "type": "object",
+            "properties": {
+                "a-b": {"type": "string"},
+                "a_b": {"type": "string"},
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "constant collision"):
+            module.catalog(collision)
+
+    def test_editor_installation_registry_paths_cover_supported_platforms(self):
+        with mock.patch("automation_bridge.editor.sys.platform", "darwin"), mock.patch.object(Path, "home", return_value=Path("/home/me")):
+            self.assertEqual(Path("/home/me/Library/Application Support/Defold/installations.json"), editor.installation_registry_path())
+        with mock.patch("automation_bridge.editor.sys.platform", "win32"), mock.patch.dict(os.environ, {"LOCALAPPDATA": "C:/Users/me/AppData/Local"}):
+            self.assertEqual(Path("C:/Users/me/AppData/Local/Defold/installations.json"), editor.installation_registry_path())
+        with mock.patch("automation_bridge.editor.sys.platform", "linux"), mock.patch.dict(os.environ, {"XDG_STATE_HOME": "/state"}):
+            self.assertEqual(Path("/state/Defold/installations.json"), editor.installation_registry_path())
+
+    def test_lua_public_api_uses_only_full_acknowledgement_name(self):
+        source = (ROOT / "automation_bridge/src/automation_bridge_application.cpp").read_text(encoding="utf-8")
+        self.assertIn('{"acknowledge_input", LuaAcknowledgeInput}', source)
+        self.assertNotIn('{"ack", LuaAcknowledgeInput}', source)
+
+    def test_editor_unsupported_operation_is_reported_from_openapi(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {}}
+        with self.assertRaises(editor.UnsupportedOperationError):
+            project.commands.hot_reload()
+
+    def test_editor_from_project_reuses_running_editor(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            with FakeHttpServer(b'{"openapi":"3.0.3"}') as server:
+                (internal / "editor.port").write_text(str(server.port), encoding="utf-8")
+                editor_client = editor.open_project(root)
+
+        self.assertEqual(server.port, editor_client.port)
+        self.assertEqual("editor_reused", editor_client.lifecycle_events[-1]["stage"])
+
+    def test_editor_from_project_launches_latest_installation_when_port_is_missing(self):
+        with tempfile.TemporaryDirectory() as root:
+            project_root = Path(root).resolve()
+            project_file = project_root / "game.project"
+            project_file.write_text("[project]\ntitle = Test\n", encoding="utf-8")
+            launcher = project_root / "Defold"
+            launcher.touch()
+            process = mock.Mock(pid=4321)
+
+            def launch(*args, **kwargs):
+                internal = project_root / ".internal"
+                internal.mkdir()
+                (internal / "editor.port").write_text("54321", encoding="utf-8")
+                return process
+
+            with mock.patch("automation_bridge.editor.sys.platform", "linux"):
+                with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
+                    with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
+                        editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
+
+        self.assertEqual(54321, editor_client.port)
+        self.assertEqual("editor_started", editor_client.lifecycle_events[-1]["stage"])
+        self.assertEqual([str(launcher), str(project_file)], popen.call_args.args[0])
+        self.assertEqual(project_root, popen.call_args.kwargs["cwd"])
+
+    def test_editor_refuses_to_launch_gui_from_restricted_macos_sandbox(self):
+        with tempfile.TemporaryDirectory() as root:
+            project_root = Path(root).resolve()
+            (project_root / "game.project").write_text("[project]\ntitle = Test\n", encoding="utf-8")
+            launcher = project_root / "Defold"
+            launcher.touch()
+
+            with mock.patch("automation_bridge.editor.sys.platform", "darwin"):
+                with mock.patch.dict(os.environ, {"CODEX_SANDBOX": "seatbelt"}):
+                    with mock.patch("automation_bridge.editor.subprocess.Popen") as popen:
+                        with self.assertRaisesRegex(editor.LaunchError, "escalated/unsandboxed"):
+                            editor.open_project(root, launcher=launcher, timeout=0.2)
+
+        popen.assert_not_called()
+
+    def test_editor_preview_returns_png_and_encodes_dimensions(self):
+        png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
+        with tempfile.TemporaryDirectory() as root:
+            with FakeHttpServer(png) as server:
+                editor_client = EditorApiClient(root, port=server.port)
+                editor_client._openapi_document = {"paths": {"/preview/{path}": {"get": {}}}}
+                preview = editor_client.preview.render(
+                    "gui/main menu.gui",
+                    width=320,
+                    height=180,
+                )
+
+        self.assertEqual(png, preview)
+        self.assertEqual(
+            "GET /preview/gui/main%20menu.gui?width=320&height=180 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_editor_preview_rejects_invalid_dimensions_before_request(self):
+        with tempfile.TemporaryDirectory() as root:
+            editor = EditorApiClient(root, port=12345)
+            with self.assertRaisesRegex(ValueError, "width"):
+                editor.preview.render("main/main.collection", width=0)
+
+    def test_editor_preview_scales_project_display_dimensions(self):
+        png = _rgba_png(2, 3, b"\x00\x00\x00\xff" * 6)
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "game.project").write_text(
+                "[display]\nwidth = 960\nheight = 640\n",
+                encoding="utf-8",
+            )
+            with FakeHttpServer(png) as server:
+                editor_client = EditorApiClient(root, port=server.port)
+                editor_client._openapi_document = {"paths": {"/preview/{path}": {"get": {}}}}
+                preview = editor_client.preview.render(
+                    "main/main.collection",
+                    resolution_multiplier=0.5,
+                )
+
+        self.assertEqual(png, preview)
+        self.assertEqual(
+            "GET /preview/main/main.collection?width=480&height=320 HTTP/1.1",
+            server.request_line,
+        )
+
+    def test_editor_preview_validates_resolution_multiplier(self):
+        with tempfile.TemporaryDirectory() as root:
+            editor = EditorApiClient(root, port=12345)
+            with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
+                editor.preview.render("main/main.collection", resolution_multiplier=0.001)
+            with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+                editor.preview.render("main/main.collection", width=320, resolution_multiplier=0.5)
+
     def test_wait_for_count_accepts_zero(self):
         class FakeAutomationBridge:
             def count(self, **selector):
                 return 0
 
-        self.assertEqual(0, AutomationBridgeClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
+        self.assertEqual(0, EngineClient.wait_for_count(FakeAutomationBridge(), 0, timeout=0.1, interval=0.01))
 
     def test_system_reboot_payload(self):
         self.assertEqual(b"\x0a\x01a\x12\x02bc", _encode_system_reboot(("a", "bc")))
@@ -130,7 +832,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         result = bridge.resize(640, 480, wait=0)
 
-        self.assertEqual({"width": 640, "height": 480}, result)
+        self.assertEqual((640, 480, "resized"), (result["width"], result["height"], result["outcome"]))
+        self.assertTrue(result["window_matches"])
         self.assertEqual((640, 480), bridge.last_window_size)
         self.assertEqual(
             [
@@ -157,26 +860,181 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual([], bridge.api_requests)
 
     def test_click_visualize_false_is_encoded(self):
-        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+        with FakeHttpServer(b'{"ok":true,"data":{"input_id":1,"state":"accepted"}}') as server:
+            bridge = EngineClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.click(10, 20, wait=0, visualize=False)
 
-        self.assertEqual(
-            "POST /automation-bridge/v1/input/click?x=10&y=20&visualize=0 HTTP/1.1",
-            server.request_line,
-        )
+        method, target, _ = server.request_line.split(" ")
+        parsed = urllib.parse.urlsplit(target)
+        payload = json.loads(server.request_body.decode("utf-8"))
+        self.assertEqual("POST", method)
+        self.assertEqual("/automation-bridge/v1/input/click", parsed.path)
+        self.assertEqual(10, payload["x"])
+        self.assertEqual(20, payload["y"])
+        self.assertFalse(payload["visualize"])
+        self.assertEqual("test-client", payload["client_id"])
+        self.assertEqual("test-session", payload["session_id"])
+        self.assertEqual(14, len(payload["request_id"]))
 
     def test_drag_visualize_false_is_encoded(self):
-        with FakeHttpServer(b'{"ok":true,"data":{"queued":"drag"}}') as server:
-            bridge = AutomationBridgeClient(server.port, timeout=1.0)
+        with FakeHttpServer(b'{"ok":true,"data":{"input_id":2,"state":"accepted"}}') as server:
+            bridge = EngineClient(server.port, timeout=1.0, client_id="test-client", session_id="test-session")
 
             bridge.drag((10, 20), (30, 40), duration=0.1, wait=0, visualize=False)
 
-        self.assertEqual(
-            "POST /automation-bridge/v1/input/drag?x1=10&y1=20&x2=30&y2=40&duration=0.1&visualize=0 HTTP/1.1",
-            server.request_line,
+        method, target, _ = server.request_line.split(" ")
+        parsed = urllib.parse.urlsplit(target)
+        payload = json.loads(server.request_body.decode("utf-8"))
+        self.assertEqual("POST", method)
+        self.assertEqual("/automation-bridge/v1/input/drag", parsed.path)
+        self.assertEqual(10, payload["x1"])
+        self.assertEqual(40, payload["y2"])
+        self.assertEqual(0.1, payload["duration"])
+        self.assertFalse(payload["visualize"])
+
+    def test_drag_path_serializes_segments_and_correlation(self):
+        bridge = FakeInputClient()
+
+        receipt = bridge.drag_path(
+            [(1, 2), (3, 4), (5, 6)],
+            durations=[0.1, 0.2],
+            easing=["ease_in", "ease_out"],
+            hold_before=0.03,
+            hold_after=0.04,
+            wait=False,
+            expected_scene_sequence=7,
         )
+
+        self.assertIsInstance(receipt, InputReceipt)
+        self.assertEqual(42, receipt.input_id)
+        _, path, params = bridge.api_requests[-1]
+        self.assertEqual("/input/drag_path", path)
+        self.assertEqual("1,2;3,4;5,6", params["points"])
+        self.assertEqual("0.1,0.2", params["durations"])
+        self.assertEqual("ease_in,ease_out", params["easing"])
+        self.assertEqual(7, params["expected_scene_sequence"])
+        self.assertEqual("test-client", params["client_id"])
+        self.assertEqual("test-session", params["session_id"])
+
+    def test_drag_path_serializes_quadratic_and_cubic_curves(self):
+        bridge = FakeInputClient()
+
+        bridge.drag_path([(0, 0), (20, 40), (60, 0)], [0.3], path="quadratic", wait=False)
+        _, _, quadratic = bridge.api_requests[-1]
+        self.assertEqual("quadratic", quadratic["path"])
+        self.assertEqual("0,0;20,40;60,0", quadratic["points"])
+        self.assertEqual("0.3", quadratic["durations"])
+
+        bridge.drag_path(
+            [(0, 0), (20, 40), (40, 40), (60, 0)],
+            [0.4],
+            path="cubic",
+            wait=False,
+        )
+        _, _, cubic = bridge.api_requests[-1]
+        self.assertEqual("cubic", cubic["path"])
+        self.assertEqual("0,0;20,40;40,40;60,0", cubic["points"])
+        self.assertEqual("0.4", cubic["durations"])
+
+    def test_drag_path_rejects_invalid_curve_control_points(self):
+        bridge = FakeInputClient()
+        with self.assertRaisesRegex(ValueError, "quadratic.*exactly three"):
+            bridge.drag_path([(0, 0), (1, 1)], [0.1], path="quadratic", wait=False)
+        with self.assertRaisesRegex(ValueError, "cubic.*exactly four"):
+            bridge.drag_path([(0, 0), (1, 1), (2, 2)], [0.1], path="cubic", wait=False)
+
+    def test_input_wait_uses_native_status_until_released(self):
+        bridge = FakeInputClient(statuses=["started", "released"])
+        accepted = InputReceipt({"input_id": 42, "state": "accepted"})
+
+        released = bridge.input.wait(accepted, timeout=0.1, interval=0)
+
+        self.assertEqual("released", released.state)
+        self.assertEqual(2, sum(1 for method, path, _ in bridge.api_requests if method == "GET" and path == "/input/status"))
+
+    def test_input_wait_reports_native_failure(self):
+        bridge = FakeInputClient(statuses=["failed"])
+
+        with self.assertRaisesRegex(InputExecutionError, "device_unavailable"):
+            bridge.input.wait({"input_id": 42, "state": "accepted"}, timeout=0.1, interval=0)
+
+    def test_input_wait_interrupt_cancels_without_masking_interrupt(self):
+        bridge = FakeInputClient(statuses=[KeyboardInterrupt()])
+
+        with self.assertRaises(KeyboardInterrupt):
+            bridge.input.wait({"input_id": 42, "state": "accepted"}, timeout=0.1, interval=0)
+
+        cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
+        self.assertTrue(cancel[2]["release"])
+
+    def test_active_drag_interrupt_can_flush_later_input_without_masking(self):
+        class CleanupFailureClient(FakeInputClient):
+            cleanup_attempted = False
+
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/input/flush":
+                    self.cleanup_attempted = True
+                    raise RuntimeError("cleanup failed")
+                return super()._request(method, path, params, json_body=json_body)
+
+        bridge = CleanupFailureClient(statuses=[KeyboardInterrupt("stop")])
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
+            bridge.drag(
+                (0, 0),
+                (10, 10),
+                duration=0.1,
+                device="touch",
+                flush_on_interrupt=True,
+            )
+
+        self.assertTrue(bridge.cleanup_attempted)
+
+    def test_held_key_interrupt_requests_release(self):
+        bridge = FakeInputClient(statuses=[KeyboardInterrupt("key stop")])
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "key stop"):
+            bridge.key("KEY_ENTER", wait="released")
+
+        cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
+        self.assertTrue(cancel[2]["release"])
+
+    def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaises(KeyboardInterrupt):
+            with bridge.input.interruption_scope():
+                bridge.drag((0, 0), (10, 10), duration=0.1, wait=False)
+                wait_until(lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+        flush = next(request for request in bridge.api_requests if request[1] == "/input/flush")
+        self.assertTrue(flush[2]["release"])
+
+    def test_pointer_context_exception_requests_cancel(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(RuntimeError, "original"):
+            with bridge.pointer((10, 20), lease=2.0) as pointer:
+                pointer.move((20, 30), duration=0.1, easing="ease_in_out")
+                raise RuntimeError("original")
+
+        self.assertIn("/input/pointer/open", [path for _, path, _ in bridge.api_requests])
+        self.assertIn("/input/pointer/move", [path for _, path, _ in bridge.api_requests])
+        self.assertIn("/input/cancel", [path for _, path, _ in bridge.api_requests])
+
+    def test_held_pointer_interrupt_survives_cancel_failure(self):
+        class CancelFailureClient(FakeInputClient):
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/input/cancel":
+                    raise RuntimeError("cancel failed")
+                return super()._request(method, path, params, json_body=json_body)
+
+        bridge = CancelFailureClient()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
+            with bridge.pointer((10, 20), lease=2.0):
+                raise KeyboardInterrupt("stop")
 
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
@@ -184,8 +1042,8 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         landscape = bridge.set_landscape(wait=0)
         portrait = bridge.set_portrait(wait=0)
 
-        self.assertEqual({"width": 568, "height": 320}, landscape)
-        self.assertEqual({"width": 320, "height": 568}, portrait)
+        self.assertEqual((568, 320), (landscape["width"], landscape["height"]))
+        self.assertEqual((320, 568), (portrait["width"], portrait["height"]))
         self.assertEqual((320, 568), bridge.last_window_size)
         self.assertEqual(
             [
@@ -222,18 +1080,18 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
 
         self.assertGreaterEqual(bridge.health_calls, 2)
 
-    def test_fresh_build_ignores_cached_remotery_url(self):
+    def test_fresh_build_ignores_cached_profiler_url(self):
         class FakeEditor:
-            def latest_registration_remotery_urls(self):
+            def _current_registration_remotery_urls(self):
                 return []
 
-            def remotery_url(self):
+            def _remotery_url_value(self):
                 return "ws://127.0.0.1:17815/rmt"
 
-        self.assertIsNone(AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=True))
+        self.assertIsNone(EngineClient._editor_profiler_url(FakeEditor(), fresh_build=True))
         self.assertEqual(
             "ws://127.0.0.1:17815/rmt",
-            AutomationBridgeClient._editor_remotery_url(FakeEditor(), fresh_build=False),
+            EngineClient._editor_profiler_url(FakeEditor(), fresh_build=False),
         )
 
     def test_engine_log_stream_reads_lines(self):
@@ -241,6 +1099,56 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             with EngineLogStream("127.0.0.1", server.port, timeout=1.0, read_timeout=1.0) as logs:
                 self.assertEqual("INFO:TEST: hello", logs.readline(timeout=1.0))
                 self.assertEqual("WARNING:TEST: done", logs.readline(timeout=1.0))
+
+    def test_engine_log_interrupt_closes_stream_and_preserves_interrupt(self):
+        class InterruptingSocket:
+            def __init__(self):
+                self.timeout = None
+                self.closed = False
+
+            def gettimeout(self):
+                return self.timeout
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def recv(self, size):
+                raise KeyboardInterrupt("log stop")
+
+            def close(self):
+                self.closed = True
+                raise RuntimeError("close failed")
+
+        stream = EngineLogStream.__new__(EngineLogStream)
+        stream._socket = InterruptingSocket()
+        stream._buffer = bytearray()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "log stop"):
+            stream.readline(timeout=0.1)
+
+        self.assertIsNone(stream._socket)
+
+    def test_log_timeout_restore_tolerates_concurrent_socket_close(self):
+        class ClosingSocket:
+            def __init__(self):
+                self.set_calls = 0
+
+            def gettimeout(self):
+                return None
+
+            def settimeout(self, value):
+                self.set_calls += 1
+                if self.set_calls == 2:
+                    raise OSError("already closed")
+
+            def recv(self, size):
+                return b""
+
+        stream = EngineLogStream.__new__(EngineLogStream)
+        stream._socket = ClosingSocket()
+        stream._buffer = bytearray()
+
+        self.assertIsNone(stream.readline(timeout=0.1))
 
     def test_read_logs_collects_future_lines(self):
         bridge = FakeEngineClient()
@@ -252,21 +1160,57 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
                 bridge.read_logs(duration=1.0, limit=2, idle_timeout=0.05),
             )
 
+    def test_logs_tail_buffers_engine_stream_and_filters_errors(self):
+        bridge = FakeEngineClient()
+        with FakeLogServer(
+            [
+                b"0 OK\n",
+                b"INFO:GAME: started\n",
+                b"ERROR:SCRIPT: missing value\n",
+                b"INFO:GAME: continuing\n",
+                b"ERROR:RESOURCE: missing atlas\n",
+            ]
+        ) as server:
+            bridge._engine_info = {"log_port": str(server.port)}
+            bridge.logs.start()
+            lines = wait_until(
+                lambda: bridge.logs.tail(100),
+                timeout=1.0,
+                interval=0.01,
+                predicate=lambda value: len(value) == 4,
+            )
+
+        self.assertEqual(
+            ["INFO:GAME: continuing", "ERROR:RESOURCE: missing atlas"],
+            lines[-2:],
+        )
+        self.assertEqual(
+            ["ERROR:SCRIPT: missing value", "ERROR:RESOURCE: missing atlas"],
+            bridge.logs.tail(100, contains="ERROR:"),
+        )
+        self.assertEqual([], bridge.logs.tail(0))
+        bridge.logs.close()
+
+    def test_logs_tail_validates_limit(self):
+        bridge = EngineClient(1)
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            bridge.logs.tail(-1)
+
     def test_profiler_accessor_uses_engine_port(self):
-        bridge = AutomationBridgeClient(12345, timeout=3.0, remotery_url="ws://127.0.0.1:17816/rmt")
+        bridge = EngineClient(12345, timeout=3.0, profiler_url="ws://127.0.0.1:17816/rmt")
 
         profiler = bridge.profiler
 
         self.assertIsInstance(profiler, ProfilerClient)
         self.assertEqual(12345, profiler.port)
         self.assertEqual(3.0, profiler.timeout)
-        self.assertEqual("ws://127.0.0.1:17816/rmt", profiler.remotery_url)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", profiler.url)
 
-        remotery = profiler.remotery()
+        connection = profiler.connect()
 
-        self.assertEqual("127.0.0.1", remotery.host)
-        self.assertEqual(17816, remotery.port)
-        self.assertEqual("/rmt", remotery.path)
+        self.assertEqual("127.0.0.1", connection.host)
+        self.assertEqual(17816, connection.port)
+        self.assertEqual("/rmt", connection.path)
 
     def test_profiler_resources_requests_resources_data(self):
         payload = _resources_payload()
@@ -315,14 +1259,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(ProfilerDataError, "truncated profiler data"):
             parse_resources_data(payload)
 
-    def test_profiler_remotery_accessor_uses_remotery_port(self):
+    def test_profiler_connection_uses_requested_port(self):
         profiler = ProfilerClient(12345, timeout=3.0)
 
-        remotery = profiler.remotery(port=23456)
+        connection = profiler.connect(port=23456)
 
-        self.assertIsInstance(remotery, RemoteryClient)
-        self.assertEqual(23456, remotery.port)
-        self.assertEqual(3.0, remotery.timeout)
+        self.assertIsInstance(connection, ProfilerConnection)
+        self.assertEqual(23456, connection.port)
+        self.assertEqual(3.0, connection.timeout)
 
     def test_editor_latest_registration_remotery_urls(self):
         lines = [
@@ -333,7 +1277,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             "INFO:ENGINE: Automation Bridge endpoint registered",
         ]
 
-        self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorClient._latest_registration_remotery_urls(lines))
+        self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorApiClient._latest_registration_remotery_urls(lines))
 
     def test_parse_remotery_sample_frame(self):
         frame = parse_sample_frame(_remotery_sample_frame_body(), {1: "Frame", 2: "Update"})
@@ -355,7 +1299,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         names = {1: "Frame", 2: "Update"}
         first = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=7000), names)
         second = parse_sample_frame(_remotery_sample_frame_body(child_duration_us=9000, root_duration_us=18000), names)
-        capture = RemoteryCapture(frames=(first, second))
+        capture = ProfilerCapture(frames=(first, second))
 
         update = capture.scope("Frame/Update")
 
@@ -377,7 +1321,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         names = {100: "Memory", 101: "Used"}
         first = parse_property_frame(_remotery_property_frame_body(property_frame=1, used=100), names)
         second = parse_property_frame(_remotery_property_frame_body(property_frame=2, used=140), names)
-        capture = RemoteryCapture(frames=(), property_frames=(first, second))
+        capture = ProfilerCapture(frames=(), property_frames=(first, second))
 
         used = capture.counter("Memory/Used")
 
@@ -418,14 +1362,14 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
             + _remotery_property(202, 2002, 0, 3, 1.5, previous_value=1, previous_value_frame=6)
         )
 
-        with self.assertRaisesRegex(RemoteryProtocolError, "invalid integer value"):
+        with self.assertRaisesRegex(ProfilerProtocolError, "invalid integer value"):
             parse_property_frame(body, {202: "Fractional"})
 
     def test_remotery_client_get_frame_resolves_sample_names(self):
         sample_message = build_message("SMPL", _remotery_sample_frame_body())
         with FakeRemoteryServer(sample_message, {1: "Frame", 2: "Update"}) as server:
-            with RemoteryClient(port=server.port, timeout=1.0) as remotery:
-                frame = remotery.get_frame(timeout=1.0)
+            with ProfilerConnection(port=server.port, timeout=1.0) as profiler:
+                frame = profiler.get_frame(timeout=1.0)
 
         self.assertEqual({"GSMP1", "GSMP2"}, set(server.client_messages))
         self.assertEqual("Frame", frame.root.name)
@@ -439,7 +1383,7 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         ]
         names = {1: "Frame", 2: "Update", 100: "Memory", 101: "Used"}
         with FakeRemoteryServer(messages, names) as server:
-            profiler = ProfilerClient(12345, timeout=1.0, remotery_url=f"ws://127.0.0.1:{server.port}/rmt")
+            profiler = ProfilerClient(12345, timeout=1.0, profiler_url=f"ws://127.0.0.1:{server.port}/rmt")
             recording = profiler.start_recording(read_timeout=0.05)
             try:
                 wait_until(
@@ -457,8 +1401,383 @@ class AutomationBridgeClientUnitTest(unittest.TestCase):
         self.assertEqual(8.0, update.self.avg_ms)
         self.assertEqual(100, capture.counter("Memory/Used").last_value)
 
+    def test_element_exposes_snapshot_and_generational_identity(self):
+        node = engine.Element(
+            {
+                "id": "n:1",
+                "snapshot_id": "n:1",
+                "instance_id": "/item",
+                "instance_generation": 9,
+                "logical_id": "instance:1:g9",
+                "created_scene_sequence": 4,
+                "scene_sequence": 12,
+                "engine_frame": 99,
+            }
+        )
 
-class FakeEngineClient(AutomationBridgeClient):
+        self.assertEqual("n:1", node.snapshot_id)
+        self.assertEqual("/item", node.instance_id)
+        self.assertEqual(9, node.instance_generation)
+        self.assertEqual("instance:1:g9", node.logical_id)
+        self.assertEqual(4, node.created_scene_sequence)
+        self.assertEqual(12, node.scene_sequence)
+        self.assertEqual(99, node.engine_frame)
+
+    def test_exact_selectors_and_count_stay_server_side(self):
+        class SelectorClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.requests = []
+
+            def _request(self, method, path, params=None, json_body=None):
+                self.requests.append((path, params))
+                return {
+                    "nodes": [{"id": "n:1", "name": "Play", "enabled": True}],
+                    "matched": 1200,
+                    "truncated": True,
+                    "next_cursor": "10",
+                    "scene_sequence": 5,
+                    "engine_frame": 8,
+                }
+
+        bridge = SelectorClient()
+        nodes = bridge.elements(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
+        count = bridge.count(name_exact="Play", enabled=True)
+
+        self.assertEqual(1, len(nodes))
+        self.assertEqual(1200, count)
+        self.assertEqual("Play", bridge.requests[0][1]["name_exact"])
+        self.assertNotIn("name", bridge.requests[0][1])
+        self.assertEqual(0, bridge.requests[1][1]["limit"])
+
+    def test_click_forwards_expected_scene_sequence(self):
+        with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
+            EngineClient(server.port, timeout=1.0).click(
+                "n:1", wait=0, expected_scene_sequence=42
+            )
+
+        self.assertEqual(42, json.loads(server.request_body)["expected_scene_sequence"])
+
+    def test_convert_point_uses_json_body(self):
+        response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
+        with FakeHttpServer(response) as server:
+            point = EngineClient(server.port, timeout=1.0).convert_point(
+                (0.5, 0.5), "normalized_viewport", "window"
+            )
+
+        self.assertEqual({"x": 400, "y": 300}, point)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertIn(
+            b'{"point":{"x":0.5,"y":0.5},"from_space":"normalized_viewport","to_space":"window"}',
+            server.request_bytes,
+        )
+
+    def test_screenshot_waits_for_native_complete_receipt(self):
+        class ScreenshotClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.status_calls = 0
+
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/screenshot":
+                    return {"capture_id": 7, "state": "pending", "path": "/tmp/shot.png"}
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    return {"capture_id": 7, "state": "pending", "path": "/tmp/shot.png"}
+                return {
+                    "capture_id": 7,
+                    "state": "complete",
+                    "path": "/tmp/shot.png",
+                    "engine_frame": 20,
+                    "scene_sequence": 10,
+                    "width": 320,
+                    "height": 200,
+                    "sha256": "abc",
+                }
+
+        receipt = ScreenshotClient().screenshot(timeout=0.2)
+
+        self.assertIsInstance(receipt, ScreenshotReceipt)
+        self.assertEqual((7, 20, 10, 320, 200, "abc"), (
+            receipt.capture_id,
+            receipt.frame,
+            receipt.scene_sequence,
+            receipt.width,
+            receipt.height,
+            receipt.sha256,
+        ))
+
+    def test_screenshot_resolution_multiplier_returns_scaled_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "native.png"
+            pixels = b"".join(
+                bytes((x * 40, y * 80, 120, 255))
+                for y in range(2)
+                for x in range(4)
+            )
+            source.write_bytes(_rgba_png(4, 2, pixels))
+
+            class ScreenshotClient(EngineClient):
+                def __init__(self):
+                    super().__init__(1)
+
+                def _request(self, method, path, params=None, json_body=None):
+                    if path == "/screenshot":
+                        return {"capture_id": 9, "state": "pending", "path": str(source)}
+                    return {
+                        "capture_id": 9,
+                        "state": "complete",
+                        "path": str(source),
+                        "engine_frame": 30,
+                        "scene_sequence": 12,
+                        "width": 4,
+                        "height": 2,
+                        "sha256": "native-sha",
+                    }
+
+            receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
+
+            self.assertEqual((2, 1), (receipt.width, receipt.height))
+            self.assertEqual(0.5, receipt.raw["resolution_multiplier"])
+            self.assertEqual(str(source), receipt.raw["source_path"])
+            self.assertNotEqual(source, receipt.path)
+            self.assertTrue(receipt.exists())
+            self.assertEqual((2, 1), _read_automation_bridge_png(receipt.path)[:2])
+            self.assertEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), receipt.sha256)
+
+    def test_screenshot_validates_resolution_multiplier(self):
+        bridge = EngineClient(1)
+        with self.assertRaisesRegex(ValueError, "0.01 through 1.0"):
+            bridge.screenshot(resolution_multiplier=0.001)
+        with self.assertRaisesRegex(ValueError, "wait=True"):
+            bridge.screenshot(wait=False, resolution_multiplier=0.5)
+
+    def test_wait_frames_uses_native_frame_receipts(self):
+        class FrameClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame = 10
+
+            def _request(self, method, path, params=None, json_body=None):
+                value = self.frame
+                self.frame += 1
+                return {"engine_frame": value, "scene_sequence": value - 2}
+
+        receipt = FrameClient().wait_frames(2, timeout=0.2, interval=0)
+
+        self.assertGreaterEqual(receipt["engine_frame"], 12)
+
+    def test_wait_frames_calculates_default_timeout_from_frame_count(self):
+        class FrameClient(EngineClient):
+            def _request(self, method, path, params=None, json_body=None):
+                return {"engine_frame": 10, "scene_sequence": 8}
+
+        with mock.patch("automation_bridge.client.wait_until", return_value={"engine_frame": 490}) as wait:
+            receipt = FrameClient(1).wait_frames(480)
+
+        self.assertEqual(490, receipt["engine_frame"])
+        self.assertEqual(16.0, wait.call_args.kwargs["timeout"])
+
+    def test_wait_frames_timeout_reports_progress_health_and_lifecycle(self):
+        class FrameClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame_requests = 0
+
+            def _request(self, method, path, params=None, json_body=None):
+                if path == "/health":
+                    return {
+                        "version": "1",
+                        "capabilities": [],
+                        "lifecycle": {"current_stage": "initial_scene_ready"},
+                    }
+                self.frame_requests += 1
+                return {
+                    "engine_frame": 10 if self.frame_requests == 1 else 11,
+                    "scene_sequence": 4,
+                }
+
+        with self.assertRaises(WaitTimeoutError) as raised:
+            FrameClient().wait_frames(5, timeout=0, interval=0)
+
+        message = str(raised.exception)
+        self.assertIn("initial_frame=10", message)
+        self.assertIn("last_observed_frame=11", message)
+        self.assertIn("frames_advancing=True", message)
+        self.assertIn("lifecycle_stage='initial_scene_ready'", message)
+        self.assertIn("engine_health=reachable", message)
+        self.assertEqual(11, raised.exception.last_value["engine_frame"])
+
+    def test_observe_element_counts_distinct_frames(self):
+        class ObservationClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.frame = 3
+
+            def maybe_element(self, **selector):
+                node = engine.Element(
+                    {
+                        "id": "n:1",
+                        "logical_id": "instance:1:g2",
+                        "scene_sequence": self.frame,
+                        "engine_frame": self.frame,
+                    }
+                )
+                self.frame += 1
+                return node
+
+        receipt = ObservationClient().observe_element(minimum_frames=3, timeout=0.2, interval=0)
+
+        self.assertEqual("instance:1:g2", receipt.identity)
+        self.assertEqual(3, receipt.observed_frames)
+        self.assertEqual((3, 5), (receipt.first_frame, receipt.last_frame))
+
+    def test_visual_difference_uses_normalized_rgb_mean_absolute_error(self):
+        black = _rgba_png(1, 1, bytes((0, 0, 0, 255)))
+        white = _rgba_png(1, 1, bytes((255, 255, 255, 255)))
+        transparent_black = _rgba_png(1, 1, bytes((0, 0, 0, 0)))
+
+        self.assertEqual(1.0, difference(black, white))
+        self.assertEqual(0.0, difference(black, transparent_black))
+        self.assertEqual(0.25, difference(black, transparent_black, include_alpha=True))
+
+    def test_profiler_recording_context_abort_hook_cannot_mask_interrupt(self):
+        class ProfilerConnectionStub:
+            connected = True
+
+            def __init__(self):
+                self.stopped = 0
+
+            def stop(self):
+                self.stopped += 1
+
+        class IdleThread:
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                pass
+
+        client = ProfilerConnectionStub()
+        hook_causes = []
+
+        def failing_abort_hook(cause, capture):
+            hook_causes.append(cause)
+            raise RuntimeError("hook failed")
+
+        recording = ProfilerRecording(
+            client,
+            close_on_stop=True,
+            on_abort=failing_abort_hook,
+        )
+        recording._thread = IdleThread()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "recording stop"):
+            with recording:
+                raise KeyboardInterrupt("recording stop")
+
+        self.assertEqual("recording stop", str(hook_causes[0]))
+        self.assertEqual(1, client.stopped)
+
+    def test_profiler_recording_finalize_hook_receives_capture(self):
+        class ProfilerConnectionStub:
+            connected = True
+
+            def stop(self):
+                pass
+
+        captures = []
+        recording = ProfilerRecording(
+            ProfilerConnectionStub(),
+            close_on_stop=True,
+            on_finalize=captures.append,
+        )
+
+        capture = recording.stop()
+
+        self.assertIs(capture, captures[0])
+
+    def test_interrupt_during_recorder_finalization_preserves_interrupt(self):
+        class FailingClient:
+            connected = True
+
+            def stop(self):
+                raise RuntimeError("socket close failed")
+
+        class InterruptingThread:
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                raise KeyboardInterrupt("finalization stop")
+
+        aborts = []
+        recording = ProfilerRecording(
+            FailingClient(),
+            close_on_stop=True,
+            on_abort=lambda cause, capture: aborts.append(cause),
+        )
+        recording._thread = InterruptingThread()
+
+        with self.assertRaisesRegex(KeyboardInterrupt, "finalization stop"):
+            recording.stop()
+
+        self.assertEqual("finalization stop", str(aborts[0]))
+
+    def test_screenshot_wait_interrupt_escapes_immediately(self):
+        bridge = FakeInputClient()
+        bridge._request = lambda *args, **kwargs: {
+            "capture_id": 7,
+            "state": "pending",
+            "path": "/tmp/not-written.png",
+        }
+
+        with mock.patch("automation_bridge.client.wait_until", side_effect=KeyboardInterrupt("capture stop")):
+            with self.assertRaisesRegex(KeyboardInterrupt, "capture stop"):
+                bridge.screenshot(wait=True)
+
+    def test_wait_timeout_reports_last_observation_and_scene(self):
+        values = iter([{"ready": False, "scene_sequence": 7}, {"ready": False, "scene_sequence": 8}])
+        with mock.patch("automation_bridge.waits.time.monotonic", side_effect=[10.0, 10.0, 10.5]), mock.patch(
+            "automation_bridge.waits.time.sleep"
+        ):
+            with self.assertRaises(WaitTimeoutError) as raised:
+                wait_until(
+                    lambda: next(values),
+                    timeout=0.1,
+                    interval=0.1,
+                    message="event missing",
+                    predicate=lambda value: value["ready"],
+                )
+
+        error = raised.exception
+        self.assertEqual({"ready": False, "scene_sequence": 8}, error.last_value)
+        self.assertEqual(2, error.attempts)
+        self.assertEqual(8, error.scene_sequence)
+        self.assertEqual(0.5, error.elapsed)
+        self.assertIn("last_value=", str(error))
+
+    def test_wait_retries_only_selected_exceptions(self):
+        class TransientEventError(RuntimeError):
+            pass
+
+        with self.assertRaises(WaitTimeoutError) as raised:
+            wait_until(
+                lambda: (_ for _ in ()).throw(TransientEventError("cursor unavailable")),
+                timeout=0,
+                retry_exceptions=(TransientEventError,),
+            )
+
+        self.assertIsInstance(raised.exception.last_exception, TransientEventError)
+        with self.assertRaisesRegex(TypeError, "bug"):
+            wait_until(
+                lambda: (_ for _ in ()).throw(TypeError("bug")),
+                timeout=1,
+                retry_exceptions=(TransientEventError,),
+            )
+
+
+class FakeEngineClient(EngineClient):
     def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
         self.engine_posts = []
@@ -466,17 +1785,28 @@ class FakeEngineClient(AutomationBridgeClient):
         self._screen = screen or {"window": {"width": 800, "height": 600}}
         self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
+        self._api_version = "1"
+        self._capability_versions_data = {name: "1" for name in self._capabilities}
+        self._backend = {"headless": False, "graphics": True, "hid": True}
 
-    def _request(self, method, path, params=None):
-        self.api_requests.append((method, path, dict(params) if params is not None else None))
+    def _request(self, method, path, params=None, json_body=None):
+        request_values = json_body if json_body is not None else params
+        self.api_requests.append((method, path, dict(request_values) if request_values is not None else None))
         if method == "GET" and path == "/health":
-            return {"version": "1", "capabilities": list(self._capabilities), "screen": self._screen}
+            return {
+                "version": self._api_version,
+                "native_version": "1.1.0",
+                "capabilities": list(self._capabilities),
+                "capability_versions": dict(self._capability_versions_data),
+                "backend": dict(self._backend),
+                "screen": self._screen,
+            }
         if method == "GET" and path == "/screen":
             return self._screen
         if method == "PUT" and path == "/screen":
             self._screen = {
                 **self._screen,
-                "window": {"width": int(params["width"]), "height": int(params["height"])},
+                "window": {"width": int(request_values["width"]), "height": int(request_values["height"])},
             }
             return self._screen
         raise AssertionError(f"unexpected request: {method} {path} {params}")
@@ -487,6 +1817,43 @@ class FakeEngineClient(AutomationBridgeClient):
 
     def engine_info(self):
         return self._engine_info
+
+
+class FakeInputClient(EngineClient):
+    def __init__(self, statuses=None):
+        super().__init__(12345, client_id="test-client", session_id="test-session")
+        self.api_requests = []
+        self.statuses = list(statuses or [])
+
+    def _request(self, method, path, params=None, json_body=None):
+        params = json_body if json_body is not None else params
+        params = dict(params) if params is not None else None
+        self.api_requests.append((method, path, params))
+        if method == "GET" and path == "/input/status":
+            state = self.statuses.pop(0) if self.statuses else "released"
+            if isinstance(state, BaseException):
+                raise state
+            return {
+                "input_id": int(params["input_id"]),
+                "state": state,
+                "reason": "device_unavailable" if state == "failed" else None,
+            }
+        if method == "GET" and path == "/input/pending":
+            return {"inputs": [], "count": 0}
+        if path == "/input/flush":
+            return {"cancel_requested": 1, "release": bool(params["release"])}
+        if path == "/input/configure":
+            return {"device": params["device"], "visualize": params.get("visualize", True)}
+        if path.startswith("/input/"):
+            return {
+                "input_id": int(params.get("input_id", 42)),
+                "state": "started" if path == "/input/cancel" else "accepted",
+                "request_id": params.get("request_id"),
+            }
+        raise AssertionError(f"unexpected request: {method} {path} {params}")
+
+    def _request_json(self, method, path, payload):
+        return self._request(method, path, payload)
 
 
 class RebootReadyClient(FakeEngineClient):
@@ -673,6 +2040,9 @@ class FakeHttpServer:
         self.reason = reason
         self.port = 0
         self.request_line = None
+        self.request_body = b""
+        self.request_text = ""
+        self.request_bytes = b""
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._thread = None
         self._error = None
@@ -696,8 +2066,28 @@ class FakeHttpServer:
         try:
             client, _ = self._socket.accept()
             with client:
-                request = client.recv(4096).decode("iso-8859-1", "replace")
+                request_bytes = bytearray()
+                while b"\r\n\r\n" not in request_bytes:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    request_bytes.extend(chunk)
+                header_bytes, _, initial_body = bytes(request_bytes).partition(b"\r\n\r\n")
+                content_length = 0
+                for line in header_bytes.split(b"\r\n")[1:]:
+                    if line.lower().startswith(b"content-length:"):
+                        content_length = int(line.split(b":", 1)[1].strip())
+                body = bytearray(initial_body)
+                while len(body) < content_length:
+                    chunk = client.recv(content_length - len(body))
+                    if not chunk:
+                        break
+                    body.extend(chunk)
+                self.request_bytes = header_bytes + b"\r\n\r\n" + bytes(body)
+                request = self.request_bytes.decode("iso-8859-1", "replace")
+                self.request_text = request
                 self.request_line = request.splitlines()[0] if request else ""
+                self.request_body = bytes(body)
                 headers = (
                     f"HTTP/1.1 {self.status} {self.reason}\r\n"
                     f"Content-Length: {len(self.body)}\r\n"
@@ -838,18 +2228,18 @@ class AutomationBridgeApiTest(unittest.TestCase):
             remotery_port = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_PORT")
             if remotery_url is None and remotery_port:
                 remotery_url = f"ws://127.0.0.1:{remotery_port}/rmt"
-            cls.bridge = AutomationBridgeClient(int(port), remotery_url=remotery_url)
+            cls.bridge = EngineClient(int(port), profiler_url=remotery_url)
             cls.bridge.wait_ready()
             return
 
         try:
-            cls.editor = EditorClient.from_project(ROOT)
-        except FileNotFoundError as exc:
+            cls.editor = editor.open_project(ROOT, start_if_needed=False)
+        except (FileNotFoundError, editor.NotRunningError) as exc:
             raise unittest.SkipTest(str(exc)) from exc
 
     @classmethod
     def close_bridge(cls):
-        if cls.bridge is None:
+        if getattr(cls, "bridge", None) is None:
             return
         bridge = cls.bridge
         cls.bridge = None
@@ -869,7 +2259,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
         for run_index in range(run_count):
             if self.editor is not None:
-                self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+                self.bridge = self.editor.build_and_run(timeout=20)
                 self.__class__.bridge = self.bridge
                 self.bridge.wait_ready()
                 if previous_port is not None:
@@ -880,18 +2270,98 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 if run_index == 1 or (run_index == 0 and self.editor is None):
                     if self.supports_capability("screen.resize"):
                         resized = self.bridge.resize(1600, 1200, wait=0.3)
-                        self.assertEqual({"width": 1600, "height": 1200}, resized)
+                        self.assertEqual((1600, 1200), (resized["width"], resized["height"]))
+                        self.assertTrue(resized["window_matches"])
                         portrait = self.bridge.set_portrait(wait=0.3)
-                        self.assertEqual({"width": 1200, "height": 1600}, portrait)
+                        self.assertEqual((1200, 1600), (portrait["width"], portrait["height"]))
                     else:
                         print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
 
-    def test_drag_negative_duration_is_clamped_in_response(self):
+    def test_drag_item_along_cubic_curve_and_closed_circle(self):
         self.ensure_running_bridge()
         self.reset_if_popup_is_visible()
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
+
+        for _ in range(2):
+            before = self.label_count("L1")
+            self.bridge.click(spawner)
+            wait_until(lambda: self.label_count("L1") > before, timeout=2, message="curved-drag item missing")
+
+        before = self.label_count("L1")
+        first, second = self.parents_for_label("L1")[:2]
+        screen = self.bridge.screen()["window"]
+        start = first.center
+        target = second.center
+        dx = target["x"] - start["x"]
+        dy = target["y"] - start["y"]
+        distance = max(1.0, math.hypot(dx, dy))
+        bend = min(140.0, max(70.0, distance * 0.6))
+        normal_x = -dy / distance
+        normal_y = dx / distance
+
+        def controls(side):
+            return tuple(
+                (
+                    min(screen["width"] - 8.0, max(8.0, start["x"] + dx * fraction + normal_x * bend * side)),
+                    min(screen["height"] - 8.0, max(8.0, start["y"] + dy * fraction + normal_y * bend * side)),
+                )
+                for fraction in (1.0 / 3.0, 2.0 / 3.0)
+            )
+
+        positive_controls = controls(1.0)
+        negative_controls = controls(-1.0)
+
+        def bend_score(points):
+            return sum(abs(dx * (point[1] - start["y"]) - dy * (point[0] - start["x"])) / distance for point in points)
+
+        control_one, control_two = max((positive_controls, negative_controls), key=bend_score)
+        curved = self.bridge.drag_path(
+            [start, control_one, control_two, target],
+            [0.45],
+            path="cubic",
+            easing="ease_in_out",
+        )
+        self.assertEqual("released", curved.state)
+        self.wait_for_merge("L1", before, "L2")
+
+        before = self.label_count("L1")
+        self.bridge.click(spawner)
+        wait_until(lambda: self.label_count("L1") > before, timeout=2, message="circular-drag item missing")
+        item_label = self.bridge.element(type="labelc", text="L1", visible=True)
+        item = self.bridge.parent(item_label)
+        center_x = float(item.center["x"])
+        center_y = float(item.center["y"])
+        right_space = screen["width"] - center_x - 8.0
+        left_space = center_x - 8.0
+        direction = 1.0 if right_space >= left_space else -1.0
+        horizontal_space = right_space if direction > 0 else left_space
+        radius = min(70.0, horizontal_space / 2.0, center_y - 8.0, screen["height"] - center_y - 8.0)
+        self.assertGreaterEqual(radius, 30.0, "test item has insufficient room for a visible circular drag")
+        circle_center_x = center_x + direction * radius
+        start_angle = math.pi if direction > 0 else 0.0
+        segment_count = 24
+        circle = [
+            (
+                circle_center_x + radius * math.cos(start_angle + 2.0 * math.pi * index / segment_count),
+                center_y + radius * math.sin(start_angle + 2.0 * math.pi * index / segment_count),
+            )
+            for index in range(segment_count + 1)
+        ]
+        circular = self.bridge.drag_path(
+            circle,
+            [0.02] * segment_count,
+            path="sampled",
+            easing="linear",
+        )
+        self.assertEqual("released", circular.state)
+        self.assertEqual(before + 1, self.label_count("L1"))
+
+    def test_drag_negative_duration_is_rejected(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
 
         start_count = self.label_count("L1")
         self.bridge.click(spawner)
@@ -902,11 +2372,11 @@ class AutomationBridgeApiTest(unittest.TestCase):
         before = self.label_count("L1")
         first, second = self.parents_for_label("L1")[:2]
 
-        response = self.bridge.drag(first, second, duration=-0.25, wait=0.2)
+        with self.assertRaises(AutomationBridgeApiError) as raised:
+            self.bridge.drag(first, second, duration=-0.25, wait=False)
 
-        self.assertEqual("drag", response["queued"])
-        self.assertEqual(0, response["duration"])
-        self.wait_for_merge("L1", before, "L2")
+        self.assertEqual("bad_request", raised.exception.code)
+        self.assertEqual(before, self.label_count("L1"))
 
     def test_drag_visualization_is_visible_in_screenshot(self):
         self.ensure_running_bridge()
@@ -944,12 +2414,32 @@ class AutomationBridgeApiTest(unittest.TestCase):
         finally:
             time.sleep(1.0)
 
+    def test_screenshot_rows_match_top_left_scene_bounds(self):
+        self.ensure_running_bridge()
+        fixture = self.bridge.element(
+            type="goc",
+            name_exact="/bounds_fixture",
+            visible=True,
+            include=["basic", "bounds"],
+        )
+        self.assertIsNotNone(fixture.bounds)
+
+        screenshot = self.bridge.screenshot(wait=True, timeout=5)
+        bounds = dict(fixture.bounds.screen)
+        mirrored = dict(bounds)
+        mirrored["y"] = screenshot.height - float(bounds["y"]) - float(bounds["h"])
+        aligned_light_pixels = _count_light_pixels_in_rect(screenshot, bounds)
+        mirrored_light_pixels = _count_light_pixels_in_rect(screenshot, mirrored)
+
+        self.assertGreater(aligned_light_pixels, 20, (screenshot, bounds))
+        self.assertGreater(aligned_light_pixels, mirrored_light_pixels + 20, (screenshot, bounds, mirrored))
+
     def test_remotery_sprite_counter_after_actions(self):
         self.ensure_running_bridge()
-        if self.editor is None and self.bridge.remotery_url is None:
-            raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for Remotery tests")
+        if self.editor is None and self.bridge.profiler_url is None:
+            raise unittest.SkipTest("set AUTOMATION_BRIDGE_REMOTERY_URL or AUTOMATION_BRIDGE_REMOTERY_PORT for profiler tests")
         self.reset_if_popup_is_visible()
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         observations = []
 
         self.record_sprite_counter(observations, "initial")
@@ -989,7 +2479,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.merge_label("L2")
         self.record_sprite_counter(observations, "drag merge L2")
 
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         for index in range(4):
             before = self.label_count("L1")
             self.bridge.click(spawner)
@@ -1010,7 +2500,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual(1, self.label_count("L4"))
         self.record_sprite_counter(observations, "finish merge L3")
 
-        restart = self.bridge.node(name_exact="restart", enabled=True)
+        restart = self.bridge.element(name_exact="restart", enabled=True)
         self.bridge.click(restart, wait=0.4)
         self.assertEqual(0, len(self.item_labels()))
         self.record_sprite_counter(observations, "restart")
@@ -1024,7 +2514,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             return
         if self.editor is None:
             raise unittest.SkipTest("no Automation Bridge engine or Defold editor is available")
-        self.bridge = AutomationBridgeClient.from_editor(self.editor, build=True, timeout=20)
+        self.bridge = self.editor.build_and_run(timeout=20)
         self.__class__.bridge = self.bridge
         self.bridge.wait_ready()
 
@@ -1033,8 +2523,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     def record_sprite_counter(self, observations, label):
         scene_count = self.bridge.count(type="spritec")
-        with self.bridge.profiler.remotery() as remotery:
-            counter_value = self.wait_for_sprite_counter(remotery, scene_count)
+        with self.bridge.profiler.connect() as profiler:
+            counter_value = self.wait_for_sprite_counter(profiler, scene_count)
         self.assertEqual(scene_count, counter_value, label)
         observations.append((label, scene_count, counter_value))
 
@@ -1054,34 +2544,62 @@ class AutomationBridgeApiTest(unittest.TestCase):
             timeout=5,
             interval=0.05,
             message=f"Remotery {self.SPRITE_COUNTER_NAME} did not match scene spritec count",
+            retry_exceptions=(AssertionError,),
         )
 
     def run_automation_bridge_api_end_to_end(self):
         health = self.bridge.health()
         self.assertEqual("1", health["version"])
+        self.assertEqual("1.3.0", health["native_version"])
         self.assertIn("scene", health["capabilities"])
         self.assertIn("input.click", health["capabilities"])
+        self.assertIn("scene.pagination", health["capabilities"])
+        self.assertGreaterEqual(health["engine_frame"], 0)
+        self.assertEqual("1", health["capability_versions"]["scene"])
+        self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
+        self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
+        self.assertGreater(health["identity"]["start_wall_time_us"], 0)
+        self.assertGreater(health["identity"]["start_monotonic_time_us"], 0)
+        self.assertEqual("initial_scene_ready", health["lifecycle"]["current_stage"])
+        self.assertEqual(health["identity"]["engine_instance_id"], self.bridge.health()["identity"]["engine_instance_id"])
 
         screen = self.bridge.screen()
         self.assertEqual("top-left", screen["coordinates"]["origin"])
+        self.assertEqual("window", screen["coordinates"]["input_space"])
         self.assertGreater(screen["window"]["width"], 0)
         self.assertGreater(screen["window"]["height"], 0)
-        self.assertEqual({"width": 960, "height": 640}, screen["display"])
+        self.assertEqual((960, 640), (screen["display"]["width"], screen["display"]["height"]))
+        self.assertGreater(screen["display_scale"], 0)
+
+        viewport_center = self.bridge.convert_point(
+            (0.5, 0.5), from_space="normalized_viewport", to_space="viewport"
+        )
+        self.assertAlmostEqual(screen["viewport"]["width"] / 2, viewport_center["x"], delta=1)
+        self.assertAlmostEqual(screen["viewport"]["height"] / 2, viewport_center["y"], delta=1)
 
         scene = self.bridge.scene(visible=True, include=["basic", "bounds", "properties"])
         self.assertEqual("main", scene["root"]["name"])
         self.assertGreater(scene["count"], 0)
+        self.assertGreater(scene["scene_sequence"], 0)
+        self.assertIn("snapshot_id", scene["root"])
 
-        spawner = self.bridge.node(
+        spawner = self.bridge.element(
             type="goc",
             name_exact="/spawner",
             visible=True,
             include=["basic", "bounds", "properties"],
             limit=20,
         )
-        spawner_detail = self.bridge.by_id(spawner.id)
+        spawner_detail = self.bridge.element_by_id(spawner.id)
         self.assertEqual("/spawner", spawner_detail.name)
         self.assertGreaterEqual(len(spawner_detail.children), 2)
+        self.assertIsNotNone(spawner_detail.instance_id)
+        self.assertIsNotNone(spawner_detail.instance_generation)
+        self.assertIsNotNone(spawner_detail.logical_id)
+
+        with self.assertRaises(AutomationBridgeApiError) as stale:
+            self.bridge.click(spawner, wait=0, expected_scene_sequence=0)
+        self.assertEqual("stale_scene", stale.exception.code)
 
         self.assert_game_object_bounds_follow_child_component()
         self.assert_spawned_by_node_click(spawner)
@@ -1093,14 +2611,14 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assert_drag_merge_by_coordinates("L1", expected_new_level="L2")
 
         text_key = self.bridge.type_text("hello")
-        self.assertEqual("key", text_key["queued"])
-        self.assertEqual(5, text_key["length"])
+        self.assertEqual("key", text_key["kind"])
+        self.assertEqual("accepted", text_key["state"])
 
         special_key = self.bridge.key("KEY_ENTER")
-        self.assertEqual("key", special_key["queued"])
+        self.assertEqual("key", special_key["kind"])
 
         self.finish_merge_game()
-        gui_nodes = self.bridge.nodes(
+        gui_nodes = self.bridge.elements(
             type="gui_node",
             limit=100,
             include=["basic", "bounds", "properties"],
@@ -1113,16 +2631,20 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual({"panel", "restart", "title"}, enabled_popup_nodes)
 
         screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+        self.assertEqual("complete", screenshot_path.state)
         self.assertGreater(screenshot_path.stat().st_size, 0)
+        self.assertEqual(hashlib.sha256(screenshot_path.read_bytes()).hexdigest(), screenshot_path.sha256)
+        self.assertGreater(screenshot_path.frame, 0)
+        self.assertGreater(screenshot_path.scene_sequence, 0)
 
         restart = next(node for node in gui_nodes if node.name == "restart")
         self.bridge.click(restart, wait=0.4)
         self.assertEqual(0, len(self.item_labels()))
-        panel = self.bridge.node(name_exact="panel")
+        panel = self.bridge.element(name_exact="panel")
         self.assertFalse(panel.enabled)
 
     def assert_game_object_bounds_follow_child_component(self):
-        fixture = self.bridge.node(
+        fixture = self.bridge.element(
             type="goc",
             name_exact="/bounds_fixture",
             visible=True,
@@ -1140,9 +2662,9 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertLessEqual(distance, 2.0)
 
         response = self.bridge.click(fixture, wait=0.1)
-        self.assertEqual("click", response["queued"])
-        self.assertAlmostEqual(fixture_x, response["x"], delta=0.5)
-        self.assertAlmostEqual(fixture_y, response["y"], delta=0.5)
+        self.assertEqual("click", response["kind"])
+        self.assertEqual("released", response["state"])
+        self.assertEqual("mouse", response["device"])
 
     def assert_spawned_by_node_click(self, node):
         before = self.label_count("L1")
@@ -1178,7 +2700,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def finish_merge_game(self):
         self.merge_label("L2")
 
-        spawner = self.bridge.node(type="goc", name_exact="/spawner", visible=True)
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
         for _ in range(4):
             self.bridge.click(spawner)
         self.merge_label("L1")
@@ -1199,12 +2721,12 @@ class AutomationBridgeApiTest(unittest.TestCase):
         )
 
     def reset_if_popup_is_visible(self):
-        restart = self.bridge.maybe_node(name_exact="restart")
+        restart = self.bridge.maybe_element(name_exact="restart")
         if restart and restart.enabled:
             self.bridge.click(restart, wait=0.4)
 
     def item_labels(self):
-        nodes = self.bridge.nodes(type="labelc", limit=100)
+        nodes = self.bridge.elements(type="labelc", limit=100)
         return [node.text for node in nodes if node.text != "SPAWN"]
 
     def label_count(self, label):
@@ -1213,7 +2735,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def parents_for_label(self, label):
         def resolve_parents():
             parents = []
-            nodes = self.bridge.nodes(type="labelc", text=label, limit=100)
+            nodes = self.bridge.elements(type="labelc", text=label, limit=100)
             for node in nodes:
                 try:
                     parents.append(self.bridge.parent(node))

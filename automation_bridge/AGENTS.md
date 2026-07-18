@@ -1,20 +1,37 @@
-# Automation Bridge Native API Notes
+# Native extension guidance
 
-- Purpose: this Defold native extension exposes a debug-build HTTP API for runtime automation: health/screen checks, scene and node discovery, click/drag/key input, and screenshots.
-- Prefer the Python wrapper in `automation_bridge/automation-bridge-python` for scripts and tests. Use this raw API only for curl-level debugging, wrapper work, or endpoints not yet wrapped.
-- Find the engine service port in the editor console line `Engine service started on port <port>`.
-- Base URL: `http://127.0.0.1:<engine_service_port>/automation-bridge/v1`.
-- No Lua setup is required for v1; the API is available when Defold's engine service web server is running.
-- Requests use query parameters only, not JSON bodies. Success shape is `{ "ok": true, "data": ... }`; errors use `{ "ok": false, "error": { "code": ..., "message": ... } }`.
-- Call `GET /health` first. Require `ok: true`, inspect `data.capabilities`, and use `GET /screen` when window/display/viewport metadata matters. When `screen.resize` is present, use `PUT /screen?width=...&height=...` to set the native Defold window size.
-- Coordinates are top-left screen pixels. Prefer node ids over raw coordinates whenever possible.
-- Discover targets with `GET /nodes` or `GET /scene`; fetch details with `GET /node?id=...`.
-- `/nodes` filters: `id`, `type`, `name`, `text`, `url`, `visible`, `include`, and `limit`. `type`/`name`/`text`/`url` are case-insensitive substring matches. Use `limit=0` for counts.
-- Include data with `include=bounds`, `properties`, `children`, `all`, or a comma-separated combination. Basic node fields are always returned.
-- Node ids are stable only for the current scene shape. Re-discover nodes after clicks, drags, collection changes, or UI updates.
-- Input endpoints: `POST /input/click?id=...` or `x/y`; `POST /input/drag?from_id=...&to_id=...&duration=...` or `x1/y1/x2/y2`; `POST /input/key?text=...` or URL-encoded `keys=%7BKEY_ENTER%7D`.
-- Mouse/touch input visualization is on by default. Use `visualize=0` on click/drag endpoints when the overlay would interfere with diagnostics.
-- `GET /screenshot` schedules capture and returns a file path; wait until that file exists and has nonzero size.
-- On macOS with the Metal adapter, `POST /metal?path=/absolute/output.gputrace&frames=1` schedules a frame capture; poll `GET /metal` for completion or use `DELETE /metal` to stop early. Launch with `METAL_CAPTURE_ENABLED=1`.
-- When available, analyze a completed trace with `gpudebug -t /absolute/output.gputrace`; use `list`, `go`, `info`, `find`, and `fetch` to inspect commands, pipelines, bindings, and attachments. Check installation with `xcrun --find gpudebug`.
-- Full endpoint details live in `automation_bridge/README.md`.
+- This subtree implements the debug-only HTTP API. Prefer the Python wrapper in
+  `automation-bridge-python/` for automation scripts; work at this level for
+  native endpoints, wrapper internals, or curl-level diagnostics.
+- The endpoint reference and source of truth for transport details, capability
+  names, response fields, and error codes is `README.md`.
+- The base URL is
+  `http://127.0.0.1:<engine_service_port>/automation-bridge/v1`; obtain the port
+  from the editor console's `Engine service started on port <port>` line.
+- No Lua setup is needed for native inspection, input, capture, events, or
+  markers. Application-defined state, commands, events, and acknowledgements
+  require `[automation_bridge] application_api = 1` in `game.project`.
+- Query parameters are supported. `POST` and `PUT` also accept a bounded root
+  `application/json` object; query values win when both transports supply a key.
+  Responses use `{ "ok": true, "data": ... }` or
+  `{ "ok": false, "error": { "code": ..., "message": ... } }`.
+- Start with `GET /health`: validate `version`, negotiate
+  `capability_versions`, and retain `identity.engine_instance_id` when caching a
+  port. Unsupported backend features return `501 unsupported_capability`.
+- Nodes are snapshots. Prefer semantic selectors or node ids to coordinates, and
+  re-query after input or scene changes. `/nodes` filters and paginates on the
+  server; use `limit=0` when only a complete count is needed.
+- Coordinates use named top-left spaces. Use `/coordinates/convert` instead of
+  inferring viewport, GUI, display, or window transforms.
+- Input is queued and receipt-based. Wait for the required input phase, and use
+  application events/state/acknowledgements when semantic completion matters.
+- Screenshot creation is asynchronous: poll `/screenshot/status` for its atomic
+  `complete` receipt; file size is not completion evidence.
+- On macOS with the Metal adapter,
+  `POST /metal?path=/absolute/output.gputrace&frames=1` schedules a frame capture;
+  poll `GET /metal` for completion or use `DELETE /metal` to stop early. Launch
+  with `METAL_CAPTURE_ENABLED=1`.
+- When available, analyze a completed trace with
+  `gpudebug -t /absolute/output.gputrace`; use `list`, `go`, `info`, `find`, and
+  `fetch` to inspect commands, pipelines, bindings, and attachments. Check
+  installation with `xcrun --find gpudebug`.

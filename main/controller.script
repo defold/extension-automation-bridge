@@ -12,6 +12,20 @@ local ITEM_MAX_SPEED = 150
 local items = {}
 local serial = 0
 
+local function publish_automation_state()
+	if not automation_bridge then
+		return
+	end
+	local count = 0
+	for _ in pairs(items) do
+		count = count + 1
+	end
+	automation_bridge.publish("sample.game", {
+		busy = false,
+		item_count = count,
+	})
+end
+
 local function distance_sq(a, b)
 	local dx = a.x - b.x
 	local dy = a.y - b.y
@@ -155,6 +169,22 @@ function init(self)
 	self.dragging = nil
 	self.pointer_down = false
 	reset_game(self)
+	if automation_bridge then
+		automation_bridge.annotate("main:/spawner#label", {
+			automation_id = "spawn_button_label",
+			localization_key = "spawn_button",
+			role = "button_label",
+		})
+		automation_bridge.command("sample.reset", function(data)
+			reset_game(self)
+			publish_automation_state()
+			automation_bridge.emit("sample.reset_complete", {
+				request_id = data.request_id,
+			})
+			return { reset = true }
+		end)
+		publish_automation_state()
+	end
 end
 
 function final(self)
@@ -209,6 +239,7 @@ function on_input(self, action_id, action)
 
 		if spawner_at(pos) then
 			spawn_random_item(self)
+			publish_automation_state()
 			return true
 		end
 
@@ -230,6 +261,7 @@ function on_input(self, action_id, action)
 				if target_id then
 					merge_items(self, dragged_id, target_id)
 				end
+				publish_automation_state()
 			end
 			return true
 		end

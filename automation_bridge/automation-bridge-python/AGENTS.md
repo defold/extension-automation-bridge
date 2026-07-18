@@ -1,19 +1,41 @@
-# Automation Bridge Python Wrapper Notes
+# Python wrapper guidance
 
-- Purpose: dependency-free Python helpers for driving a Defold debug build through the Automation Bridge HTTP API. Use it for editor/bootstrap automation, runtime scene inspection, node selection, input, screenshots, logs, window control, reboot/shutdown, resource data, and Remotery profiling.
-- Setup from this repo: add `automation_bridge/automation-bridge-python` to `PYTHONPATH` or `sys.path`, then import `AutomationBridgeClient`, `EditorClient`, or `wait_until` from `automation_bridge` as needed.
-- Public APIs have docstrings. Use `help(AutomationBridgeClient)`, `help(AutomationBridgeClient.drag)`, or `.__doc__` for quick in-code reference.
-- Normal bootstrap: `bridge = AutomationBridgeClient.from_project(".", build=True)`. It builds through the editor, discovers/caches the engine service port and, when present in fresh logs, the Remotery URL, handles stale reused engine ports, and waits for `/automation-bridge/v1/health`. If Remotery discovery is missing, `bridge.profiler.remotery()` falls back to Defold's default port; pass `url=` or `port=` to override it.
-- Use `AutomationBridgeClient.from_editor(editor, build=True)` for explicit editor control, `AutomationBridgeClient(port)` for an already known engine port, and `AUTOMATION_BRIDGE_ENGINE_PORT` only when a running port is known.
-- Core API: `health()`, `screen()`, `scene(...)`, `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, `count(...)`, `click(...)`, `drag(...)`, `type_text(...)`, `key("KEY_ENTER")`, `wait_for_node(...)`, `wait_for_count(...)`, module-level `wait_until(...)`, `screenshot(...)`, `format_nodes(...)`, and `dump_scene(...)`.
-- Selectors pass native filters `id`, `type`, `name`, `text`, `url`, `visible`, `include`, `limit`; Python also adds `enabled`, `kind`, `path`, `name_exact`, `text_exact`, `has_bounds`, and `visible_and_enabled`.
-- Native `type`/`name`/`text`/`url` matching is case-insensitive substring matching. Use `name_exact` or `text_exact` when exact matching matters.
-- `Node` objects are snapshots with fields like `id`, `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, `visible`, `enabled`, `bounds`, `center`, `children`, and `raw`. Re-query after clicks, drags, collection changes, or UI updates.
-- Component nodes often expose useful labels/properties while the parent game object receives input. Use `bridge.parent(component_node)` before clicking or dragging when needed.
-- Input accepts nodes, node ids, point mappings, `(x, y)` tuples, or raw `x, y` coordinates. Coordinates are top-left screen pixels. `drag(..., duration=...)` waits for the queued drag to finish by default.
-- Mouse/touch input visualization is enabled by default; pass `visualize=False` to `click()` or `drag()` when needed.
-- Use `bridge.screenshot(wait=True)` for PNG diagnostics; use `bridge.format_nodes(...)` or `bridge.dump_scene(...)` when selector failures need scene context.
-- Engine logs: `bridge.log_stream()` and `bridge.read_logs(duration=..., limit=...)` read future Defold TCP log lines; `EditorClient.console_lines()` reads existing editor console history.
-- Engine control: `resize(width, height)`, `set_portrait()`, `set_landscape()`, `reboot(*args, wait=True)`, and `close_engine()`. Only call `close_engine()` when intentionally shutting down the running engine. For editor-launched reboots that must return to Automation Bridge, pass explicit project/bootstrap args.
-- Profiling: `bridge.profiler.resources()` reads Defold `/resources_data`; `bridge.profiler.capture(frames=..., warmup_frames=...)` captures Remotery frames; `bridge.profiler.start_recording(...)` records until your script stops it. Use `capture.scopes(...)` for timing stats and `capture.counters(...)` for Remotery property counters.
-- Full user/API docs live in `README.md`; raw endpoint docs live in `../README.md`.
+- This is the preferred, dependency-free interface for driving a Defold debug
+  build. Add this directory to `PYTHONPATH`, then use the focused package-root
+  namespaces: `from automation_bridge import editor, engine`.
+- Bootstrap with `game = editor.open_project(".").build_and_run()`. The editor
+  helper reuses a healthy project editor or starts the newest discovered Defold
+  installation. Use `game.close_engine()` only when the script intentionally
+  owns engine cleanup.
+- On macOS, run a bootstrap that may start Defold with escalated/unsandboxed
+  execution. Defold inherits a sandbox from its Python parent and will abort
+  during AppKit registration when WindowServer and LaunchServices are denied.
+  Reusing a healthy editor does not require escalation. When uncertain, probe
+  with `editor.open_project(".", start_if_needed=False)` and rerun the normal
+  bootstrap with escalation after `NotRunningError`. Do not rely on
+  `start_new_session=True` or `/usr/bin/open` to escape the inherited sandbox.
+- Declare mandatory features with `required_capabilities=[...]` or
+  `game.require(...)`; probe optional features with `game.supports(...)`.
+- Prefer named helpers. Use
+  `game.request(method, path, params=..., json=...)` only as the raw native API
+  escape hatch.
+- Selectors support substring, exact, boolean, identity, and pagination filters.
+  `count()` remains complete regardless of page limits. `Element` values are
+  snapshots, so re-query after input or scene changes.
+- A visible component may expose the useful label while its parent game object
+  receives input; use `game.parent(component)` when appropriate. Input targets
+  may be elements, ids, point mappings, `(x, y)` pairs, or raw coordinates.
+- Prefer events, published state, commands, input acknowledgements, frame waits,
+  `wait_for_element(...)`, `observe_element(...)`, and
+  `wait_for_disappearance(...)` over sleeps.
+- `screenshot(wait=True)` returns an atomic receipt. Start agent inspection with
+  `resolution_multiplier=0.5`; the scaled receipt retains the engine file at
+  `raw["source_path"]`. `project.preview.render(...)` provides the equivalent
+  editor-side render without running the game.
+- Optional diagnostics are intentionally namespaced under `game.visual`,
+  `game.gestures`, `game.video_recording`, `game.metal_capture`, `game.profiler`,
+  and `game.trace(...)`.
+- Public docstrings are the exact API reference (`help(engine.Client.drag)`). See
+  `README.md` for workflows and examples, and `../README.md` for raw endpoints.
+- Run tests from the repository root with:
+  `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling`.

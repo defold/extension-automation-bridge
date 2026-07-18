@@ -199,6 +199,8 @@ namespace dmAutomationBridge
     static void FreeNode(Node* node)
     {
         FreeString(&node->m_Id);
+        FreeString(&node->m_InstanceId);
+        FreeString(&node->m_LogicalId);
         FreeString(&node->m_Name);
         FreeString(&node->m_Type);
         FreeString(&node->m_Kind);
@@ -207,6 +209,9 @@ namespace dmAutomationBridge
         FreeString(&node->m_Text);
         FreeString(&node->m_Url);
         FreeString(&node->m_Resource);
+        FreeString(&node->m_AutomationId);
+        FreeString(&node->m_LocalizationKey);
+        FreeString(&node->m_Role);
         for (uint32_t i = 0; i < node->m_Properties.m_Count; ++i)
         {
             FreeProperty(&node->m_Properties.m_Data[i]);
@@ -491,6 +496,8 @@ namespace dmAutomationBridge
             SetString(&node.m_Name, buffer);
         }
 
+        ApplyNodeAnnotation(&node);
+
         const char* safe_segment = IsEmpty(node.m_Name) ? node.m_Type : node.m_Name;
         char segment[128];
         dmSnPrintf(segment, sizeof(segment), "%s[%u]", safe_segment, sibling_index);
@@ -514,6 +521,37 @@ namespace dmAutomationBridge
         char id[32];
         dmSnPrintf(id, sizeof(id), "n:%016llx", (unsigned long long)id_hash);
         SetString(&node.m_Id, id);
+
+        // Collection roots only initialize m_Collection. The remaining union-like
+        // SceneNode fields are unspecified, so m_Instance must only be read for
+        // node kinds that Defold documents as carrying an instance.
+        if (scene_node->m_Type != dmGameObject::SCENE_NODE_TYPE_COLLECTION && scene_node->m_Instance)
+        {
+            dmhash_t instance_identifier = dmGameObject::GetIdentifier(scene_node->m_Instance);
+            node.m_InstanceGeneration = dmGameObject::GetGeneration(scene_node->m_Instance);
+            node.m_HasInstanceIdentity = true;
+            SetHashString(&node.m_InstanceId, instance_identifier);
+
+            char logical_id[96];
+            dmSnPrintf(logical_id, sizeof(logical_id), "instance:%016llx:g%u",
+                       (unsigned long long)instance_identifier,
+                       node.m_InstanceGeneration);
+            SetString(&node.m_LogicalId, logical_id);
+            node.m_CreatedSceneSequence = snapshot->m_Sequence;
+
+            const Snapshot* previous = &g_AutomationBridge.m_Snapshot;
+            for (uint32_t i = 0; i < previous->m_Nodes.m_Count; ++i)
+            {
+                const Node* old = &previous->m_Nodes.m_Data[i];
+                if (old->m_HasInstanceIdentity &&
+                    old->m_InstanceGeneration == node.m_InstanceGeneration &&
+                    StringsEqual(old->m_InstanceId, node.m_InstanceId))
+                {
+                    node.m_CreatedSceneSequence = old->m_CreatedSceneSequence;
+                    break;
+                }
+            }
+        }
 
         if (parent_index >= 0 && (uint32_t)parent_index < snapshot->m_Nodes.m_Count)
         {
@@ -566,8 +604,16 @@ namespace dmAutomationBridge
 
         snapshot->m_WindowWidth = dmGraphics::GetWindowWidth(g_AutomationBridge.m_GraphicsContext);
         snapshot->m_WindowHeight = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
-        snapshot->m_BackbufferWidth = dmGraphics::GetWidth(g_AutomationBridge.m_GraphicsContext);
-        snapshot->m_BackbufferHeight = dmGraphics::GetHeight(g_AutomationBridge.m_GraphicsContext);
+        // The public window size is the drawable framebuffer size on Defold's
+        // graphics backends. GetWidth/GetHeight are the configured project
+        // reference size and must not be mislabeled as backbuffer pixels.
+        snapshot->m_BackbufferWidth = snapshot->m_WindowWidth;
+        snapshot->m_BackbufferHeight = snapshot->m_WindowHeight;
+        snapshot->m_DisplayScale = dmGraphics::GetDisplayScaleFactor(g_AutomationBridge.m_GraphicsContext);
+        if (!IsFiniteFloat(snapshot->m_DisplayScale) || snapshot->m_DisplayScale <= 0.0f)
+        {
+            snapshot->m_DisplayScale = 1.0f;
+        }
         dmGraphics::GetViewport(g_AutomationBridge.m_GraphicsContext, &snapshot->m_ViewportX, &snapshot->m_ViewportY, &snapshot->m_ViewportWidth, &snapshot->m_ViewportHeight);
 
         if (snapshot->m_WindowWidth == 0)
@@ -590,6 +636,7 @@ namespace dmAutomationBridge
         if (g_AutomationBridge.m_Register)
         {
             dmGameObject::SceneNode root;
+            memset(&root, 0, sizeof(root));
             if (dmGameObject::TraverseGetRoot(g_AutomationBridge.m_Register, &root))
             {
                 DefoldPrivateApiResetSnapshotCamera();
@@ -646,6 +693,23 @@ namespace dmAutomationBridge
     {
         StringBufferAppend(out, "{\"id\":");
         AppendJsonString(out, node->m_Id);
+        StringBufferAppend(out, ",\"snapshot_id\":");
+        AppendJsonString(out, node->m_Id);
+        StringBufferAppend(out, ",\"scene_sequence\":");
+        AppendNumber(out, (double)snapshot->m_Sequence);
+        StringBufferAppend(out, ",\"engine_frame\":");
+        AppendNumber(out, (double)g_AutomationBridge.m_Frame);
+        if (node->m_HasInstanceIdentity)
+        {
+            StringBufferAppend(out, ",\"instance_id\":");
+            AppendJsonString(out, node->m_InstanceId);
+            StringBufferAppend(out, ",\"instance_generation\":");
+            AppendNumber(out, node->m_InstanceGeneration);
+            StringBufferAppend(out, ",\"logical_id\":");
+            AppendJsonString(out, node->m_LogicalId);
+            StringBufferAppend(out, ",\"created_scene_sequence\":");
+            AppendNumber(out, (double)node->m_CreatedSceneSequence);
+        }
         StringBufferAppend(out, ",\"name\":");
         AppendJsonString(out, node->m_Name);
         StringBufferAppend(out, ",\"type\":");
@@ -682,6 +746,21 @@ namespace dmAutomationBridge
         {
             StringBufferAppend(out, ",\"resource\":");
             AppendJsonString(out, node->m_Resource);
+        }
+        if (!IsEmpty(node->m_AutomationId))
+        {
+            StringBufferAppend(out, ",\"automation_id\":");
+            AppendJsonString(out, node->m_AutomationId);
+        }
+        if (!IsEmpty(node->m_LocalizationKey))
+        {
+            StringBufferAppend(out, ",\"localization_key\":");
+            AppendJsonString(out, node->m_LocalizationKey);
+        }
+        if (!IsEmpty(node->m_Role))
+        {
+            StringBufferAppend(out, ",\"role\":");
+            AppendJsonString(out, node->m_Role);
         }
 
         if (include->m_Bounds)
@@ -736,11 +815,16 @@ namespace dmAutomationBridge
 
     void AppendScreenJson(StringBuffer* out, const Snapshot* snapshot)
     {
-        StringBufferAppend(out, "{\"window\":{\"width\":");
+        int32_t viewport_top = (int32_t)snapshot->m_BackbufferHeight - snapshot->m_ViewportY - (int32_t)snapshot->m_ViewportHeight;
+        StringBufferAppend(out, "{\"window\":{\"x\":0,\"y\":0,\"width\":");
         AppendNumber(out, snapshot->m_WindowWidth);
         StringBufferAppend(out, ",\"height\":");
         AppendNumber(out, snapshot->m_WindowHeight);
-        StringBufferAppend(out, "},\"backbuffer\":{\"width\":");
+        StringBufferAppend(out, "},\"client\":{\"x\":0,\"y\":0,\"width\":");
+        AppendNumber(out, snapshot->m_WindowWidth);
+        StringBufferAppend(out, ",\"height\":");
+        AppendNumber(out, snapshot->m_WindowHeight);
+        StringBufferAppend(out, "},\"backbuffer\":{\"x\":0,\"y\":0,\"width\":");
         AppendNumber(out, snapshot->m_BackbufferWidth);
         StringBufferAppend(out, ",\"height\":");
         AppendNumber(out, snapshot->m_BackbufferHeight);
@@ -748,15 +832,28 @@ namespace dmAutomationBridge
         AppendNumber(out, snapshot->m_DisplayWidth);
         StringBufferAppend(out, ",\"height\":");
         AppendNumber(out, snapshot->m_DisplayHeight);
+        StringBufferAppend(out, ",\"scale\":");
+        AppendNumber(out, snapshot->m_DisplayScale);
+        StringBufferAppend(out, "},\"project_content\":{\"x\":0,\"y\":0,\"width\":");
+        AppendNumber(out, snapshot->m_DisplayWidth);
+        StringBufferAppend(out, ",\"height\":");
+        AppendNumber(out, snapshot->m_DisplayHeight);
+        StringBufferAppend(out, "},\"display_pixels\":{\"x\":0,\"y\":0,\"width\":");
+        AppendNumber(out, snapshot->m_WindowWidth);
+        StringBufferAppend(out, ",\"height\":");
+        AppendNumber(out, snapshot->m_WindowHeight);
+        StringBufferAppend(out, ",\"scope\":\"window_drawable\"");
         StringBufferAppend(out, "},\"viewport\":{\"x\":");
         AppendNumber(out, snapshot->m_ViewportX);
         StringBufferAppend(out, ",\"y\":");
-        AppendNumber(out, snapshot->m_ViewportY);
+        AppendNumber(out, viewport_top);
         StringBufferAppend(out, ",\"width\":");
         AppendNumber(out, snapshot->m_ViewportWidth);
         StringBufferAppend(out, ",\"height\":");
         AppendNumber(out, snapshot->m_ViewportHeight);
-        StringBufferAppend(out, "},\"coordinates\":{\"origin\":\"top-left\",\"units\":\"screen_pixels\"}}");
+        StringBufferAppend(out, "},\"display_scale\":");
+        AppendNumber(out, snapshot->m_DisplayScale);
+        StringBufferAppend(out, ",\"coordinates\":{\"origin\":\"top-left\",\"units\":\"pixels\",\"input_space\":\"window\",\"spaces\":[\"window\",\"client\",\"backbuffer\",\"viewport\",\"normalized_viewport\"]}}");
     }
 
 

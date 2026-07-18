@@ -1,0 +1,56 @@
+{
+  "openapi": "3.0.3",
+  "paths": {
+    "/console": {"get": {}},
+    "/console/stream": {"get": {}},
+    "/prefs/{path}": {"get": {}, "post": {}},
+    "/ref": {"get": {}},
+    "/preview/{path}": {"get": {}},
+    "/eval": {"post": {}},
+    "/command/{command}": {
+      "post": {
+        "parameters": [
+          {
+            "name": "command",
+            "schema": {
+              "enum": [
+                "build",
+                "clean-build",
+                "build-html5",
+                "fetch-libraries",
+                "hot-reload",
+                "rebundle",
+                "reload-extensions",
+                "reload-stylesheets",
+                "debugger-start",
+                "debugger-stop",
+                "debugger-break",
+                "debugger-continue",
+                "debugger-detach",
+                "debugger-step-into",
+                "debugger-step-out",
+                "debugger-step-over",
+                "asset-portal",
+                "documentation",
+                "donate-page",
+                "editor-logs",
+                "engine-profiler",
+                "engine-resource-profiler",
+                "issues",
+                "report-issue",
+                "report-suggestion",
+                "support-forum",
+                "show-build-errors",
+                "show-console",
+                "show-curve-editor",
+                "toggle-pane-bottom",
+                "toggle-pane-left",
+                "toggle-pane-right"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

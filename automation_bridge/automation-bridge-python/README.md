@@ -1,364 +1,547 @@
 # Automation Bridge Python Helpers
 
-Small dependency-free Python helpers for driving the Automation Bridge extension from tests and local automation scripts.
+Dependency-free Python helpers for driving a Defold debug build through the
+Automation Bridge HTTP API.
 
-The package uses only the Python standard library and wraps the existing curl-friendly `/automation-bridge/v1` API.
+## Quick start
 
-## Quick Start
-
-```python
-from automation_bridge import AutomationBridgeClient
-
-bridge = AutomationBridgeClient.from_project(".", build=True)
-
-spawner = bridge.node(type="goc", name="spawner", visible=True)
-bridge.click(spawner)
-
-items = bridge.nodes(type="labelc", text_exact="L1", limit=100)
-bridge.drag(bridge.parent(items[0]), bridge.parent(items[1]), duration=0.16)
-
-png = bridge.screenshot(wait=True)
-
-with bridge.log_stream(read_timeout=1.0) as logs:
-    print(logs.readline(timeout=1.0))
-```
-
-Close the running engine when a script needs to clean up after itself:
-
-```python
-bridge.close_engine()
-```
-
-Resize the running engine window or swap the last known size between portrait and landscape:
-
-```python
-bridge.resize(1280, 720)
-bridge.set_portrait()
-bridge.set_landscape()
-```
-
-When running from this repository without installing anything, add `automation_bridge/automation-bridge-python` to `PYTHONPATH`:
+When running from this repository, add the wrapper directory to `PYTHONPATH`:
 
 ```sh
-PYTHONPATH=automation_bridge/automation-bridge-python python3 tests/test_automation_bridge_api.py
+PYTHONPATH=automation_bridge/automation-bridge-python python3 your_script.py
 ```
 
-The repository also includes a runtime smoke test for game-object bounds:
+Build, connect, query the scene, and send input:
 
-```sh
-PYTHONPATH=automation_bridge/automation-bridge-python python3 examples/gameobject_bounds.py
+```python
+from automation_bridge import editor
+
+project = editor.open_project(".")
+game = project.build_and_run()
+
+spawner = game.element(type="goc", name_exact="/spawner", visible=True)
+game.click(spawner)
+label = game.wait_for_element(type="labelc", text_exact="L1")
+game.drag(game.parent(label), (500, 300), duration=0.16)
+shot = game.screenshot(wait=True, resolution_multiplier=0.5)
+print(shot.path, shot.frame, shot.scene_sequence, shot.sha256)
 ```
 
-It uses a sample fixture whose sprite is offset from the parent game object origin, so it fails if parent game-object bounds collapse to the raw Defold world position.
+Use `game.close_engine()` only when the script intentionally owns engine cleanup.
 
-## Public API Surface
+## Public API
 
-`AutomationBridgeClient` is the main entry point.
+The package root exposes only `editor` and `engine`.
 
-- Bootstrap: `AutomationBridgeClient(port)`, `from_project(...)`, `from_editor(...)`, and `wait_ready(...)`.
-- Raw API passthrough: `get(path, params=None)`, `post(path, params=None)`, and `put(path, params=None)`.
-- Runtime state: `health()`, `screen()`, `scene(...)`, `remotery_url`, and `last_window_size`.
-- Node queries: `nodes(...)`, `node(...)`, `maybe_node(...)`, `by_id(...)`, `parent(...)`, and `count(...)`.
-- Input: `click(...)`, `drag(...)`, `type_text(...)`, and `key(...)`.
-- Waits and screenshots: client methods `wait_for_node(...)`, `wait_for_count(...)`, and `screenshot(...)`, plus the module-level `wait_until(...)`.
-- Engine diagnostics: `engine_info()`, `engine_log_port()`, `log_stream(...)`, `read_logs(...)`, `format_nodes(...)`, and `dump_scene(...)`.
-- Engine control: `resize(...)`, `set_portrait(...)`, `set_landscape(...)`, `reboot(...)`, and `close_engine(...)`.
-- Profiling: `bridge.profiler.resources()`, `bridge.profiler.remotery(...)`, `bridge.profiler.capture(...)`, and `bridge.profiler.start_recording(...)`.
-
-`EditorClient` exposes editor-oriented helpers for advanced bootstrap flows: `from_project(...)`, `build(...)`, `console_lines()`, `engine_service_port()`, `engine_service_ports()`, `latest_registration_engine_service_ports()`, `latest_registration_has_engine_service_port()`, `last_build_had_engine_service_port()`, `endpoint_registered_count()`, `remotery_url()`, `remotery_urls()`, `latest_registration_remotery_urls()`, `remember_engine_service_port(...)`, and `remember_remotery_url(...)`.
-
-Typed response wrappers include `Node`, `Bounds`, `ResourceProfileEntry`, `RemoteryFrame`, `RemoterySample`, `RemoterySampleAggregate`, `RemoteryCapture`, `RemoteryScopeStats`, `RemoteryCounterStats`, `RemoteryProperty`, `RemoteryPropertyFrame`, `RemoteryPropertyEntry`, `RemoteryTimingStats`, `RemoteryValueStats`, and `RemoteryRecording`. `EngineLogStream`, `ProfilerClient`, and `RemoteryClient` are also exported for direct use. These are lightweight snapshots around native engine data; re-query after clicks, drags, or scene changes.
+- Bootstrap: `editor.open_project(...)`, `project.build_and_run()`,
+  `project.clean_build_and_run()`, `project.connect_engine()`, and
+  `engine.connect(port)`.
+- Editor operations: `project.commands`, `project.debugger`, `project.console`,
+  `project.preferences`, `project.reference`, `project.preview`, and
+  `project.build_and_run_html5()`.
+- Runtime state: `health()`, `screen()`, `scene(...)`, capabilities, and lifecycle.
+- Elements: `elements(...)`, `element(...)`, `maybe_element(...)`,
+  `element_by_id(...)`, `parent(...)`, `count(...)`, compact formatting, and
+  scene dumps.
+- Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`,
+  `type_text(...)`, `key(...)`, and `game.input`.
+- Synchronization: events, states, application commands, full input
+  acknowledgements, timeline markers, frame/count waits, and element
+  observation.
+- Runtime control and geometry: `resize(...)`, `set_portrait()`,
+  `set_landscape()`, `convert_point(...)`, `reboot(...)`, and
+  `close_engine()`.
+- Capture and diagnostics: screenshots, historical `game.logs`, live engine
+  logs, profiling, visual comparison, tracing, `game.video_recording`, and
+  `game.metal_capture` on supported macOS/Metal runtimes.
+- Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
 
 ## Bootstrap
 
-Use the editor client when you want explicit control over the Defold editor server. `AutomationBridgeClient.from_editor(..., build=True)` closes known candidate engine ports before building so repeated runs start from a fresh engine process. `build()` waits until the runtime logs `Automation Bridge endpoint registered`, then waits another 0.2 seconds before returning.
-When the editor reuses the same running engine process, it may not print a fresh engine service port before `Automation Bridge endpoint registered`; `EditorClient` reuses the last port it saw and stores it in `.internal/automation_bridge.engine.port`.
-The same bootstrap reads Defold's `Initialized Remotery (ws://.../rmt)` log line when it is present and stores it in `.internal/automation_bridge.remotery.url`, so `bridge.profiler.remotery()` can connect without a hard-coded port when discovery succeeds. If no fresh Remotery URL is discovered, the helper falls back to Defold's default Remotery port; pass `url=` or `port=` to override it.
-If the latest build logs `Automation Bridge endpoint registered` without a fresh engine service port before it, `AutomationBridgeClient.from_editor(..., build=True)` immediately tries to close candidate engine ports with `@system/exit`, rebuilds once, and retries. It uses the same recovery path if discovered ports do not serve `/automation-bridge/v1/health`.
-
 ```python
-from automation_bridge import AutomationBridgeClient, EditorClient
+from automation_bridge import editor, engine
 
-editor = EditorClient.from_project(".")
-editor.build()
-
-bridge = AutomationBridgeClient.from_editor(editor, build=False)
-bridge.wait_ready()
+project = editor.open_project(".")
+game = project.build_and_run()
+clean_game = project.clean_build_and_run()
+existing_game = project.connect_engine()
+direct_game = engine.connect(51337)
 ```
 
-Use an already-started engine service port directly:
+Choose the operation by ownership and lifecycle intent:
+
+| Operation | Editor required | Builds | Engine intent |
+| --- | --- | --- | --- |
+| `editor.open_project(".")` | No; starts or reuses it | No | Return an editor project client |
+| `project.build_and_run()` | Yes | Incremental | Replace the previous engine and connect |
+| `project.clean_build_and_run()` | Yes | Clean | Replace the previous engine and connect |
+| `project.connect_engine()` | Yes | No | Connect to the healthy engine already registered by this project |
+| `engine.connect(port)` | No | No | Connect directly to a known engine service port |
+| `game.close_engine()` | No | No | Close the connected engine; use only when the script owns cleanup |
+
+There is intentionally no `project.connect()`: a project is already the editor
+client, while `connect_engine()` makes the second client and its lifecycle
+explicit.
+
+The editor bootstrap discovers `.internal/editor.port`, launches Defold when
+needed, rejects stale engine ports, and waits for Automation Bridge health.
+Pass `start_if_needed=False` to require an already-running editor.
+
+## Reliable game test loop
+
+Resize before coordinate-based input or visual assertions, then synchronize on
+application-published state instead of estimating completion from elapsed time:
+
+If a `.go`, `.gui`, or `.collection` resource was created or edited manually,
+render it through the editor preview before building. This makes the editor
+parse its references and produces a quick visual artifact, so malformed files,
+missing resources, and obvious layout mistakes are reported close to the edit:
 
 ```python
-from automation_bridge import AutomationBridgeClient
+from pathlib import Path
+from automation_bridge import editor
 
-bridge = AutomationBridgeClient(51337)
-bridge.wait_ready()
+project = editor.open_project(".")
+preview_directory = Path("/tmp/defold-previews")
+preview_directory.mkdir(parents=True, exist_ok=True)
+
+for resource in (
+    "main/player.go",
+    "main/hud.gui",
+    "main/main.collection",
+):
+    png = project.preview.render(resource, resolution_multiplier=0.5)
+    output = preview_directory / f"{Path(resource).name}.png"
+    output.write_bytes(png)
+    print(f"Rendered {resource} to {output}")
 ```
 
-## Raw API and Scene Data
+Preview rendering validates editor loading and appearance; it does not replace
+`build_and_run()` when runtime scripts, input, physics, or dynamically spawned
+content must be tested.
 
-Use the named helpers for normal scripts:
+After previewing manually authored resources, continue with the runtime loop:
 
 ```python
-health = bridge.health()
-screen = bridge.screen()
-scene = bridge.scene(visible=True, include=["bounds", "properties"])
+from automation_bridge import editor
 
-label_count = bridge.count(type="labelc")
-bridge.click(480, 320)
-bridge.resize(1280, 720)
+project = editor.open_project(".")
+game = project.build_and_run(required_capabilities=[
+    "screen.resize",
+    "input.pointer",
+    "screenshot",
+    "application.state",
+])
+
+game.resize(1080, 1920)
+game.set_portrait()
+game.wait_for_state("tutorial.phase", "ready")
+
+before = game.screenshot(after_frames=1)
+game.drag((540, 1500), (540, 500), duration=0.25)
+game.wait_for_state("tutorial.phase", "waiting_for_pickup")
+after = game.screenshot(after_frames=1)
 ```
 
-`health()` and `screen()` update `bridge.last_window_size` from the engine response. `scene()` returns the full native scene-tree payload with `count`, `visible_filter`, `screen`, and `root`.
+The state names and values in this example belong to the game. Publish them
+from Lua together with semantic scene annotations:
 
-Raw `get()`, `post()`, and `put()` are available for curl-level debugging or endpoints that do not have named wrapper methods yet.
+```lua
+automation_bridge.publish("tutorial", {
+    phase = "waiting_for_pickup",
+    figure = figure_num,
+})
 
-## Selectors
-
-`nodes()` returns a list of snapshot `Node` objects. `node()` expects exactly one match. `maybe_node()` allows zero or one.
-
-```python
-restart = bridge.node(name_exact="restart", enabled=True)
-labels = bridge.nodes(type="labelc", text="L", limit=100)
-count = bridge.count(type="labelc", text_exact="L2")
-detail = bridge.by_id(restart.id)
-item = bridge.parent(labels[0])
+automation_bridge.annotate("main:/ghost#sprite", {
+    automation_id = "tutorial_target_ghost",
+    role = "tutorial_target",
+})
 ```
 
-Server-side filters are passed to the extension: `id`, `type`, `name`, `text`, `url`, `visible`, `limit`, and `include`.
+Tests can then use
+`game.element(automation_id="tutorial_target_ghost")` instead of inferring a
+runtime object from size, scale, depth, or changing instance ids.
 
-Python adds stricter client-side filters: `enabled`, `kind`, `path`, `name_exact`, `text_exact`, `has_bounds`, and `visible_and_enabled`.
+On macOS, run a bootstrap that may launch Defold outside restricted agent
+sandboxes. A GUI process inherits its Python parent's sandbox and cannot
+register with WindowServer or LaunchServices. The wrapper refuses to launch
+Defold when Codex marks the process as sandboxed and raises `LaunchError` with
+instructions to start Defold manually or rerun with escalated execution. An
+already-running healthy editor can still be reused without escalation.
 
-`include` may be either a comma-separated string or an iterable:
-
-```python
-node = bridge.node(name="spawner", include=["bounds", "properties"])
-```
-
-Native `type`, `name`, `text`, and `url` filters are case-insensitive substring matches. Use `name_exact` and `text_exact` when exact matching matters.
-
-`Node` exposes convenience properties for the native node payload:
-
-```python
-node.id
-node.name
-node.type
-node.kind
-node.path
-node.parent_id
-node.text
-node.url
-node.visible
-node.enabled
-node.raw
-
-if node.bounds:
-    print(node.bounds.screen["x"], node.bounds.screen["y"])
-    print(node.bounds.x, node.bounds.y, node.bounds.w, node.bounds.h)
-    print(node.center["x"], node.center["y"])
-    print(node.bounds.normalized["x"], node.bounds.normalized["y"])
-
-for child in node.children:
-    print(child.compact())
-```
-
-## Input
+Installation discovery and preview rendering are explicit:
 
 ```python
-bridge.click(node)
-bridge.click(node.id)
-bridge.click(480, 320)
-bridge.click((480, 320))
-bridge.click({"x": 480, "y": 320})
-bridge.click({"center": {"x": 480, "y": 320}})
-bridge.click(node, visualize=False)
+for installation in editor.installations():
+    print(installation.launcher_path, installation.last_launched_at)
 
-bridge.drag(first_node, second_node, duration=0.16)
-bridge.drag(first_node.center, second_node.center, duration=0.16)
-bridge.drag(first_node, second_node, duration=0.16, visualize=False)
-
-bridge.type_text("hello")
-bridge.key("KEY_ENTER")
-```
-
-Mouse/touch input visualization is on by default in the native endpoint: clicks draw a growing circle and drags draw a line for one second. Pass `visualize=False` to `click()` or `drag()` to disable it for that input. Drag calls block until the requested `duration` has completed and the engine has had a short extra moment to process the release. Pass `wait=0` to only queue the input, or pass a larger wait if the game needs additional settle time after input.
-
-`Node` objects are snapshots. If the scene may have changed, fetch a fresh node with `bridge.by_id(node.id)` or query again.
-
-Component nodes often expose useful text or properties, while their parent game object is the actionable target. Use `bridge.parent(component_node)` before clicking or dragging when needed:
-
-```python
-label = bridge.node(type="labelc", text_exact="L1")
-item = bridge.parent(label)
-bridge.drag(item, (480, 320))
-```
-
-## Waits and Screenshots
-
-```python
-from automation_bridge import wait_until
-
-wait_until(lambda: bridge.count(type="labelc", text_exact="L2") >= 1)
-
-node = bridge.wait_for_node(name_exact="restart", enabled=True)
-bridge.wait_for_count(2, type="labelc", text_exact="L1")
-
-png = bridge.screenshot(wait=True, timeout=5)
-```
-
-`wait_until(fn, timeout=..., interval=..., message=...)` polls until `fn()` returns a truthy value. Exceptions raised while polling are retried until timeout, then reported in the final `AssertionError`.
-
-## Engine Control
-
-The helper combines Automation Bridge window control with a small subset of Defold's built-in engine service protobuf messages on the same engine service port:
-
-```python
-bridge.resize(1280, 720)
-bridge.set_portrait()
-bridge.set_landscape()
-
-bridge.reboot(
-    "--config=bootstrap.main_collection=/main/main.collectionc",
-    "build/default/game.projectc",
+preview_png = project.preview.render(
+    "main/main.collection",
+    resolution_multiplier=0.5,
 )
 ```
 
-`bridge.resize(width, height)` calls Automation Bridge's `PUT /screen` endpoint, which sets the native Defold window size, then remembers the returned `(width, height)` as `bridge.last_window_size`. `bridge.screen()` and `bridge.health()` also update the remembered size from the engine response. `bridge.set_portrait()` and `bridge.set_landscape()` use that remembered size, fetching `/screen` first if needed, and swap width/height only when the current orientation does not already match.
-
-`bridge.reboot(*args)` posts `com.dynamo.system.proto.System$Reboot` to `/post/@system/reboot`. Defold accepts up to six string arguments; pass the same command-line style arguments you would pass to `sys.reboot(...)` or the editor reboot helper. For editor-launched projects, a bare `bridge.reboot()` may restart without the project or this extension, so pass explicit project/bootstrap args when you expect Automation Bridge to return. By default the wrapper waits for the Automation Bridge endpoint to become ready again; pass `wait=False` when rebooting into a target that will not load this extension.
-
-`bridge.close_engine()` posts Defold's built-in `@system/exit` message to the same engine service port used by the Automation Bridge API. If the process stays alive on macOS/Linux, the helper falls back to terminating the local process listening on that port. The graceful request is equivalent to:
-
-```sh
-printf '\010\000' | curl -sS -X POST --data-binary @- \
-  "http://127.0.0.1:<ENGINE_PORT>/post/@system/exit"
-```
-
-## Diagnostics
-
-Selector errors include the selector and compact candidate node details. You can also format or dump scene state explicitly:
+Built-in preferences are discoverable constants with metadata, while custom
+editor-script paths remain strings:
 
 ```python
-print(bridge.format_nodes(type="gui_node", limit=100))
-print(bridge.dump_scene(visible=True, include=["bounds"]))
-bridge.dump_scene("scene.json", visible=True)
+size = project.preferences.get(project.preferences.CODE_FONT_SIZE)
+project.preferences.set(project.preferences.CODE_FONT_SIZE, 16)
+project.preferences.set("my-extension/preview/quality", "high")
+for preference in project.preferences.list(prefix="code"):
+    print(preference.path, preference.description)
 ```
 
-Read future engine logs from Defold's TCP log service:
+## Capabilities
+
+Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python
-print(bridge.engine_info()["log_port"])
-print(bridge.engine_log_port())
+game = project.build_and_run(
+    required_capabilities=["runtime.lifecycle", "application.events>=1"],
+)
 
-with bridge.log_stream(read_timeout=1.0) as logs:
-    print(logs.readline(timeout=1.0))
-
-recent = bridge.read_logs(duration=2.0, limit=20)
+game.require("scene", "input.drag")
 ```
 
-`bridge.log_stream()` discovers the log port from engine `/info`, performs Defold's `0 OK` log-service handshake, and then yields plain log lines without trailing newlines. The stream only receives logs emitted after it connects; use `EditorClient.console_lines()` when you need the editor's existing console history.
-
-`EngineLogStream` is context-managed and iterable. It also exposes `readline(timeout=...)` and `close()`.
-
-## Profiler
-
-Read Defold's built-in resource profiler data from `/resources_data`:
+Check nonessential functionality without mutating the client:
 
 ```python
-resources = bridge.profiler.resources()
-for resource in resources:
-    print(resource.name, resource.type, resource.size, resource.size_on_disc, resource.ref_count)
+available = {
+    name: game.supports(name)
+    for name in ("scene", "screenshot", "input.drag")
+}
 ```
 
-`resources()` returns `ResourceProfileEntry` objects. `size` is the in-memory size reported by Defold, falling back to size on disc when the engine does not report a separate memory size.
-The returned list is sorted by `size` from largest to smallest.
+Capability declarations may use `name>=N`. Incompatible API versions raise
+`IncompatibleApiVersionError`; missing required features raise
+`UnsupportedCapabilityError`.
 
-`parse_resources_data(payload)` is exported for tests and fixtures that already have a raw `/resources_data` binary payload.
+## Raw requests
 
-Capture one Remotery sample frame from Defold's runtime profiler websocket:
+Named helpers are preferred. For endpoint-level debugging, use the single raw
+escape hatch:
 
 ```python
-with bridge.profiler.remotery() as remotery:
-    frame = remotery.get_frame(timeout=2.0)
-    for entry in frame.aggregate(include_root=False)[:10]:
-        print(entry.label, entry.total_ms, entry.self_ms, entry.call_count)
+health = game.request("GET", "/health")
+result = game.request("POST", "/coordinates/convert", json={
+    "point": {"x": 0.5, "y": 0.5},
+    "from_space": "normalized_viewport",
+    "to_space": "window",
+})
 ```
 
-When the bridge was created with `from_project()` or `from_editor()`, `remotery()` uses the websocket URL discovered from editor logs. Direct `AutomationBridgeClient(port)` instances fall back to `ws://127.0.0.1:17815/rmt`, matching Defold's default profiler viewer. Use `start()` and `stop()` directly when a script needs to keep the connection open across multiple frame captures.
+Raw native endpoint documentation is in [`../README.md`](../README.md).
 
-Override the Remotery target when needed:
+## Elements and selectors
+
+`elements()` returns snapshots. Re-query after input, collection changes, or UI
+updates.
 
 ```python
-from automation_bridge import RemoteryClient
-
-with bridge.profiler.remotery(port=17816) as remotery:
-    print(remotery.aggregate_frame(thread="Main")[:5])
-
-with bridge.profiler.remotery(url="ws://127.0.0.1:17816/rmt") as remotery:
-    print(remotery.sample_names)
-
-with RemoteryClient.from_url("ws://127.0.0.1:17816/rmt") as remotery:
-    print(remotery.get_frame(timeout=2.0).duration_ms)
+labels = game.elements(type="labelc", text="L", limit=100)
+restart = game.element(name_exact="restart", enabled=True)
+maybe_popup = game.maybe_element(automation_id="popup")
+parent = game.parent(labels[0])
+total = game.count(type="labelc")
 ```
 
-Capture a window of frames for performance analysis:
+Substring filters are `type`, `name`, `text`, and `url`. Exact filters include
+`type_exact`, `name_exact`, `text_exact`, `url_exact`, `path`, `kind`,
+`instance_id`, `logical_id`, `automation_id`, `localization_key`, and `role`.
+Boolean filters include `visible`, `enabled`, `has_bounds`, and
+`visible_and_enabled`.
+
+`Element` exposes `id`, `snapshot_id`, `instance_id`, `instance_generation`,
+`logical_id`, `created_scene_sequence`, `scene_sequence`, `engine_frame`,
+`name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, semantic metadata,
+visibility, bounds, children, and `raw`.
+
+## Input
+
+Input targets can be elements, element ids, point mappings, `(x, y)` pairs, or raw
+coordinates:
 
 ```python
-capture = bridge.profiler.capture(frames=300, warmup_frames=60, timeout=10.0, thread="Main")
-
-for scope in capture.scopes(sort="self_p95_ms", include_root=False)[:20]:
-    print(scope.path, scope.self.avg_ms, scope.self.median_ms, scope.self.p95_ms, scope.calls_avg)
-
-update = capture.scope("Frame/Update")
-print(update.total.avg_ms, update.total.median_ms, update.total.p99_ms)
+game.click(element)
+game.click(480, 320)
+game.drag(first, second, duration=0.2, easing="ease_in_out")
+game.type_text("Hello")
+game.key("SPACE")
 ```
 
-`capture.scopes()` groups samples by thread and full scope path. It can filter by `name`, exact or wildcard `path`, `thread`, substring `contains`, or regular expression, and exposes total/self timing statistics: count, total, min, max, average, median, p90, p95, and p99. Sort keys include `total_ms`, `self_ms`, `total_avg_ms`, `self_avg_ms`, `total_median_ms`, `self_median_ms`, `total_p90_ms`, `self_p90_ms`, `total_p95_ms`, `self_p95_ms`, `total_p99_ms`, `self_p99_ms`, `max_ms`, `self_max_ms`, `calls`, `calls_avg`, `occurrences`, and `frames`.
+`click()`, `drag()`, and `drag_path()` wait for native release by default.
+`type_text()` and `key()` return after the request is accepted unless a `wait`
+state is supplied. These five helpers accept `wait="accepted"`,
+`wait="started"`, `wait="released"`, or `wait=False` as appropriate.
 
-When the script does not know the frame count in advance, start a background recording, drive gameplay, then stop it when the scenario reaches the point you care about:
+Low-level queue and interruption control lives under `game.input`:
 
 ```python
-recording = bridge.profiler.start_recording(thread="Main")
+with game.input.interruption_scope():
+    receipt = game.click(element, wait=False)
+    game.input.wait(receipt, "released")
+```
+
+For a continuous held pointer:
+
+```python
+with game.pointer((100, 100)) as pointer:
+    pointer.move((200, 150), duration=0.2)
+    pointer.hold(0.1)
+```
+
+The pointer object exposes its configured `lease`, `input_id`, and `closed`
+state. `game.input.status(pointer.input_id)` returns its current native receipt.
+To capture a rendered pressed state, request a frame-relative screenshot while
+the pointer context is still open and choose a lease that comfortably covers
+the capture:
+
+```python
+with game.pointer((100, 100), lease=10) as pointer:
+    pressed = game.screenshot(after_frames=1)
+    assert game.input.status(pointer.input_id).state == "started"
+```
+
+## Synchronization and observation
+
+Use application events and published state instead of sleeps:
+
+```python
+with game.events("now") as events:
+    game.click(button)
+    completed = events.wait("operation.complete", timeout=5)
+
+revision = game.state("ui").revision
+game.click(button)
+state = game.wait_for_state("ui.busy", False, after_revision=revision)
+```
+
+`wait_frames(count)` is useful when rendered-frame evidence is specifically
+required. Its default timeout is `max(5, count / 30)` seconds; an explicit
+`timeout` overrides that calculation. Timeout errors include the initial and
+last observed frame, whether frames advanced, the current lifecycle stage, and
+a best-effort engine health result. Frame waits do not replace semantic state or
+event waits.
+
+Run application commands:
+
+```python
+result = game.command("reset_fixture", {"seed": 42})
+```
+
+Add a timeline marker. `recording_timestamp_us` is optional; when omitted, the
+wrapper records the host monotonic clock in microseconds:
+
+```python
+marker = game.mark("workflow_started", {"fixture": "menu"})
+```
+
+Native input completion and application acknowledgement are distinct. An
+application can call `automation_bridge.acknowledge_input(input_id, result)`
+from Lua; Python waits for that semantic result explicitly:
+
+```python
+with game.events("now") as events:
+    receipt = game.click(button)
+    acknowledgement = game.wait_for_input_acknowledgement(
+        receipt.input_id,
+        events=events,
+    )
+```
+
+Wait for scene evidence:
+
+```python
+element = game.wait_for_element(
+    automation_id="result",
+    after_scene_sequence=previous_sequence,
+)
+stable = game.observe_element(logical_id=element.logical_id, minimum_frames=3)
+gone = game.wait_for_disappearance(element.id)
+```
+
+## Screenshots and visual checks
+
+`screenshot(wait=True)` returns an atomic `ScreenshotReceipt` containing the
+capture path, engine frame, scene sequence, dimensions, and SHA-256. Runtime
+screenshots also accept `resolution_multiplier` from `0.01` through `1.0`:
+
+```python
+shot = game.screenshot(resolution_multiplier=0.5)
+print(shot.path, shot.width, shot.height, shot.sha256)
+```
+
+Screenshot pixels and pointer input both use top-left window orientation.
+Defold's graphics adapters already normalize readback rows to display order, so
+the native capture preserves their order when publishing the PNG and pixel
+coordinates in the receipt correspond to input coordinates. Defold world
+coordinates are a different space: a generic `height - world_y` conversion is
+not reliable with cameras, projections, viewports, scaling, or letterboxing.
+`game.convert_point(...)` converts among the advertised top-left window,
+client, display-pixel, backbuffer, viewport, and normalized-viewport spaces;
+world transforms must be published by the application when needed.
+
+Large black regions are not automatically classified as capture corruption
+because they may be legitimate game content. When a capture looks suspicious,
+retain its receipt and PNG, capture an adjacent frame with
+`screenshot(after_frames=1)`, inspect live scene state, and compare the two with
+`game.visual.difference(...)`. The receipt's frame, scene sequence, dimensions,
+and SHA-256 make the evidence reproducible without silently replacing it.
+
+The engine capture remains available at `shot.raw["source_path"]`; the returned
+receipt points to a bilinear-downscaled PNG with updated dimensions and hash.
+Downscaling requires `wait=True`. Agents should normally start with `0.5` and
+use full resolution only when fine detail matters.
+
+## Runtime logs
+
+Public project and engine connection helpers start a bounded background
+collector against Defold's engine log service as soon as the Automation Bridge
+client is available. Recent output and errors can then be queried without
+depending on the editor console:
+
+```python
+recent = game.logs.tail(100)
+errors = game.logs.tail(100, contains="ERROR:")
+for line in errors:
+    print(line)
+```
+
+The filter is a case-sensitive substring match. Filtering happens before the
+limit is applied, so the second example returns up to 100 matching errors, not
+only errors among the last 100 unfiltered lines. The collector retains the most
+recent 10,000 lines and is stopped by `game.close_engine()`.
+
+Collection begins at the earliest successful bridge connection. Messages
+emitted before the wrapper discovers the engine service port cannot be recovered
+from Defold's forward-only log service; use `project.console` only when those
+earliest build or startup messages are required.
+
+`game.log_stream()` opens Defold's live TCP log stream. Start it before an
+operation when every subsequent line matters; `game.read_logs()` is also
+forward-only:
+
+```python
+with game.log_stream(read_timeout=0.1) as logs:
+    game.click(button)
+    game.wait_for_state("tutorial.phase", "waiting_for_pickup")
+    while line := logs.readline(timeout=0.1):
+        print(line)
+```
+
+`project.console` remains available when the full editor snapshot or structured
+console regions are needed.
+
+Pixel comparisons are explicitly namespaced:
+
+```python
+before = game.screenshot()
+game.click(button)
+changed = game.visual.wait_for_region_change(before, region=(0, 0, 300, 200))
+
+stable = game.visual.wait_for_stable_frame(consecutive_frames=3)
+error = game.visual.difference(before, stable.screenshot)
+```
+
+## Generated gestures
+
+Gesture synthesis has one public entry path:
+
+```python
+gesture = game.gestures.generate_drag(
+    (100, 100),
+    (500, 300),
+    seed=42,
+    duration=(0.7, 0.9),
+    control_points=4,
+)
+game.drag_path(**gesture)
+```
+
+## Metal capture, recording, and traces
+
+On macOS with Defold's Metal adapter, capture complete rendered frames to an
+Apple `.gputrace` document:
+
+```python
+capture = game.metal_capture.start("captures/frame.gputrace", frames=1)
+print(capture.path, capture.frames_captured)
+```
+
+The engine must be launched with `METAL_CAPTURE_ENABLED=1`, and health must
+advertise `metal.capture`. `start()` creates the parent directory, schedules the
+capture, and waits for `complete` by default; pass `wait=False`, inspect
+`status()`, or call `stop()` for explicit lifecycle control. Analyze the result
+with Xcode or, when installed, `gpudebug`.
+
+Video recording is native and namespaced. It records the running Defold
+process's largest on-screen window to H.264 MP4 using ScreenCaptureKit on
+macOS 15+ or Windows Graphics Capture and Media Foundation on Windows 10
+version 1903+:
+
+```python
+capabilities = game.video_recording.capabilities()
+
+with game.video_recording.start("capture.mp4", size=(960, 540), fps=30):
+    game.click(button)
+```
+
+The recorder runs in the game process, automatically selects that process's
+window, crops it to the undecorated game content area, and finalizes the file
+when the context exits. Omitted `audio` uses the platform default: enabled on
+macOS and disabled on Windows. The current Windows backend is video-only and
+rejects `audio=True`. The first macOS capture may trigger Screen Recording
+permission. Check `capabilities().available` before treating recording as an
+optional feature. No FFmpeg installation or external recorder process is used.
+
+Diagnostic traces remain a client-bound context because they intercept client
+operations:
+
+```python
+with game.trace("session.trace.json", screenshots="on_error") as trace:
+    game.click(button)
+    trace.record("checkpoint", {"name": "after click"})
+```
+
+Replay is best effort and cannot restore application state, random seeds,
+timing mode, or external services.
+
+## Profiling
+
+All profiling is presented through `game.profiler`; the underlying stream
+protocol is an implementation detail.
+
+```python
+resources = game.profiler.resources()
+
+capture = game.profiler.capture(frames=120, warmup_frames=10)
+for scope in capture.scopes(contains="Update"):
+    print(scope.path, scope.self.p95_ms)
+
+for counter in capture.counters(contains="Texture"):
+    print(counter.path, counter.values.last)
+```
+
+Record until the automation script decides the interesting interval is over:
+
+```python
+recording = game.profiler.start_recording(warmup_frames=10)
 try:
-    start = bridge.node(name_exact="start", visible_and_enabled=True)
-    bridge.click(start)
-    bridge.drag(item, target)
-    bridge.wait_for_count(1, name_exact="result", timeout=5.0)
+    game.click(button)
 finally:
     capture = recording.stop()
-
-for scope in capture.scopes(contains="update", sort="self_p95_ms")[:10]:
-    print(scope.path, scope.self.avg_ms, scope.self.p95_ms)
 ```
 
-`start_recording()` reads Remotery on a background thread until `recording.stop()` returns a `RemoteryCapture`. Use `recording.snapshot()` to inspect frames collected so far without stopping, and `recording.frame_count`, `recording.property_frame_count`, and `recording.running` for progress checks. Do not call `get_frame()`, `get_properties()`, or `capture()` on the same `RemoteryClient` while a recording is running.
+Advanced profiler-facing type names live in `automation_bridge.profiler`, such
+as `ProfilerCapture`, `ProfilerRecording`, `ProfilerConnection`,
+`ProfilerScopeStats`, and `ProfilerCounterStats`.
 
-Custom scopes and counters must be emitted by the running Defold app before Python can read them. In Lua, wrap same-frame work with `profiler.scope_begin("my_scope")` and `profiler.scope_end()`. In C++ code that includes `<dmsdk/dlib/profile.h>`, use `DM_PROFILE("MyCppScope")` for scopes and `DM_PROPERTY_GROUP(MyMetrics, "...", 0)`, `DM_PROPERTY_U32(MyCounter, 0, PROFILE_PROPERTY_NONE, "...", MyMetrics)`, then `DM_PROPERTY_SET_U32(MyCounter, value)` or `DM_PROPERTY_ADD_U32(MyCounter, delta)` for counters exposed through `capture.counters(...)`.
+## Tests
 
-Remotery property snapshots are exposed as counters:
+Run the wrapper tests with:
 
-```python
-capture = bridge.profiler.capture(frames=120, include_properties=True)
-
-for counter in capture.counters(path="Memory/*", sort="max"):
-    print(counter.path, counter.type, counter.last_value, counter.values.avg, counter.values.p95)
-
-with bridge.profiler.remotery() as remotery:
-    properties = remotery.get_properties(timeout=2.0)
-    for entry in properties.find("Sprite", include_groups=False):
-        print(entry.path, entry.value)
+```sh
+PYTHONPATH=automation_bridge/automation-bridge-python \
+python3 -m unittest tests.test_automation_bridge_api tests.test_tooling
 ```
-
-`capture.counters()` can filter by `name`, exact or wildcard `path`, substring `contains`, or regex. Counter values expose count, total, min, max, average, median, p90, p95, and p99. Sort keys include `avg`, `median`, `p90`, `p95`, `p99`, `min`, `max`, `last`, and `frames`. Remotery group properties are skipped by default; pass `include_groups=True` to include them. Use `capture.counter("Memory/Texture")` when exactly one counter should match. For a single raw `PSNP` snapshot, `properties.entries()` returns all entries and `properties.find("Sprite")` returns matching entries with `path`, `name`, `type`, and `value` convenience fields.
-
-## Errors
-
-All custom errors inherit from `AutomationBridgeError`.
-
-- `HttpError`: transport failures or invalid JSON.
-- `AutomationBridgeApiError`: extension returned `{ "ok": false }`.
-- `SelectorError`: `node()` or `maybe_node()` found the wrong number of nodes.
-- `ProfilerDataError`: a Defold profiler endpoint returned malformed or unexpected binary data.
-- `RemoteryError`: base class for Remotery websocket connection, timeout, and protocol errors.
-- `RemoteryProtocolError`: malformed or unexpected Remotery websocket data.
-- `RemoteryTimeoutError`: Remotery did not produce requested data before timeout.

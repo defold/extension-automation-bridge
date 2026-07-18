@@ -491,9 +491,18 @@ namespace dmAutomationBridge
         if (visualization->m_Drag)
         {
             dmVMath::Vector4 color(1.0f, 0.72f, 0.12f, alpha);
-            DrawDebugLine(render_context, visualization->m_X1, visualization->m_Y1, visualization->m_X2, visualization->m_Y2, color);
-            DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, 6.0f, color);
-            DrawDebugCircle(render_context, visualization->m_X2, visualization->m_Y2, 6.0f, color);
+            for (uint32_t i = 1; i < visualization->m_PointCount; ++i)
+            {
+                DrawDebugLine(render_context,
+                              visualization->m_X[i - 1], visualization->m_Y[i - 1],
+                              visualization->m_X[i], visualization->m_Y[i], color);
+            }
+            if (visualization->m_PointCount > 0)
+            {
+                DrawDebugCircle(render_context, visualization->m_X[0], visualization->m_Y[0], 6.0f, color);
+                uint32_t last = visualization->m_PointCount - 1;
+                DrawDebugCircle(render_context, visualization->m_X[last], visualization->m_Y[last], 6.0f, color);
+            }
             dmRender::RenderListEnd(render_context);
             dmRender::DrawDebug3d(render_context, 0);
             dmRender::ClearRenderObjects(render_context);
@@ -504,7 +513,10 @@ namespace dmAutomationBridge
 
         float radius = 6.0f + 34.0f * t;
         dmVMath::Vector4 color(0.15f, 0.85f, 1.0f, alpha);
-        DrawDebugCircle(render_context, visualization->m_X1, visualization->m_Y1, radius, color);
+        if (visualization->m_PointCount > 0)
+        {
+            DrawDebugCircle(render_context, visualization->m_X[0], visualization->m_Y[0], radius, color);
+        }
         dmRender::RenderListEnd(render_context);
         dmRender::DrawDebug3d(render_context, 0);
         dmRender::ClearRenderObjects(render_context);

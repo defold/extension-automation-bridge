@@ -3,4 +3,9 @@ name: AutomationBridge
 platforms:
   osx:
     context:
-      frameworks: [Foundation, Metal]
+      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "Foundation", "Metal", "ScreenCaptureKit"]
+
+  win32:
+    context:
+      flags: ["-std=c++17"]
+      libs: ["d3d11", "dxgi", "dwmapi", "mf", "mfplat", "mfreadwrite", "mfuuid", "ole32", "runtimeobject", "windowsapp"]

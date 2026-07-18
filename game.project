@@ -12,6 +12,10 @@ high_dpi = 1
 [android]
 input_method = HiddenInputField
 
+[automation_bridge]
+application_api = 1
+event_capacity = 256
+
 [physics]
 gravity_y = -1000.0
 scale = 0.01
@@ -24,7 +28,7 @@ title = extension-automation-bridge
 
 [library]
 include_dirs = automation_bridge
-defold_min_version = 1.12.4
+defold_min_version = 1.13.1
 
 [render]
 clear_color_red = 0.5
