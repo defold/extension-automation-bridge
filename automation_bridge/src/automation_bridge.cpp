@@ -162,7 +162,9 @@ namespace dmAutomationBridge
     static dmExtension::Result AppFinalize(dmExtension::AppParams* params)
     {
         (void)params;
-        UnregisterWebEndpoint();
+        // The engine service outlives engine instances during a reboot. Keep the
+        // handler registered so it retains precedence over the profiler's "/"
+        // catch-all handler. The web server removes it when the process exits.
         StopMetalCapture();
         FinalizeNativeRecording();
         FreeAutomationBridgeContext(&g_AutomationBridge);

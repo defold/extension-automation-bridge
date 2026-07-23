@@ -396,14 +396,21 @@ class EngineClientUnitTest(unittest.TestCase):
             internal.mkdir()
             (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
             (internal / "automation_bridge.engine.identity.json").write_text(
-                '{"port":43210,"engine_instance_id":"engine:old","project_identity":"project:same"}\n',
+                '{"port":43210,"engine_instance_id":"engine:old",'
+                '"project_identity":"project:same","process_id":122}\n',
                 encoding="utf-8",
             )
             editor = EditorApiClient(root, port=12345)
 
             accepted = editor._validate_cached_engine_health(
                 43210,
-                {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
+                {
+                    "identity": {
+                        "engine_instance_id": "engine:new",
+                        "project_identity": "project:same",
+                        "process_id": 123,
+                    }
+                },
                 fresh_build=False,
             )
 
@@ -425,6 +432,32 @@ class EngineClientUnitTest(unittest.TestCase):
                 43210,
                 {"identity": {"engine_instance_id": "engine:new", "project_identity": "project:same"}},
                 fresh_build=True,
+            )
+
+        self.assertTrue(accepted)
+
+    def test_editor_accepts_new_instance_after_same_process_reboot(self):
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:old",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            editor = EditorApiClient(root, port=12345)
+
+            accepted = editor._validate_cached_engine_health(
+                43210,
+                {
+                    "identity": {
+                        "engine_instance_id": "engine:new",
+                        "project_identity": "project:same",
+                        "process_id": 123,
+                    }
+                },
+                fresh_build=False,
             )
 
         self.assertTrue(accepted)
@@ -2278,6 +2311,41 @@ class AutomationBridgeApiTest(unittest.TestCase):
                         print("SCREEN_RESIZE_SKIPPED capability unavailable")
                 self.reset_if_popup_is_visible()
                 self.run_automation_bridge_api_end_to_end()
+
+    def test_editor_reboot_preserves_automation_bridge_endpoint(self):
+        if self.editor is None:
+            raise unittest.SkipTest("Defold editor is required to exercise an in-process reboot")
+
+        self.ensure_running_bridge()
+        port = self.bridge.port
+        before = self.bridge.health()["identity"]
+
+        status, response = self.editor._json_command("build", timeout=20)
+        self.assertEqual(200, status)
+        self.assertTrue(response["success"], response.get("issues"))
+
+        def rebooted_health():
+            health = self.bridge.health()
+            identity = health["identity"]
+            return health if identity["engine_instance_id"] != before["engine_instance_id"] else None
+
+        after = wait_until(
+            rebooted_health,
+            timeout=10,
+            interval=0.05,
+            message="Automation Bridge endpoint did not survive the editor engine reboot",
+            retry_exceptions=(AutomationBridgeError,),
+        )
+        self.assertEqual(port, self.bridge.port)
+        self.assertEqual(before["process_id"], after["identity"]["process_id"])
+        self.assertEqual("initial_scene_ready", after["lifecycle"]["current_stage"])
+
+        self.bridge.logs.close()
+        attached = self.editor.connect_engine(timeout=10)
+        self.bridge = attached
+        self.__class__.bridge = attached
+        self.assertEqual(port, attached.port)
+        self.assertEqual(after["identity"]["engine_instance_id"], attached.health()["identity"]["engine_instance_id"])
 
     def test_drag_item_along_cubic_curve_and_closed_circle(self):
         self.ensure_running_bridge()

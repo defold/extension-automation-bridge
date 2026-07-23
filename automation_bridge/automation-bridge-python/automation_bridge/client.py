@@ -751,6 +751,7 @@ class Client:
                     service_port,
                     identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
                     identity.get("project_identity") if isinstance(identity, Mapping) else None,
+                    identity.get("process_id") if isinstance(identity, Mapping) else None,
                 )
                 editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
                 lifecycle = health.get("lifecycle", {})

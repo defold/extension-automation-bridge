@@ -2793,24 +2793,6 @@ namespace dmAutomationBridge
         }
     }
 
-    void UnregisterWebEndpoint()
-    {
-        if (!g_AutomationBridge.m_WebServer || !g_AutomationBridge.m_WebHandlerRegistered)
-        {
-            g_AutomationBridge.m_WebServer = 0;
-            g_AutomationBridge.m_WebHandlerRegistered = false;
-            return;
-        }
-        dmWebServer::Result result = dmWebServer::RemoveHandler(g_AutomationBridge.m_WebServer, API_PREFIX);
-        if (result != dmWebServer::RESULT_OK && result != dmWebServer::RESULT_HANDLER_NOT_REGISTRED)
-        {
-            dmLogWarning("Unable to remove Automation Bridge endpoint '%s' (%d)", API_PREFIX, result);
-        }
-        g_AutomationBridge.m_WebServer = 0;
-        g_AutomationBridge.m_WebHandlerRegistered = false;
-    }
-
-
 }
 
 #endif

@@ -613,7 +613,6 @@ namespace dmAutomationBridge
     void StopMetalCapture();
 
     void RegisterWebEndpoint(dmExtension::AppParams* params);
-    void UnregisterWebEndpoint();
     void AutomationBridgeHandler(void* user_data, dmWebServer::Request* request);
 }
 

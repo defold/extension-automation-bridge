@@ -804,6 +804,7 @@ class Client:
         port: int,
         engine_instance_id: Optional[str] = None,
         project_identity: Optional[str] = None,
+        process_id: Optional[int] = None,
     ) -> None:
         """Remember a validated port and identity so stale port reuse is detectable."""
         self._engine_service_port = int(port)
@@ -812,6 +813,7 @@ class Client:
             "port": self._engine_service_port,
             "engine_instance_id": engine_instance_id,
             "project_identity": project_identity,
+            "process_id": process_id,
         }
         self._write_cached_engine_identity(self._cached_engine_identity)
 
@@ -819,7 +821,8 @@ class Client:
         """Reject a cached-only port when it now belongs to a different engine/project.
 
         Fresh editor registrations are authoritative and replace the cache. When attaching
-        without a build, an instance mismatch means the operating system reused the port.
+        without a build, accept an instance change only when the process is unchanged,
+        which identifies a normal editor-triggered engine reboot.
         """
         cached = self._cached_engine_identity
         if not isinstance(cached, dict) or cached.get("port") != int(port):
@@ -835,6 +838,10 @@ class Client:
         cached_instance = cached.get("engine_instance_id")
         current_instance = identity.get("engine_instance_id")
         if not fresh_build and cached_instance and current_instance != cached_instance:
+            cached_process = cached.get("process_id")
+            current_process = identity.get("process_id")
+            if cached_process is not None and cached_process == current_process:
+                return True
             self._record_lifecycle("cached_port_rejected", port=port, reason="engine_instance_mismatch")
             return False
         return True
