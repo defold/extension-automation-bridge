@@ -1,0 +1,10 @@
+name: Build with bob
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    uses: defold/github-actions-common/.github/workflows/bob.yml@master
+    with:
+      ignored_platforms: >-
+        [{"platform":"armv7-android"},{"platform":"arm64-android"},{"platform":"wasm-web"},{"platform":"wasm_pthread-web"},{"platform":"arm64-ios"}]
