@@ -986,6 +986,19 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("released", released.state)
         self.assertEqual(2, sum(1 for method, path, _ in bridge.api_requests if method == "GET" and path == "/input/status"))
 
+    def test_input_wait_accepts_polled_receipt_by_id(self):
+        bridge = FakeInputClient(statuses=["accepted"])
+
+        accepted = bridge.input.wait(
+            42,
+            state="accepted",
+            timeout=0.1,
+            interval=0,
+        )
+
+        self.assertEqual("accepted", accepted.state)
+        self.assertEqual(1, sum(1 for method, path, _ in bridge.api_requests if method == "GET" and path == "/input/status"))
+
     def test_input_wait_reports_native_failure(self):
         bridge = FakeInputClient(statuses=["failed"])
 

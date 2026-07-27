@@ -219,7 +219,7 @@ class _TraceClient:
         raise RuntimeError("screenshot unavailable")
 
     def request(self, method, path, *, params=None, json=None):
-        self.posts.append((path, params))
+        self.posts.append((path, params, json))
         return {"accepted": True}
 
 
@@ -254,7 +254,7 @@ class TraceTest(unittest.TestCase):
 
             report = TraceSession.replay(client, path)
             self.assertEqual(1, report["replayed"])
-            self.assertEqual([("/input/drag", {"duration": 0.5})], client.posts)
+            self.assertEqual([("/input/drag", {"duration": 0.5}, None)], client.posts)
             self.assertIn("application_state", report["missing_prerequisites"])
             with self.assertRaises(TraceError):
                 TraceSession.replay(client, path, require_deterministic=True)
@@ -284,10 +284,18 @@ class ClientToolingTest(unittest.TestCase):
                 with client.trace(path, screenshots="never"):
                     client.click((10, 20), wait=0)
             data = json.loads(path.read_text())
-        action = next(item for item in data["timeline"] if item["kind"] == "action")
-        self.assertEqual("/input/click", action["payload"]["path"])
-        self.assertEqual(12, action["input_id"])
-        self.assertEqual(90, action["engine_frame"])
+            action = next(item for item in data["timeline"] if item["kind"] == "action")
+            self.assertEqual("/input/click", action["payload"]["path"])
+            self.assertEqual(12, action["input_id"])
+            self.assertEqual(90, action["engine_frame"])
+
+            replay_client = _TraceClient()
+            report = TraceSession.replay(replay_client, path)
+            self.assertEqual(1, report["replayed"])
+            self.assertEqual("/input/click", replay_client.posts[0][0])
+            self.assertEqual({}, replay_client.posts[0][1])
+            replayed_json = replay_client.posts[0][2]
+            self.assertEqual((10, 20), (replayed_json["x"], replayed_json["y"]))
 
 
 if __name__ == "__main__":

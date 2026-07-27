@@ -8,7 +8,15 @@ annotations, and input acknowledgements.
 
 ## Installation
 
-After Defold has fetched the extension into your project, copy the `automation-bridge-python` directory from the extension into your project. When you update the extension, update the copied Python helper directory at the same time so your automation scripts use the matching API.
+After Defold has fetched the extension into your project, copy the
+`automation-bridge-python` directory from the extension into your project root.
+When you update the extension, update the copied Python helper directory at the
+same time so your automation scripts use the matching API. From the project
+root, add the copied directory to `PYTHONPATH`:
+
+```sh
+PYTHONPATH=automation-bridge-python python3 your_script.py
+```
 
 The HTTP bridge is available only in debug builds. Scene inspection, input,
 screenshots, recording, and timeline markers require no Lua setup. Enable the

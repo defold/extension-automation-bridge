@@ -36,6 +36,8 @@
   `game.gestures`, `game.video_recording`, `game.metal_capture`, `game.profiler`,
   and `game.trace(...)`.
 - Public docstrings are the exact API reference (`help(engine.Client.drag)`). See
-  `README.md` for workflows and examples, and `../README.md` for raw endpoints.
-- Run tests from the repository root with:
+  `README.md` for workflows and examples. The raw endpoint reference is
+  `automation_bridge/README.md` in the extension source repository and is not
+  included when this helper directory is copied into a project.
+- In the extension source checkout, run tests from the repository root with:
   `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling`.

@@ -365,13 +365,16 @@ class InputController:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
-        """Wait for native `started` or `released`; cancellation/failure raises."""
+        """Wait for native `accepted`, `started`, or `released`; cancellation/failure raises."""
         if state not in {"accepted", "started", "released"}:
             raise ValueError("input wait state must be accepted, started, or released")
         receipt = InputReceipt(input_or_id) if isinstance(input_or_id, Mapping) else None
         input_id = int(receipt["input_id"] if receipt is not None else input_or_id)
-        if state == "accepted" and receipt is not None:
-            return receipt
+        if receipt is not None:
+            if receipt.state in {"cancelled", "failed"}:
+                raise InputExecutionError(receipt)
+            if state == "accepted" and receipt.state in {"accepted", "started", "released"}:
+                return receipt
         deadline = time.monotonic() + max(0.0, timeout)
         last = receipt
         try:
@@ -380,6 +383,8 @@ class InputController:
                     last = self.status(input_id)
                 if last.state in {"cancelled", "failed"}:
                     raise InputExecutionError(last)
+                if state == "accepted" and last.state in {"accepted", "started", "released"}:
+                    return last
                 if state == "started" and last.state in {"started", "released"}:
                     return last
                 if state == "released" and last.state == "released":

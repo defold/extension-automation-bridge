@@ -982,7 +982,7 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, ",\"engine_frame\":");
         AppendNumber(&response, (double)g_AutomationBridge.m_Frame);
         StringBufferAppend(&response, "}}\n");
-        RequestSendJson(ctx, observed ? 200 : 202, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static void HandleScene(RequestContext* ctx)
@@ -1355,14 +1355,14 @@ namespace dmAutomationBridge
         return true;
     }
 
-    static void SendReceiptResponse(RequestContext* ctx, const InputReceipt* receipt, uint32_t queue_position, int status_code = 202)
+    static void SendReceiptResponse(RequestContext* ctx, const InputReceipt* receipt, uint32_t queue_position)
     {
         StringBuffer response;
         StringBufferInit(&response);
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
         AppendInputReceiptJson(&response, receipt, queue_position);
         StringBufferAppend(&response, "}\n");
-        RequestSendJson(ctx, status_code, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static bool ValidateDuration(RequestContext* ctx, float value, const char* name)
@@ -1695,7 +1695,7 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 404, "input_not_found", "input receipt was not found or expired from bounded history");
             return;
         }
-        SendReceiptResponse(ctx, receipt, QueuePosition(input_id), 200);
+        SendReceiptResponse(ctx, receipt, QueuePosition(input_id));
     }
 
     static void HandleInputPending(RequestContext* ctx)
@@ -1881,7 +1881,7 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 409, "input_already_finished", "input is already in a terminal state");
             return;
         }
-        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id));
     }
 
     static void HandleInputFlush(RequestContext* ctx)
@@ -1905,7 +1905,7 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, ",\"release\":");
         StringBufferAppend(&response, release ? "true" : "false");
         StringBufferAppend(&response, "}}\n");
-        RequestSendJson(ctx, 202, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static void HandleInputConfigure(RequestContext* ctx)
@@ -2030,7 +2030,7 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 409, "pointer_closed", error);
             return;
         }
-        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id));
     }
 
     static void HandlePointerHold(RequestContext* ctx)
@@ -2047,7 +2047,7 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 409, "pointer_closed", error);
             return;
         }
-        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id));
     }
 
     static void HandlePointerUp(RequestContext* ctx)
@@ -2062,7 +2062,7 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 409, "pointer_closed", error);
             return;
         }
-        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id), 202);
+        SendReceiptResponse(ctx, FindInputReceipt(input_id), QueuePosition(input_id));
     }
 
     static void HandleScreenshot(RequestContext* ctx)
@@ -2415,7 +2415,7 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"command_id\":");
         AppendNumber(&response, (double)command_id);
         StringBufferAppend(&response, ",\"state\":\"pending\"}}\n");
-        RequestSendJson(ctx, 202, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static void HandleCommandStatus(RequestContext* ctx)
@@ -2590,7 +2590,7 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
         AppendMetalCaptureJson(&response);
         StringBufferAppend(&response, "}\n");
-        RequestSendJson(ctx, 202, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static void HandleMetalDelete(RequestContext* ctx)
@@ -2611,7 +2611,7 @@ namespace dmAutomationBridge
         StringBufferAppend(&response, "{\"ok\":true,\"data\":");
         AppendMetalCaptureJson(&response);
         StringBufferAppend(&response, "}\n");
-        RequestSendJson(ctx, 202, &response);
+        RequestSendJson(ctx, 200, &response);
     }
 
     static void SendMethodNotAllowed(RequestContext* ctx, const char* methods)

@@ -5,11 +5,15 @@ Automation Bridge HTTP API.
 
 ## Quick start
 
-When running from this repository, add the wrapper directory to `PYTHONPATH`:
+After copying this directory into a Defold project root, add the copied
+directory to `PYTHONPATH`:
 
 ```sh
-PYTHONPATH=automation_bridge/automation-bridge-python python3 your_script.py
+PYTHONPATH=automation-bridge-python python3 your_script.py
 ```
+
+When working in the extension source checkout instead, use
+`PYTHONPATH=automation_bridge/automation-bridge-python`.
 
 Build, connect, query the scene, and send input:
 
@@ -231,7 +235,10 @@ result = game.request("POST", "/coordinates/convert", json={
 })
 ```
 
-Raw native endpoint documentation is in [`../README.md`](../README.md).
+Raw native endpoint documentation is in
+[`automation_bridge/README.md`](https://github.com/defold/extension-automation-bridge/blob/master/automation_bridge/README.md)
+in the extension source repository. It is not included in the copied Python
+helper directory.
 
 ## Elements and selectors
 
@@ -539,7 +546,9 @@ as `ProfilerCapture`, `ProfilerRecording`, `ProfilerConnection`,
 
 ## Tests
 
-Run the wrapper tests with:
+The test modules are part of the extension source repository and are not
+included in the copied Python helper directory. Extension contributors can run
+them from the extension repository root with:
 
 ```sh
 PYTHONPATH=automation_bridge/automation-bridge-python \

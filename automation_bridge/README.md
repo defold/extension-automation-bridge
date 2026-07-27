@@ -226,7 +226,7 @@ curl -fsS "$BASE/screen" | python3 -m json.tool
 Sets the native Defold window size and returns `requested`, `outcome`,
 `window_matches`, `backbuffer_matches`, all named rectangles, scene sequence,
 and engine frame. Outcomes are `already_correct`, `resized`, or
-`requested_not_observed`. The latter uses HTTP 202 and lets a client poll
+`requested_not_observed`. The latter still uses HTTP 200 and lets a client poll
 `GET /screen` to impose its own timeout.
 
 Query parameters:
@@ -333,7 +333,7 @@ curl -fsS -X POST "$BASE/input/click?id=n:0123456789abcdef"
 curl -fsS -X POST "$BASE/input/click?x=480&y=320&visualize=0"
 ```
 
-Accepted input returns HTTP 202 with this lifecycle receipt in `data`:
+Accepted input returns HTTP 200 with this lifecycle receipt in `data`:
 
 ```json
 {
@@ -513,7 +513,7 @@ automation_bridge.command("my_game.load_fixture", function(data)
 end)
 ```
 
-Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-encoded-json>&timeout_ms=30000`. The `202` response contains a command id. Poll `GET /commands?id=<id>` for `pending`, `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua callbacks run on the engine update thread and cannot be safely preempted; a running cancellation returns `409 command_not_cancellable`.
+Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-encoded-json>&timeout_ms=30000`. The HTTP 200 response contains a command id. Poll `GET /commands?id=<id>` for `pending`, `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua callbacks run on the engine update thread and cannot be safely preempted; a running cancellation returns `409 command_not_cancellable`.
 
 ### Native delivery and application acknowledgement
 
@@ -573,7 +573,7 @@ curl -fsS -X POST --get \
   "$BASE/metal" | python3 -m json.tool
 ```
 
-`POST` returns `202` with state `pending`. Capture starts at the next pre-render callback and stops after the requested number of post-render callbacks. Poll status with:
+`POST` returns HTTP 200 with state `pending`. Capture starts at the next pre-render callback and stops after the requested number of post-render callbacks. Poll status with:
 
 ```sh
 curl -fsS "$BASE/metal" | python3 -m json.tool
