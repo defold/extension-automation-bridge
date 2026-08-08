@@ -5,12 +5,19 @@
   then import `editor` and `engine` from `automation_bridge`.
 - Typical bootstrap:
   `game = editor.open_project(".").build_and_run()`.
+- Reusing an already healthy editor is safe from a sandboxed agent shell. Probe
+  with `editor.open_project(".", start_if_needed=False)` when uncertain.
 - On macOS, a bootstrap that may launch Defold must run with
   escalated/unsandboxed execution. A GUI process inherits the agent command's
   sandbox and otherwise cannot register with WindowServer or LaunchServices.
-  Reusing an already healthy editor is safe without escalation; probe with
-  `editor.open_project(".", start_if_needed=False)` when uncertain, then rerun
-  the normal bootstrap with escalation if no editor is running.
+  After `NotRunningError`, rerun the normal bootstrap with escalation.
+- On Windows, an editor launched as a descendant of a sandboxed agent may abort
+  before writing `.internal/editor.port` because the sandbox blocks the JDK's
+  internal loopback socket. Running a command in another agent shell, or marking
+  only that child command unsandboxed, may still leave it in the restricted
+  process tree. After `NotRunningError`, start Defold outside the agent process
+  tree, for example manually from the Start menu or Explorer, then rerun the
+  probe to reuse it.
 - Treat public docstrings as the exact callable API; for example, use
   `help(engine.Client)` or `help(engine.Client.drag)`. The wrapper overview and
   examples are in `automation_bridge/automation-bridge-python/README.md`.

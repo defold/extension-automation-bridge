@@ -166,12 +166,36 @@ Tests can then use
 `game.element(automation_id="tutorial_target_ghost")` instead of inferring a
 runtime object from size, scale, depth, or changing instance ids.
 
-On macOS, run a bootstrap that may launch Defold outside restricted agent
-sandboxes. A GUI process inherits its Python parent's sandbox and cannot
-register with WindowServer or LaunchServices. The wrapper refuses to launch
-Defold when Codex marks the process as sandboxed and raises `LaunchError` with
-instructions to start Defold manually or rerun with escalated execution. An
-already-running healthy editor can still be reused without escalation.
+## Sandboxed editor launch
+
+An already-running healthy editor can be reused from a sandboxed agent without
+escalation. Probe without starting a new editor when the environment is
+uncertain:
+
+```python
+from automation_bridge import editor
+
+project = editor.open_project(".", start_if_needed=False)
+```
+
+If this raises `NotRunningError`, the required launch procedure differs by
+platform:
+
+- **macOS:** Rerun the normal bootstrap with escalated/unsandboxed execution.
+  Defold inherits the Python parent's sandbox and otherwise cannot register with
+  WindowServer or LaunchServices. The wrapper detects the Codex sandbox marker
+  and raises `LaunchError` instead of starting a known-broken editor process.
+  Neither `start_new_session=True` nor `/usr/bin/open` escapes an inherited
+  sandbox.
+- **Windows:** Start Defold outside the agent's restricted process tree, for
+  example manually from the Start menu or Explorer, then rerun the probe above.
+  A descendant editor may abort during boot when the sandbox blocks the JDK's
+  internal loopback socket. This happens before `.internal/editor.port` is
+  written and may appear to the wrapper as a startup timeout. The editor log in
+  `%LOCALAPPDATA%\Defold\editor2.<date>.log` identifies this case with the
+  message `Unable to establish loopback connection`. Switching agent shells,
+  marking only a descendant command unsandboxed, or using detached child-process
+  flags does not reliably move the editor outside the restricted process tree.
 
 Installation discovery and preview rendering are explicit:
 

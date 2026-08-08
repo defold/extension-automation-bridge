@@ -7,13 +7,23 @@
   helper reuses a healthy project editor or starts the newest discovered Defold
   installation. Use `game.close_engine()` only when the script intentionally
   owns engine cleanup.
+- Reusing a healthy editor does not require escalation. When uncertain, probe
+  with `editor.open_project(".", start_if_needed=False)` before attempting a
+  launch.
 - On macOS, run a bootstrap that may start Defold with escalated/unsandboxed
   execution. Defold inherits a sandbox from its Python parent and will abort
   during AppKit registration when WindowServer and LaunchServices are denied.
-  Reusing a healthy editor does not require escalation. When uncertain, probe
-  with `editor.open_project(".", start_if_needed=False)` and rerun the normal
-  bootstrap with escalation after `NotRunningError`. Do not rely on
-  `start_new_session=True` or `/usr/bin/open` to escape the inherited sandbox.
+  Rerun the normal bootstrap with escalation after `NotRunningError`. Do not
+  rely on `start_new_session=True` or `/usr/bin/open` to escape the inherited
+  sandbox.
+- On Windows, Defold may inherit a process-tree sandbox even when an individual
+  agent command is described as unsandboxed. The JDK can then fail to establish
+  its internal loopback socket during editor boot, and the editor aborts before
+  writing `.internal/editor.port`. Switching between Bash and PowerShell or
+  using detached child-process flags does not reliably escape this restriction.
+  After `NotRunningError`, start Defold outside the agent process tree, for
+  example manually from the Start menu or Explorer, then rerun the probe and
+  reuse the healthy editor.
 - Declare mandatory features with `required_capabilities=[...]` or
   `game.require(...)`; probe optional features with `game.supports(...)`.
 - Prefer named helpers. Use
