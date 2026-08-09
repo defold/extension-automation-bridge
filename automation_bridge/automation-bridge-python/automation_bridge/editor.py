@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence, TYPE_CHECKING, Union
@@ -25,6 +30,11 @@ if TYPE_CHECKING:
 
 
 _AUTOMATION_BRIDGE_ENDPOINT_TEXT = "Automation Bridge endpoint registered"
+_AUTOMATION_BRIDGE_REPOSITORY = "https://github.com/defold/extension-automation-bridge"
+_AUTOMATION_BRIDGE_LATEST_RELEASE_API = "https://api.github.com/repos/defold/extension-automation-bridge/releases/latest"
+_AUTOMATION_BRIDGE_PYTHON_DIRECTORY = "automation-bridge-python"
+_DEPENDENCY_LINE_PATTERN = re.compile(r"^(\s*dependencies#(\d+)\s*=\s*)(.*?)([ \t]*(?:\r\n|\n|\r)?)$")
+_SECTION_PATTERN = re.compile(r"^\s*\[([^]]+)\]\s*(?:\r\n|\n|\r)?$")
 _ENGINE_SERVICE_PORT_PATTERNS = (
     re.compile(r"Engine service started on port (\d+)"),
     re.compile(r"Log server started on port (\d+)"),
@@ -73,6 +83,10 @@ class CommandError(Error):
     """Raised when an editor command is rejected or fails."""
 
 
+class AutomationBridgeUpdateError(Error):
+    """Raised when the project dependency or copied Python wrapper cannot be updated."""
+
+
 class BuildError(CommandError):
     """Raised when a build-and-run command reports compilation issues."""
 
@@ -84,6 +98,219 @@ class BuildError(CommandError):
 def _macos_gui_launch_is_sandboxed() -> bool:
     """Return whether Codex marked this macOS process as Seatbelt-restricted."""
     return sys.platform == "darwin" and bool(os.environ.get("CODEX_SANDBOX"))
+
+
+def _validate_automation_bridge_tag(tag: str) -> tuple[str, str]:
+    if not isinstance(tag, str):
+        raise TypeError("Automation Bridge version must be a string")
+    normalized_tag = tag.strip()
+    normalized_version = normalized_tag[1:] if normalized_tag.startswith("v") else normalized_tag
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", normalized_version):
+        raise ValueError(
+            "Automation Bridge version must be an exact release such as '2.1.0'"
+        )
+    return normalized_version, normalized_tag
+
+
+def _resolve_automation_bridge_release(
+    version: Optional[str],
+    timeout: float,
+) -> tuple[str, str]:
+    if version is not None:
+        return _validate_automation_bridge_tag(version)
+    try:
+        status, release = request_json(
+            _AUTOMATION_BRIDGE_LATEST_RELEASE_API,
+            timeout=min(float(timeout), 30.0),
+        )
+    except (AutomationBridgeError, OSError, TypeError, ValueError) as exc:
+        raise AutomationBridgeUpdateError(
+            f"cannot resolve the latest Automation Bridge release: {exc}"
+        ) from exc
+    if status < 200 or status >= 300:
+        raise AutomationBridgeUpdateError(
+            f"cannot resolve the latest Automation Bridge release: HTTP {status}"
+        )
+    tag = release.get("tag_name") if isinstance(release, Mapping) else None
+    try:
+        return _validate_automation_bridge_tag(tag)
+    except (TypeError, ValueError) as exc:
+        raise AutomationBridgeUpdateError(
+            f"latest Automation Bridge release returned an invalid tag: {tag!r}"
+        ) from exc
+
+
+def _is_automation_bridge_dependency(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and parsed.netloc.lower() == "github.com"
+        and parsed.path.startswith("/defold/extension-automation-bridge/")
+    )
+
+
+def _update_automation_bridge_dependency(text: str, dependency_url: str) -> tuple[str, Optional[str]]:
+    lines = text.splitlines(keepends=True)
+    section: Optional[str] = None
+    project_start: Optional[int] = None
+    project_end = len(lines)
+    dependency_lines = []
+    bridge_lines = []
+
+    for index, line in enumerate(lines):
+        section_match = _SECTION_PATTERN.match(line)
+        if section_match:
+            next_section = section_match.group(1).strip().lower()
+            if section == "project" and next_section != "project":
+                project_end = index
+            section = next_section
+            if section == "project":
+                if project_start is not None:
+                    raise ValueError("game.project contains more than one [project] section")
+                project_start = index
+            continue
+        if section != "project":
+            continue
+        dependency_match = _DEPENDENCY_LINE_PATTERN.match(line)
+        if not dependency_match:
+            continue
+        value = dependency_match.group(3).strip()
+        dependency_lines.append((index, int(dependency_match.group(2))))
+        if _is_automation_bridge_dependency(value):
+            bridge_lines.append((index, dependency_match, value))
+
+    if project_start is None:
+        raise ValueError("game.project has no [project] section")
+    if len(bridge_lines) > 1:
+        raise ValueError("game.project contains multiple Automation Bridge dependencies")
+
+    if bridge_lines:
+        index, match, previous_url = bridge_lines[0]
+        lines[index] = f"{match.group(1)}{dependency_url}{match.group(4)}"
+        return "".join(lines), previous_url
+
+    newline = "\r\n" if "\r\n" in text else "\n"
+    next_number = max((number for _, number in dependency_lines), default=-1) + 1
+    insertion = f"dependencies#{next_number} = {dependency_url}{newline}"
+    insert_at = dependency_lines[-1][0] + 1 if dependency_lines else project_end
+    if insert_at > 0 and lines and not lines[insert_at - 1].endswith(("\n", "\r")):
+        lines[insert_at - 1] += newline
+    lines.insert(insert_at, insertion)
+    return "".join(lines), None
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _automation_bridge_archive_path(project_root: Path, dependency_url: str) -> Path:
+    library_directory = project_root / ".internal" / "lib"
+    url_hash = hashlib.sha1(dependency_url.encode("utf-8")).hexdigest()
+    candidates = [
+        path
+        for path in library_directory.glob(f"{url_hash}-*.zip")
+        if path.is_file()
+    ]
+    if not candidates:
+        plain_archive = library_directory / f"{url_hash}.zip"
+        if plain_archive.is_file():
+            candidates.append(plain_archive)
+    if not candidates:
+        raise AutomationBridgeUpdateError(
+            f"Defold reported the dependency fetched, but its archive is missing from {library_directory}"
+        )
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _replace_python_wrapper(archive_path: Path, destination: Path) -> None:
+    transaction_root = Path(
+        tempfile.mkdtemp(prefix=".automation-bridge-update-", dir=destination.parent)
+    )
+    staged = transaction_root / _AUTOMATION_BRIDGE_PYTHON_DIRECTORY
+    backup = transaction_root / "previous"
+    moved_previous = False
+    installed = False
+    marker = "/automation_bridge/automation-bridge-python/"
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            selected = []
+            for info in archive.infolist():
+                normalized_name = "/" + info.filename.replace("\\", "/").lstrip("/")
+                if marker not in normalized_name:
+                    continue
+                relative_text = normalized_name.split(marker, 1)[1]
+                if not relative_text:
+                    continue
+                relative = Path(relative_text)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise AutomationBridgeUpdateError(
+                        f"unsafe Python wrapper path in {archive_path}: {info.filename}"
+                    )
+                file_type = (info.external_attr >> 16) & 0o170000
+                if file_type == stat.S_IFLNK:
+                    raise AutomationBridgeUpdateError(
+                        f"symbolic links are not allowed in the Python wrapper: {info.filename}"
+                    )
+                selected.append((info, relative))
+
+            required = Path("automation_bridge") / "__init__.py"
+            if not any(relative == required for _, relative in selected):
+                raise AutomationBridgeUpdateError(
+                    f"fetched archive does not contain {_AUTOMATION_BRIDGE_PYTHON_DIRECTORY}: {archive_path}"
+                )
+
+            for info, relative in selected:
+                target = staged / relative
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(info) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                mode = (info.external_attr >> 16) & 0o777
+                if mode:
+                    os.chmod(target, mode)
+
+        if destination.exists():
+            destination.rename(backup)
+            moved_previous = True
+        staged.rename(destination)
+        installed = True
+    except BaseException:
+        if installed and destination.exists():
+            shutil.rmtree(destination)
+            installed = False
+        if moved_previous and backup.exists():
+            backup.rename(destination)
+            moved_previous = False
+        raise
+    finally:
+        shutil.rmtree(transaction_root, ignore_errors=True)
 
 
 class PreviewError(Error):
@@ -144,6 +371,18 @@ class LibraryResult:
 class FetchLibrariesResult:
     success: bool
     libraries: tuple[LibraryResult, ...]
+
+
+@dataclass(frozen=True)
+class AutomationBridgeUpdateResult:
+    version: str
+    dependency_url: str
+    previous_dependency_url: Optional[str]
+    dependency_was_present: bool
+    dependency_changed: bool
+    wrapper_path: Path
+    wrapper_was_present: bool
+    fetch: FetchLibrariesResult
 
 
 @dataclass(frozen=True)
@@ -381,6 +620,97 @@ class Client:
         self.reference = Reference(self)
         self.preview = Preview(self)
         self.preferences = Preferences(self)
+
+    def update_automation_bridge(
+        self,
+        version: Optional[str] = None,
+        *,
+        timeout: float = 60.0,
+    ) -> AutomationBridgeUpdateResult:
+        """Install or update the bridge dependency and copied Python wrapper.
+
+        Omit ``version`` to use GitHub's latest stable release, or provide an
+        exact release to pin the project.
+
+        The complete project-root ``automation-bridge-python`` directory is
+        replaced from the fetched extension archive. Restart Python after this
+        method returns before running automation through the updated wrapper.
+        """
+        normalized_version, release_tag = _resolve_automation_bridge_release(version, timeout)
+        dependency_url = (
+            f"{_AUTOMATION_BRIDGE_REPOSITORY}/archive/refs/tags/"
+            f"{release_tag}.zip"
+        )
+        project_path = self.root / "game.project"
+        try:
+            original_project = project_path.read_bytes()
+            project_text = original_project.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise AutomationBridgeUpdateError(f"cannot read {project_path}: {exc}") from exc
+
+        try:
+            updated_text, previous_url = _update_automation_bridge_dependency(
+                project_text,
+                dependency_url,
+            )
+        except ValueError as exc:
+            raise AutomationBridgeUpdateError(f"cannot update {project_path}: {exc}") from exc
+
+        updated_project = updated_text.encode("utf-8")
+        dependency_changed = updated_project != original_project
+        wrapper_path = self.root / _AUTOMATION_BRIDGE_PYTHON_DIRECTORY
+        wrapper_was_present = wrapper_path.exists()
+        if wrapper_path.is_symlink() or (wrapper_was_present and not wrapper_path.is_dir()):
+            raise AutomationBridgeUpdateError(
+                f"refusing to replace non-directory Python wrapper path: {wrapper_path}"
+            )
+
+        if dependency_changed:
+            _atomic_write_bytes(project_path, updated_project)
+
+        try:
+            fetch = self.commands.fetch_libraries(timeout=timeout)
+            matching_library = next(
+                (library for library in fetch.libraries if library.uri == dependency_url),
+                None,
+            )
+            if matching_library is not None and not matching_library.success:
+                detail = f": {matching_library.message}" if matching_library.message else ""
+                raise AutomationBridgeUpdateError(
+                    f"Defold failed to fetch {dependency_url}{detail}"
+                )
+            if matching_library is None and not fetch.success:
+                raise AutomationBridgeUpdateError(
+                    f"Defold did not report a successful fetch for {dependency_url}"
+                )
+
+            archive_path = _automation_bridge_archive_path(self.root, dependency_url)
+            _replace_python_wrapper(archive_path, wrapper_path)
+        except BaseException as exc:
+            if dependency_changed:
+                try:
+                    _atomic_write_bytes(project_path, original_project)
+                except OSError as rollback_error:
+                    raise AutomationBridgeUpdateError(
+                        f"Automation Bridge update failed and {project_path} could not be restored: "
+                        f"{rollback_error}"
+                    ) from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, AutomationBridgeUpdateError)):
+                raise
+            raise AutomationBridgeUpdateError(
+                f"cannot install Automation Bridge {normalized_version}: {exc}"
+            ) from exc
+
+        return AutomationBridgeUpdateResult(
+            version=normalized_version,
+            dependency_url=dependency_url,
+            previous_dependency_url=previous_url,
+            dependency_was_present=previous_url is not None,
+            dependency_changed=dependency_changed,
+            wrapper_path=wrapper_path,
+            wrapper_was_present=wrapper_was_present,
+            fetch=fetch,
+        )
 
     @classmethod
     def _open_project(
@@ -965,6 +1295,8 @@ def installation_registry_path() -> Path:
 
 
 __all__ = [
+    "AutomationBridgeUpdateError",
+    "AutomationBridgeUpdateResult",
     "BuildError",
     "BuildIssue",
     "Client",

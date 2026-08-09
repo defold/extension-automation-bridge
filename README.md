@@ -18,6 +18,12 @@ root, add the copied directory to `PYTHONPATH`:
 PYTHONPATH=automation-bridge-python python3 your_script.py
 ```
 
+Starting with extension 2.1.0, the copied wrapper provides
+`project.update_automation_bridge()` to select the latest stable release, update
+the dependency, invoke Defold's Fetch Libraries command, and atomically refresh
+the project-root Python wrapper. Pass a version to pin a specific release. Run
+it as a standalone maintenance step and restart Python afterward.
+
 The HTTP bridge is available only in debug builds. Scene inspection, input,
 screenshots, recording, and timeline markers require no Lua setup. Enable the
 application-defined Lua channel separately in `game.project` when a script needs

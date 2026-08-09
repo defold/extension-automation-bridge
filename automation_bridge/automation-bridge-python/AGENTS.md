@@ -1,61 +1,40 @@
 # Python wrapper guidance
 
-- This is the preferred, dependency-free interface for driving a Defold debug
-  build. Add this directory to `PYTHONPATH`, then use the focused package-root
-  namespaces: `from automation_bridge import editor, engine`.
-- Bootstrap with `game = editor.open_project(".").build_and_run()`. The editor
-  helper reuses a healthy project editor or starts the newest discovered Defold
-  installation. Use `game.close_engine()` only when the script intentionally
-  owns engine cleanup.
-- Reusing a healthy editor does not require escalation. When uncertain, probe
-  with `editor.open_project(".", start_if_needed=False)` before attempting a
-  launch.
-- On macOS, run a bootstrap that may start Defold with escalated/unsandboxed
-  execution. Defold inherits a sandbox from its Python parent and will abort
-  during AppKit registration when WindowServer and LaunchServices are denied.
-  Rerun the normal bootstrap with escalation after `NotRunningError`. Do not
-  rely on `start_new_session=True` or `/usr/bin/open` to escape the inherited
-  sandbox.
-- On Windows, Defold may inherit a process-tree sandbox even when an individual
-  agent command is described as unsandboxed. The JDK can then fail to establish
-  its internal loopback socket during editor boot, and the editor aborts before
-  writing `.internal/editor.port`. Switching between Bash and PowerShell or
-  using detached child-process flags does not reliably escape this restriction.
-  After `NotRunningError`, start Defold outside the agent process tree, for
-  example manually from the Start menu or Explorer, then rerun the probe and
-  reuse the healthy editor.
-- Declare mandatory features with `required_capabilities=[...]` or
-  `game.require(...)`; probe optional features with `game.supports(...)`.
-- Prefer named helpers. Use
-  `game.request(method, path, params=..., json=...)` only as the raw native API
-  escape hatch.
-- Selectors support substring, exact, boolean, identity, and pagination filters.
-  `count()` remains complete regardless of page limits. `Element` values are
-  snapshots, so re-query after input or scene changes. Passing an `Element`
-  directly to `click()`, or `Element` objects as both endpoints of `drag()`,
-  sends their logical runtime identities and raises `engine.StaleElementError`
-  if a path now belongs to another instance; this guard does not turn a snapshot
-  into a live locator.
-- A visible component may expose the useful label while its parent game object
-  receives input; use `game.parent(component)` when appropriate. Input targets
-  may be elements, ids, point mappings, `(x, y)` pairs, or raw coordinates.
-- `game.key(...)` accepts case-insensitive letters, digits, function keys, and
-  common names such as `SPACE`, `ESCAPE`, and `ENTER`, with or without `KEY_`.
-  Invalid names fail before input is queued; use `type_text(...)` for literal
-  UTF-8 text, including braces.
-- Prefer events, published state, commands, input acknowledgements, frame waits,
-  `wait_for_element(...)`, `observe_element(...)`, and
-  `wait_for_disappearance(...)` over sleeps.
-- `screenshot(wait=True)` returns an atomic receipt. Start agent inspection with
-  `resolution_multiplier=0.5`; the scaled receipt retains the engine file at
-  `raw["source_path"]`. `project.preview.render(...)` provides the equivalent
-  editor-side render without running the game.
-- Optional diagnostics are intentionally namespaced under `game.visual`,
-  `game.gestures`, `game.video_recording`, `game.metal_capture`, `game.profiler`,
-  and `game.trace(...)`.
-- Public docstrings are the exact API reference (`help(engine.Client.drag)`). See
-  `README.md` for workflows and examples. The raw endpoint reference is
-  `automation_bridge/README.md` in the extension source repository and is not
-  included when this helper directory is copied into a project.
-- In the extension source checkout, run tests from the repository root with:
+- Add this directory to `PYTHONPATH` and use only the package-root namespaces:
+  `from automation_bridge import editor, engine`.
+- Bootstrap with `game = editor.open_project(".").build_and_run()`. Close the
+  engine only when the script owns its lifecycle.
+- For migrations, run `project.update_automation_bridge()`, restart Python, then
+  apply the relevant steps from `MIGRATION.md`. Pass a version only when pinning.
+  Never merge wrapper versions or store project code in the wrapper directory.
+- Probe a running editor with
+  `editor.open_project(".", start_if_needed=False)` before launching one.
+- macOS: a launch must run unsandboxed; an existing editor may be reused.
+  Detached processes and `/usr/bin/open` do not escape the inherited sandbox.
+- Windows: if the sandbox blocks the JDK loopback connection, start Defold
+  manually outside the agent process tree, then reuse it. Changing shells or
+  detaching a child process does not escape the inherited sandbox.
+- Declare required features with `required_capabilities` or `game.require()`;
+  probe optional features with `game.supports()`.
+- Prefer named helpers. Use `game.request(...)` only when no wrapper helper
+  exposes the required native feature.
+- `elements()` is paginated; use `count()` when the complete match count is
+  required.
+- `Element` objects are snapshots. Re-query after state or scene changes. Pass
+  `Element` objects to `click()` and both ends of `drag()` for stale-identity
+  protection; handle `engine.StaleElementError` by re-querying.
+- Use `game.parent(component)` when a visible child exposes the selector but its
+  parent receives input. Use `type_text()` for literal text and `key()` for one
+  validated special key.
+- Prefer events, published state, commands, acknowledgements, frame waits, and
+  element waits over sleeps.
+- Use atomic receipts for screenshots and recordings. Start visual inspection at
+  `resolution_multiplier=0.5`; use `project.preview.render()` for editor-side
+  validation without running the game. Optional diagnostics live under
+  `game.visual`, `game.gestures`, `game.video_recording`, `game.metal_capture`,
+  `game.profiler`, and `game.trace(...)`.
+- Public docstrings are the API reference. See `README.md` for examples and
+  `best_practices.py` for copyable agent patterns. See `MIGRATION.md` for
+  upgrades and `README.md` for detailed workflows.
+- In the extension source checkout, run tests from the repository root:
   `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling`.

@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import zipfile
 import zlib
 from pathlib import Path
 from unittest import mock
@@ -578,6 +579,194 @@ class EngineClientUnitTest(unittest.TestCase):
         with mock.patch("automation_bridge.editor.request_json", return_value=(500, {"success": False})):
             with self.assertRaises(editor.CommandError):
                 project.commands.fetch_libraries()
+
+    def test_editor_updates_existing_automation_bridge_and_replaces_python_wrapper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            project_path.write_text(
+                "[project]\n"
+                "title = Test\n"
+                "dependencies#3 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.0.2.zip\n"
+                "dependencies#7 = https://example.test/other.zip\n"
+                "\n[display]\nwidth = 960\n",
+                encoding="utf-8",
+            )
+            wrapper = root / "automation-bridge-python"
+            wrapper.mkdir()
+            (wrapper / "old.txt").write_text("old", encoding="utf-8")
+            dependency_url = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+            archive = self._write_automation_bridge_archive(root, dependency_url)
+            project = EditorApiClient(root, port=12345)
+            fetched = editor.FetchLibrariesResult(
+                True,
+                (editor.LibraryResult(dependency_url, True),),
+            )
+
+            with mock.patch.object(project.commands, "fetch_libraries", return_value=fetched) as fetch:
+                result = project.update_automation_bridge("2.1.0", timeout=9)
+
+            updated = project_path.read_text(encoding="utf-8")
+            self.assertIn(f"dependencies#3 = {dependency_url}", updated)
+            self.assertIn("dependencies#7 = https://example.test/other.zip", updated)
+            self.assertIn("[display]\nwidth = 960", updated)
+            self.assertFalse((wrapper / "old.txt").exists())
+            self.assertEqual("new", (wrapper / "automation_bridge" / "__init__.py").read_text(encoding="utf-8"))
+            self.assertEqual(archive, max((root / ".internal" / "lib").glob("*.zip")))
+            self.assertTrue(result.dependency_was_present)
+            self.assertTrue(result.dependency_changed)
+            self.assertTrue(result.wrapper_was_present)
+            self.assertEqual("2.1.0", result.version)
+            fetch.assert_called_once_with(timeout=9)
+
+    def test_editor_adds_missing_automation_bridge_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            project_path.write_bytes(
+                b"[project]\r\ntitle = Test\r\ndependencies#2 = https://example.test/other.zip\r\n"
+                b"[display]\r\nwidth = 960\r\n"
+            )
+            dependency_url = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+            self._write_automation_bridge_archive(root, dependency_url)
+            project = EditorApiClient(root, port=12345)
+            fetched = editor.FetchLibrariesResult(
+                True,
+                (editor.LibraryResult(dependency_url, True),),
+            )
+
+            with (
+                mock.patch.object(project.commands, "fetch_libraries", return_value=fetched),
+                mock.patch(
+                    "automation_bridge.editor.request_json",
+                    return_value=(200, {"tag_name": "2.1.0"}),
+                ) as latest,
+            ):
+                result = project.update_automation_bridge()
+
+            updated = project_path.read_bytes()
+            self.assertIn(f"dependencies#3 = {dependency_url}\r\n".encode(), updated)
+            self.assertLess(updated.index(b"dependencies#3"), updated.index(b"[display]"))
+            self.assertFalse(result.dependency_was_present)
+            self.assertFalse(result.wrapper_was_present)
+            self.assertTrue((result.wrapper_path / "automation_bridge" / "__init__.py").is_file())
+            self.assertEqual("2.1.0", result.version)
+            latest.assert_called_once_with(editor._AUTOMATION_BRIDGE_LATEST_RELEASE_API, timeout=30.0)
+
+    def test_editor_automation_bridge_update_rejects_duplicate_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            original = (
+                "[project]\n"
+                "dependencies#0 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.0.1.zip\n"
+                "dependencies#1 = https://github.com/defold/extension-automation-bridge/archive/refs/heads/master.zip\n"
+            )
+            project_path.write_text(original, encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+
+            with mock.patch.object(project.commands, "fetch_libraries") as fetch:
+                with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "multiple"):
+                    project.update_automation_bridge("2.1.0")
+
+            self.assertEqual(original, project_path.read_text(encoding="utf-8"))
+            fetch.assert_not_called()
+
+    def test_editor_automation_bridge_update_rejects_invalid_latest_release_tag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            original = "[project]\ntitle = Test\n"
+            project_path.write_text(original, encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch(
+                    "automation_bridge.editor.request_json",
+                    return_value=(200, {"tag_name": "../../master"}),
+                ),
+                mock.patch.object(project.commands, "fetch_libraries") as fetch,
+            ):
+                with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "invalid tag"):
+                    project.update_automation_bridge()
+
+            self.assertEqual(original, project_path.read_text(encoding="utf-8"))
+            fetch.assert_not_called()
+
+    def test_editor_automation_bridge_update_rolls_back_after_invalid_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            original = (
+                "[project]\n"
+                "dependencies#0 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.0.2.zip\n"
+            )
+            project_path.write_text(original, encoding="utf-8")
+            wrapper = root / "automation-bridge-python"
+            wrapper.mkdir()
+            (wrapper / "keep.txt").write_text("keep", encoding="utf-8")
+            dependency_url = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+            self._write_automation_bridge_archive(root, dependency_url, valid=False)
+            project = EditorApiClient(root, port=12345)
+            fetched = editor.FetchLibrariesResult(
+                True,
+                (editor.LibraryResult(dependency_url, True),),
+            )
+
+            with mock.patch.object(project.commands, "fetch_libraries", return_value=fetched):
+                with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "does not contain"):
+                    project.update_automation_bridge("2.1.0")
+
+            self.assertEqual(original, project_path.read_text(encoding="utf-8"))
+            self.assertEqual("keep", (wrapper / "keep.txt").read_text(encoding="utf-8"))
+
+    def test_editor_automation_bridge_update_rolls_back_after_fetch_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "game.project"
+            original = (
+                "[project]\n"
+                "dependencies#0 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.0.2.zip\n"
+            )
+            project_path.write_text(original, encoding="utf-8")
+            wrapper = root / "automation-bridge-python"
+            wrapper.mkdir()
+            (wrapper / "keep.txt").write_text("keep", encoding="utf-8")
+            dependency_url = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+            project = EditorApiClient(root, port=12345)
+            fetched = editor.FetchLibrariesResult(
+                False,
+                (editor.LibraryResult(dependency_url, False, "release not found"),),
+            )
+
+            with mock.patch.object(project.commands, "fetch_libraries", return_value=fetched):
+                with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "release not found"):
+                    project.update_automation_bridge("2.1.0")
+
+            self.assertEqual(original, project_path.read_text(encoding="utf-8"))
+            self.assertEqual("keep", (wrapper / "keep.txt").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _write_automation_bridge_archive(root, dependency_url, valid=True):
+        library = Path(root) / ".internal" / "lib"
+        library.mkdir(parents=True)
+        url_hash = hashlib.sha1(dependency_url.encode("utf-8")).hexdigest()
+        archive_path = library / f"{url_hash}-payload.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            if valid:
+                archive.writestr(
+                    "extension-automation-bridge-2.1.0/automation_bridge/"
+                    "automation-bridge-python/automation_bridge/__init__.py",
+                    "new",
+                )
+                archive.writestr(
+                    "extension-automation-bridge-2.1.0/automation_bridge/"
+                    "automation-bridge-python/README.md",
+                    "readme",
+                )
+            else:
+                archive.writestr("extension-automation-bridge-2.1.0/README.md", "wrong archive")
+        return archive_path
 
     def test_editor_console_read_and_context_managed_stream(self):
         project = EditorApiClient(".", port=12345)
@@ -1559,6 +1748,25 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("instance:first:g2", drag["expected_from_logical_id"])
         self.assertEqual("instance:second:g4", drag["expected_to_logical_id"])
         self.assertIsNone(drag["expected_scene_sequence"])
+
+    def test_wait_for_element_uses_element_selector_pipeline(self):
+        bridge = EngineClient(1)
+        element = Element({"id": "e:1", "scene_sequence": 4, "name": "Play"})
+
+        with mock.patch.object(
+            bridge,
+            "_select_elements",
+            return_value=([element], {}, "name_exact='Play'"),
+        ) as select:
+            actual = bridge.wait_for_element(
+                name_exact="Play",
+                after_scene_sequence=3,
+                timeout=0.01,
+                interval=0,
+            )
+
+        self.assertIs(element, actual)
+        select.assert_called_once_with({"name_exact": "Play"})
 
     def test_stale_element_response_has_specific_exception_type(self):
         response = b'{"ok":false,"error":{"code":"stale_element","message":"refresh it"}}'

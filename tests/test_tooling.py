@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
+import ast
+import importlib
+import inspect
 import json
 import math
+import re
 import sys
 import tempfile
 import unittest
@@ -9,15 +13,195 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
+PYTHON_WRAPPER_ROOT = ROOT / "automation_bridge" / "automation-bridge-python"
+PYTHON_PACKAGE_ROOT = PYTHON_WRAPPER_ROOT / "automation_bridge"
+sys.path.insert(0, str(PYTHON_WRAPPER_ROOT))
 
-from automation_bridge import engine  # noqa: E402
+import automation_bridge as automation_bridge_package  # noqa: E402
+from automation_bridge import editor, engine  # noqa: E402
 EngineClient = engine.Client
 from automation_bridge.gestures import GestureConstraintError, GestureGenerator  # noqa: E402
 VideoRecordingClient = engine.VideoRecordingClient
 MetalCaptureClient = engine.MetalCaptureClient
 MetalCaptureError = engine.MetalCaptureError
 from automation_bridge.trace import TraceError, TraceSession  # noqa: E402
+
+
+_SNAKE_OR_PROSE_NODE_TERM = re.compile(
+    r"(?i)(?<![A-Za-z0-9])nodes?(?![A-Za-z0-9])"
+)
+_CAMEL_CASE_NODE_TERM = re.compile(
+    r"(?<=[a-z])Nodes?(?=[A-Z0-9]|$)|(?<![A-Za-z0-9])[Nn]odes?(?=[A-Z])"
+)
+
+
+def _non_gui_node_terms(text):
+    """Yield generic node terms, permitting only explicitly GUI-qualified uses."""
+    matches = list(_SNAKE_OR_PROSE_NODE_TERM.finditer(text))
+    matches.extend(_CAMEL_CASE_NODE_TERM.finditer(text))
+    for match in sorted(matches, key=lambda item: (item.start(), item.end())):
+        prefix = text[max(0, match.start() - 16) : match.start()]
+        if re.search(r"(?i)gui(?:[\s_.:/-]*)$", prefix):
+            continue
+        yield match
+
+
+def _public_api_entries():
+    """Yield every supported module export and public member defined by its classes."""
+    seen = set()
+    for module in (editor, engine):
+        for export_name in module.__all__:
+            value = getattr(module, export_name)
+            qualified_name = f"{module.__name__}.{export_name}"
+            if qualified_name not in seen:
+                seen.add(qualified_name)
+                yield qualified_name, value
+            if not inspect.isclass(value):
+                continue
+            for owner in reversed(value.__mro__):
+                if not owner.__module__.startswith("automation_bridge"):
+                    continue
+                for member_name, member in vars(owner).items():
+                    if member_name.startswith("_"):
+                        continue
+                    qualified_member_name = f"{qualified_name}.{member_name}"
+                    if qualified_member_name in seen:
+                        continue
+                    seen.add(qualified_member_name)
+                    yield qualified_member_name, member
+
+
+def _signature_target(value):
+    if isinstance(value, property):
+        return value.fget
+    if isinstance(value, (classmethod, staticmethod)):
+        return value.__func__
+    return value
+
+
+class PythonPublicApiContractTest(unittest.TestCase):
+    def test_terminology_check_rejects_legacy_names_but_allows_gui_terms(self):
+        for text in (
+            "node",
+            "nodes",
+            "_select_nodes",
+            "nodeCount",
+            "waitForNode",
+            "SceneNode",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNotNone(next(_non_gui_node_terms(text), None))
+        for text in ("GUI node", "gui_nodes", "GuiNode", "gui.Node", "scene_gui_node"):
+            with self.subTest(text=text):
+                self.assertIsNone(next(_non_gui_node_terms(text), None))
+
+    def test_every_public_api_uses_element_terminology(self):
+        self.assertEqual(["editor", "engine"], automation_bridge_package.__all__)
+        entries = list(_public_api_entries())
+        names = {name for name, _ in entries}
+        self.assertIn("automation_bridge.engine.Client.wait_for_element", names)
+        self.assertIn("automation_bridge.engine.Element", names)
+        self.assertIn("automation_bridge.editor.Client.update_automation_bridge", names)
+
+        failures = []
+        for qualified_name, value in entries:
+            fragments = [("name", qualified_name)]
+            documentation = inspect.getdoc(value)
+            if documentation:
+                fragments.append(("documentation", documentation))
+            try:
+                signature = inspect.signature(_signature_target(value))
+            except (TypeError, ValueError):
+                pass
+            else:
+                fragments.append(("signature", str(signature)))
+            for source, fragment in fragments:
+                if next(_non_gui_node_terms(fragment), None) is not None:
+                    failures.append(f"{qualified_name} ({source}): {fragment!r}")
+
+        self.assertFalse(
+            failures,
+            "generic node terminology leaked into the public Python API:\n"
+            + "\n".join(failures),
+        )
+
+    def test_python_wrapper_sources_use_element_terminology(self):
+        paths = sorted(PYTHON_PACKAGE_ROOT.rglob("*.py"))
+        paths.append(PYTHON_WRAPPER_ROOT / "best_practices.py")
+        failures = []
+        for path in paths:
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if next(_non_gui_node_terms(line), None) is not None:
+                    failures.append(f"{path.relative_to(ROOT)}:{line_number}: {line.strip()}")
+
+        self.assertFalse(
+            failures,
+            "generic node terminology leaked into the Python wrapper; only explicit "
+            "GUI-node terminology is allowed:\n" + "\n".join(failures),
+        )
+
+    def test_direct_internal_calls_refer_to_declared_members(self):
+        failures = []
+        for path in sorted(PYTHON_PACKAGE_ROOT.rglob("*.py")):
+            relative_module = path.relative_to(PYTHON_WRAPPER_ROOT).with_suffix("")
+            module_parts = [part for part in relative_module.parts if part != "__init__"]
+            module = importlib.import_module(".".join(module_parts))
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for definition in tree.body:
+                if not isinstance(definition, ast.ClassDef):
+                    continue
+                runtime_class = getattr(module, definition.name, None)
+                if not inspect.isclass(runtime_class):
+                    continue
+
+                assigned_attributes = set()
+                for item in ast.walk(definition):
+                    targets = []
+                    if isinstance(item, ast.Assign):
+                        targets = item.targets
+                    elif isinstance(item, (ast.AnnAssign, ast.NamedExpr, ast.AugAssign)):
+                        targets = [item.target]
+                    for target in targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id in {"self", "cls"}
+                        ):
+                            assigned_attributes.add(target.attr)
+
+                for item in ast.walk(definition):
+                    if not (
+                        isinstance(item, ast.Call)
+                        and isinstance(item.func, ast.Attribute)
+                        and isinstance(item.func.value, ast.Name)
+                        and item.func.value.id in {"self", "cls"}
+                    ):
+                        continue
+                    member_name = item.func.attr
+                    if hasattr(runtime_class, member_name) or member_name in assigned_attributes:
+                        continue
+                    failures.append(
+                        f"{path.relative_to(ROOT)}:{item.lineno}: "
+                        f"{definition.name}.{member_name}"
+                    )
+
+        self.assertFalse(
+            failures,
+            "direct self/cls calls refer to undeclared members:\n" + "\n".join(failures),
+        )
+
+
+class BestPracticesReferenceTest(unittest.TestCase):
+    def test_reference_compiles_and_is_linked_from_agent_guidance(self):
+        reference = ROOT / "automation_bridge/automation-bridge-python/best_practices.py"
+        source = reference.read_text(encoding="utf-8")
+        compile(source, str(reference), "exec")
+
+        guidance = (
+            ROOT / "automation_bridge/automation-bridge-python/AGENTS.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("best_practices.py", guidance)
+        self.assertIn("if __name__ == \"__main__\":", source)
 
 
 class GestureGeneratorTest(unittest.TestCase):

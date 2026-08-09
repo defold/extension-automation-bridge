@@ -3,6 +3,49 @@
 Dependency-free Python helpers for driving a Defold debug build through the
 Automation Bridge HTTP API.
 
+When updating an existing script from wrapper 2.x, follow the Python-only
+[migration guide](MIGRATION.md).
+
+Coding agents should start with the syntax-checked, copyable patterns in
+[`best_practices.py`](best_practices.py), then use this README and public
+docstrings for details.
+
+## Install or update Automation Bridge
+
+Once this helper directory is present, use the editor client to install or
+update the matching extension dependency and refresh the complete copied Python
+wrapper:
+
+```python
+from automation_bridge import editor
+
+project = editor.open_project(".")
+result = project.update_automation_bridge()
+print(result.dependency_url)
+print(result.wrapper_path)
+```
+
+With no version argument, the method resolves GitHub's latest stable release.
+Pass an exact version to pin the project instead:
+
+```python
+project.update_automation_bridge("2.1.0")
+```
+
+Run this as a standalone maintenance step, then restart Python before importing
+the updated wrapper for automation. The method:
+
+- detects whether the Automation Bridge dependency is already present;
+- adds it to `[project]` or updates its release URL without rewriting unrelated
+  `game.project` settings;
+- invokes Defold's Fetch Libraries command;
+- validates the fetched extension archive; and
+- atomically replaces the project-root `automation-bridge-python` directory.
+
+The wrapper directory is managed as one unit. Do not store project scripts or
+local customizations inside it. A failed fetch, invalid archive, or failed
+replacement restores the previous dependency and wrapper.
+
 ## Quick start
 
 After copying this directory into a Defold project root, add the copied
@@ -43,6 +86,8 @@ The package root exposes only `editor` and `engine`.
 - Editor operations: `project.commands`, `project.debugger`, `project.console`,
   `project.preferences`, `project.reference`, `project.preview`, and
   `project.build_and_run_html5()`.
+- Project maintenance: `project.update_automation_bridge()` for the latest stable
+  release, or `project.update_automation_bridge(version)` to pin a release.
 - Runtime state: `health()`, `screen()`, `scene(...)`, capabilities, and lifecycle.
 - Elements: `elements(...)`, `element(...)`, `maybe_element(...)`,
   `element_by_id(...)`, `parent(...)`, `count(...)`, compact formatting, and

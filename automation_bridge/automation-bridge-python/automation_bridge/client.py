@@ -1860,7 +1860,7 @@ class Client:
     ) -> Element:
         """Wait for one element, optionally requiring a newer scene sequence."""
         def one_element() -> Optional[Element]:
-            elements, _, _ = self._select_nodes(selector)
+            elements, _, _ = self._select_elements(selector)
             if len(elements) != 1:
                 return None
             element = elements[0]
