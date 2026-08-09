@@ -35,6 +35,7 @@ from automation_bridge.engine import (  # noqa: E402
     ProfilerClient,
     ProfilerDataError,
     ScreenshotReceipt,
+    StaleElementError,
     UnsupportedCapabilityError,
     WaitTimeoutError,
     wait_until,
@@ -187,6 +188,7 @@ class EngineClientUnitTest(unittest.TestCase):
         for removed in ("from_project", "from_editor"):
             self.assertFalse(hasattr(engine, removed))
         self.assertFalse(hasattr(editor, "Extensions"))
+        self.assertIsNone(importlib.util.find_spec("automation_bridge.nodes"))
 
     def test_engine_connect_forwards_the_complete_connection_contract(self):
         sentinel = object()
@@ -298,7 +300,7 @@ class EngineClientUnitTest(unittest.TestCase):
     def test_semantic_element_metadata_is_typed(self):
         element = Element(
             {
-                "id": "n:1",
+                "id": "e:1",
                 "automation_id": "operation_status",
                 "localization_key": "status_ready",
                 "role": "status",
@@ -335,9 +337,9 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_health_rejects_incompatible_native_api_version(self):
         bridge = FakeEngineClient()
-        bridge._api_version = "2"
+        bridge._api_version = "1"
 
-        with self.assertRaisesRegex(IncompatibleApiVersionError, "supported native range is 1..1"):
+        with self.assertRaisesRegex(IncompatibleApiVersionError, "supported native range is 2..2"):
             bridge.health()
 
     def test_bridge_startup_does_not_retry_incompatible_api(self):
@@ -370,8 +372,8 @@ class EngineClientUnitTest(unittest.TestCase):
 
         metadata = bridge.trace_metadata()
 
-        self.assertEqual("2.0.0", metadata["python_package_version"])
-        self.assertEqual("1.1.0", metadata["native_version"])
+        self.assertEqual("3.0.0", metadata["python_package_version"])
+        self.assertEqual("2.0.0", metadata["native_version"])
         self.assertEqual({"runtime.health": 1}, metadata["capability_versions"])
 
     def test_headless_capability_subset_keeps_health_and_lifecycle_usable(self):
@@ -877,7 +879,7 @@ class EngineClientUnitTest(unittest.TestCase):
         )
 
     def test_resize_requires_screen_resize_capability(self):
-        bridge = FakeEngineClient(capabilities=["scene", "nodes"])
+        bridge = FakeEngineClient(capabilities=["scene", "elements"])
 
         with self.assertRaisesRegex(AutomationBridgeError, "screen.resize"):
             bridge.resize(640, 480, wait=0)
@@ -902,7 +904,7 @@ class EngineClientUnitTest(unittest.TestCase):
         parsed = urllib.parse.urlsplit(target)
         payload = json.loads(server.request_body.decode("utf-8"))
         self.assertEqual("POST", method)
-        self.assertEqual("/automation-bridge/v1/input/click", parsed.path)
+        self.assertEqual("/automation-bridge/v2/input/click", parsed.path)
         self.assertEqual(10, payload["x"])
         self.assertEqual(20, payload["y"])
         self.assertFalse(payload["visualize"])
@@ -920,7 +922,7 @@ class EngineClientUnitTest(unittest.TestCase):
         parsed = urllib.parse.urlsplit(target)
         payload = json.loads(server.request_body.decode("utf-8"))
         self.assertEqual("POST", method)
-        self.assertEqual("/automation-bridge/v1/input/drag", parsed.path)
+        self.assertEqual("/automation-bridge/v2/input/drag", parsed.path)
         self.assertEqual(10, payload["x1"])
         self.assertEqual(40, payload["y2"])
         self.assertEqual(0.1, payload["duration"])
@@ -1045,6 +1047,27 @@ class EngineClientUnitTest(unittest.TestCase):
 
         cancel = next(request for request in bridge.api_requests if request[1] == "/input/cancel")
         self.assertTrue(cancel[2]["release"])
+
+    def test_key_normalizes_common_names_and_optional_prefixes(self):
+        bridge = FakeInputClient()
+
+        for key in ("M", "space", "KEY_ESCAPE", "{key_f12}", "7"):
+            bridge.key(key, wait=False)
+
+        self.assertEqual(
+            ["{KEY_M}", "{KEY_SPACE}", "{KEY_ESCAPE}", "{KEY_F12}", "{KEY_7}"],
+            [request[2]["keys"] for request in bridge.api_requests],
+        )
+
+    def test_key_rejects_unknown_names_before_queueing(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(ValueError, "A-Z, 0-9"):
+            bridge.key("COMMAND", wait=False)
+        with self.assertRaises(TypeError):
+            bridge.key(7, wait=False)
+
+        self.assertEqual([], bridge.api_requests)
 
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
@@ -1448,10 +1471,10 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual(100, capture.counter("Memory/Used").last_value)
 
     def test_element_exposes_snapshot_and_generational_identity(self):
-        node = engine.Element(
+        element = engine.Element(
             {
-                "id": "n:1",
-                "snapshot_id": "n:1",
+                "id": "e:1",
+                "snapshot_id": "e:1",
                 "instance_id": "/item",
                 "instance_generation": 9,
                 "logical_id": "instance:1:g9",
@@ -1461,13 +1484,13 @@ class EngineClientUnitTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual("n:1", node.snapshot_id)
-        self.assertEqual("/item", node.instance_id)
-        self.assertEqual(9, node.instance_generation)
-        self.assertEqual("instance:1:g9", node.logical_id)
-        self.assertEqual(4, node.created_scene_sequence)
-        self.assertEqual(12, node.scene_sequence)
-        self.assertEqual(99, node.engine_frame)
+        self.assertEqual("e:1", element.snapshot_id)
+        self.assertEqual("/item", element.instance_id)
+        self.assertEqual(9, element.instance_generation)
+        self.assertEqual("instance:1:g9", element.logical_id)
+        self.assertEqual(4, element.created_scene_sequence)
+        self.assertEqual(12, element.scene_sequence)
+        self.assertEqual(99, element.engine_frame)
 
     def test_exact_selectors_and_count_stay_server_side(self):
         class SelectorClient(EngineClient):
@@ -1478,7 +1501,7 @@ class EngineClientUnitTest(unittest.TestCase):
             def _request(self, method, path, params=None, json_body=None):
                 self.requests.append((path, params))
                 return {
-                    "nodes": [{"id": "n:1", "name": "Play", "enabled": True}],
+                    "elements": [{"id": "e:1", "name": "Play", "enabled": True}],
                     "matched": 1200,
                     "truncated": True,
                     "next_cursor": "10",
@@ -1487,22 +1510,64 @@ class EngineClientUnitTest(unittest.TestCase):
                 }
 
         bridge = SelectorClient()
-        nodes = bridge.elements(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
+        elements = bridge.elements(name_exact="Play", enabled=True, case_sensitive=True, limit=10)
         count = bridge.count(name_exact="Play", enabled=True)
 
-        self.assertEqual(1, len(nodes))
+        self.assertEqual(1, len(elements))
         self.assertEqual(1200, count)
         self.assertEqual("Play", bridge.requests[0][1]["name_exact"])
         self.assertNotIn("name", bridge.requests[0][1])
         self.assertEqual(0, bridge.requests[1][1]["limit"])
+        self.assertEqual(["/elements", "/elements"], [path for path, _ in bridge.requests])
+
+    def test_element_by_id_uses_element_endpoint_and_payload(self):
+        class DetailClient(EngineClient):
+            def __init__(self):
+                super().__init__(1)
+                self.request = None
+
+            def _request(self, method, path, params=None, json_body=None):
+                self.request = (method, path, params)
+                return {"element": {"id": "e:1", "name": "Play"}}
+
+        bridge = DetailClient()
+        element = bridge.element_by_id("e:1")
+
+        self.assertEqual("Play", element.name)
+        self.assertEqual(("GET", "/element"), bridge.request[:2])
 
     def test_click_forwards_expected_scene_sequence(self):
         with FakeHttpServer(b'{"ok":true,"data":{"queued":"click"}}') as server:
             EngineClient(server.port, timeout=1.0).click(
-                "n:1", wait=0, expected_scene_sequence=42
+                "e:1", wait=0, expected_scene_sequence=42
             )
 
         self.assertEqual(42, json.loads(server.request_body)["expected_scene_sequence"])
+
+    def test_element_targeted_input_forwards_stable_runtime_identity(self):
+        bridge = FakeInputClient()
+        first = Element({"id": "e:1", "logical_id": "instance:first:g2", "scene_sequence": 10})
+        second = Element({"id": "e:2", "logical_id": "instance:second:g4", "scene_sequence": 11})
+
+        bridge.click(first, wait=False)
+        bridge.drag(first, second, duration=0.1, wait=False)
+
+        click = bridge.api_requests[0][2]
+        drag = bridge.api_requests[1][2]
+        self.assertEqual("instance:first:g2", click["expected_logical_id"])
+        self.assertIsNone(click["expected_scene_sequence"])
+        self.assertEqual("instance:first:g2", drag["expected_from_logical_id"])
+        self.assertEqual("instance:second:g4", drag["expected_to_logical_id"])
+        self.assertIsNone(drag["expected_scene_sequence"])
+
+    def test_stale_element_response_has_specific_exception_type(self):
+        response = b'{"ok":false,"error":{"code":"stale_element","message":"refresh it"}}'
+        with FakeHttpServer(response, status=409, reason="Conflict") as server:
+            bridge = EngineClient(server.port, timeout=1.0)
+            with self.assertRaises(StaleElementError) as raised:
+                bridge.click("e:1", wait=False)
+
+        self.assertEqual("stale_element", raised.exception.code)
 
     def test_convert_point_uses_json_body(self):
         response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
@@ -1633,7 +1698,7 @@ class EngineClientUnitTest(unittest.TestCase):
             def _request(self, method, path, params=None, json_body=None):
                 if path == "/health":
                     return {
-                        "version": "1",
+                        "version": "2",
                         "capabilities": [],
                         "lifecycle": {"current_stage": "initial_scene_ready"},
                     }
@@ -1661,16 +1726,16 @@ class EngineClientUnitTest(unittest.TestCase):
                 self.frame = 3
 
             def maybe_element(self, **selector):
-                node = engine.Element(
+                element = engine.Element(
                     {
-                        "id": "n:1",
+                        "id": "e:1",
                         "logical_id": "instance:1:g2",
                         "scene_sequence": self.frame,
                         "engine_frame": self.frame,
                     }
                 )
                 self.frame += 1
-                return node
+                return element
 
         receipt = ObservationClient().observe_element(minimum_frames=3, timeout=0.2, interval=0)
 
@@ -1829,9 +1894,9 @@ class FakeEngineClient(EngineClient):
         self.engine_posts = []
         self.api_requests = []
         self._screen = screen or {"window": {"width": 800, "height": 600}}
-        self._capabilities = ["scene", "nodes", "node", "screen.resize"] if capabilities is None else list(capabilities)
+        self._capabilities = ["scene", "elements", "element", "screen.resize"] if capabilities is None else list(capabilities)
         self._engine_info = {"log_port": "0"}
-        self._api_version = "1"
+        self._api_version = "2"
         self._capability_versions_data = {name: "1" for name in self._capabilities}
         self._backend = {"headless": False, "graphics": True, "hid": True}
 
@@ -1841,7 +1906,7 @@ class FakeEngineClient(EngineClient):
         if method == "GET" and path == "/health":
             return {
                 "version": self._api_version,
-                "native_version": "1.1.0",
+                "native_version": "2.0.0",
                 "capabilities": list(self._capabilities),
                 "capability_versions": dict(self._capability_versions_data),
                 "backend": dict(self._backend),
@@ -1912,7 +1977,7 @@ class RebootReadyClient(FakeEngineClient):
         self.health_calls += 1
         if self.health_calls <= self.failures:
             raise AutomationBridgeError("engine is rebooting")
-        return {"version": "1"}
+        return {"version": "2"}
 
 
 def _profiler_string(value):
@@ -2528,20 +2593,20 @@ class AutomationBridgeApiTest(unittest.TestCase):
         before = self.label_count("L1")
         self.bridge.click(spawner)
         wait_until(lambda: self.label_count("L1") > before, timeout=2, message="first spawn did not appear")
-        self.record_sprite_counter(observations, "click spawner node")
+        self.record_sprite_counter(observations, "click spawner element")
 
         before = self.label_count("L1")
         self.bridge.click(spawner.center)
         wait_until(lambda: self.label_count("L1") > before, timeout=2, message="second spawn did not appear")
         self.record_sprite_counter(observations, "click spawner coordinates")
 
-        self.assert_drag_merge_by_node_ids("L1", expected_new_level="L2")
+        self.assert_drag_merge_by_element_ids("L1", expected_new_level="L2")
         self.record_sprite_counter(observations, "drag merge L1 by ids")
 
         before = self.label_count("L1")
         self.bridge.click(spawner)
         wait_until(lambda: self.label_count("L1") > before, timeout=2, message="third spawn did not appear")
-        self.record_sprite_counter(observations, "click spawner node again")
+        self.record_sprite_counter(observations, "click spawner element again")
 
         before = self.label_count("L1")
         self.bridge.click(spawner.center)
@@ -2630,9 +2695,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
     def run_automation_bridge_api_end_to_end(self):
         health = self.bridge.health()
-        self.assertEqual("1", health["version"])
-        self.assertEqual("1.3.0", health["native_version"])
+        self.assertEqual("2", health["version"])
+        self.assertEqual("2.0.0", health["native_version"])
         self.assertIn("scene", health["capabilities"])
+        self.assertIn("elements", health["capabilities"])
+        self.assertIn("element", health["capabilities"])
+        self.assertNotIn("nodes", health["capabilities"])
+        self.assertNotIn("node", health["capabilities"])
         self.assertIn("input.click", health["capabilities"])
         self.assertIn("scene.pagination", health["capabilities"])
         self.assertGreaterEqual(health["engine_frame"], 0)
@@ -2671,6 +2740,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             include=["basic", "bounds", "properties"],
             limit=20,
         )
+        self.assertTrue(spawner.id.startswith("e:"))
         spawner_detail = self.bridge.element_by_id(spawner.id)
         self.assertEqual("/spawner", spawner_detail.name)
         self.assertGreaterEqual(len(spawner_detail.children), 2)
@@ -2682,10 +2752,15 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.bridge.click(spawner, wait=0, expected_scene_sequence=0)
         self.assertEqual("stale_scene", stale.exception.code)
 
+        stale_spawner = Element({**spawner.raw, "logical_id": "instance:stale:g0"})
+        with self.assertRaises(StaleElementError) as stale_identity:
+            self.bridge.click(stale_spawner, wait=0)
+        self.assertEqual("stale_element", stale_identity.exception.code)
+
         self.assert_game_object_bounds_follow_child_component()
-        self.assert_spawned_by_node_click(spawner)
+        self.assert_spawned_by_element_click(spawner)
         self.assert_spawned_by_coordinate_click(spawner)
-        self.assert_drag_merge_by_node_ids("L1", expected_new_level="L2")
+        self.assert_drag_merge_by_element_ids("L1", expected_new_level="L2")
 
         self.bridge.click(spawner)
         self.bridge.click(spawner.center)
@@ -2697,6 +2772,14 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
         special_key = self.bridge.key("KEY_ENTER")
         self.assertEqual("key", special_key["kind"])
+
+        with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
+            self.bridge.request("POST", "/input/key", json={
+                "keys": "{M}",
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("unsupported_key", unsupported_key.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(
@@ -2747,17 +2830,17 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("released", response["state"])
         self.assertEqual("mouse", response["device"])
 
-    def assert_spawned_by_node_click(self, node):
+    def assert_spawned_by_element_click(self, element):
         before = self.label_count("L1")
-        self.bridge.click(node)
+        self.bridge.click(element)
         self.assertGreater(self.label_count("L1"), before)
 
-    def assert_spawned_by_coordinate_click(self, node):
+    def assert_spawned_by_coordinate_click(self, element):
         before = self.label_count("L1")
-        self.bridge.click(node.center)
+        self.bridge.click(element.center)
         self.assertGreater(self.label_count("L1"), before)
 
-    def assert_drag_merge_by_node_ids(self, label, expected_new_level):
+    def assert_drag_merge_by_element_ids(self, label, expected_new_level):
         before = self.label_count(label)
         first, second = self.parents_for_label(label)[:2]
         self.bridge.drag(first, second, duration=0.16)
@@ -2807,8 +2890,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.bridge.click(restart, wait=0.4)
 
     def item_labels(self):
-        nodes = self.bridge.elements(type="labelc", limit=100)
-        return [node.text for node in nodes if node.text != "SPAWN"]
+        elements = self.bridge.elements(type="labelc", limit=100)
+        return [element.text for element in elements if element.text != "SPAWN"]
 
     def label_count(self, label):
         return self.bridge.count(type="labelc", text=label)
@@ -2816,10 +2899,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def parents_for_label(self, label):
         def resolve_parents():
             parents = []
-            nodes = self.bridge.elements(type="labelc", text=label, limit=100)
-            for node in nodes:
+            elements = self.bridge.elements(type="labelc", text=label, limit=100)
+            for element in elements:
                 try:
-                    parents.append(self.bridge.parent(node))
+                    parents.append(self.bridge.parent(element))
                 except AutomationBridgeApiError as exc:
                     if exc.code != "not_found":
                         raise

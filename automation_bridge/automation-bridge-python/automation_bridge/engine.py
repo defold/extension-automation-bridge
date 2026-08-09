@@ -14,10 +14,11 @@ from .client import (
     PointerSession,
     RuntimeLogs,
     SelectorError,
+    StaleElementError,
     UnsupportedCapabilityError,
 )
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
-from .nodes import Bounds, Element
+from .elements import Bounds, Element
 from .profiler import *  # Re-export the focused profiler result and control types.
 from .recording import (
     VideoRecordingCapabilities,

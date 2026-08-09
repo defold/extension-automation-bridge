@@ -22,7 +22,7 @@ namespace dmAutomationBridge
         case dmGameObject::SCENE_NODE_TYPE_SUBCOMPONENT:
             return "subcomponent";
         default:
-            return "node";
+            return "element";
         }
     }
 
@@ -48,7 +48,7 @@ namespace dmAutomationBridge
         {
             return "subcomponent";
         }
-        return "node";
+        return "element";
     }
 
     static void SetAnchorFromPivot(Node* node, const char* pivot)
@@ -519,12 +519,12 @@ namespace dmAutomationBridge
 
         uint64_t id_hash = dmHashBuffer64(node.m_Path, (uint32_t)strlen(node.m_Path));
         char id[32];
-        dmSnPrintf(id, sizeof(id), "n:%016llx", (unsigned long long)id_hash);
+        dmSnPrintf(id, sizeof(id), "e:%016llx", (unsigned long long)id_hash);
         SetString(&node.m_Id, id);
 
         // Collection roots only initialize m_Collection. The remaining union-like
         // SceneNode fields are unspecified, so m_Instance must only be read for
-        // node kinds that Defold documents as carrying an instance.
+        // Scene element kinds that Defold documents as carrying an instance.
         if (scene_node->m_Type != dmGameObject::SCENE_NODE_TYPE_COLLECTION && scene_node->m_Instance)
         {
             dmhash_t instance_identifier = dmGameObject::GetIdentifier(scene_node->m_Instance);

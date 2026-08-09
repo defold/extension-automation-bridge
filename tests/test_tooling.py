@@ -207,7 +207,7 @@ class _TraceClient:
         self.posts = []
 
     def health(self):
-        return {"version": 1, "engine_instance_id": "engine-1", "capabilities": ["scene", "input.drag"]}
+        return {"version": 2, "engine_instance_id": "engine-1", "capabilities": ["scene", "input.drag"]}
 
     def screen(self):
         return {"window": {"width": 800, "height": 600}, "viewport": {"x": 0, "y": 0, "width": 800, "height": 600}}
@@ -274,7 +274,7 @@ class TraceTest(unittest.TestCase):
 class ClientToolingTest(unittest.TestCase):
     def test_active_trace_automatically_records_input_request_and_receipt(self):
         client = EngineClient(1234)
-        client.health = lambda: {"version": 1, "capabilities": ["input.click"]}
+        client.health = lambda: {"version": 2, "capabilities": ["input.click"]}
         client.screen = lambda: {"window": {"width": 100, "height": 100}}
         client.scene = lambda: {"scene_sequence": 4}
         response = {"ok": True, "data": {"input_id": 12, "engine_frame": 90, "state": "accepted"}}

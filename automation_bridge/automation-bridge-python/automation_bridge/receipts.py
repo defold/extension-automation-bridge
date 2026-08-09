@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
-from .nodes import Element
+from .elements import Element
 
 
 @dataclass(frozen=True)

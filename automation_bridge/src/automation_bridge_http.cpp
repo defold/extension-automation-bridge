@@ -661,6 +661,22 @@ namespace dmAutomationBridge
         return true;
     }
 
+    static bool ValidateExpectedLogicalIdentity(RequestContext* ctx, const char* id, const char* parameter)
+    {
+        const char* expected = RequestGetParam(ctx, parameter);
+        if (IsEmpty(expected))
+        {
+            return true;
+        }
+        const Node* node = FindNodeById(id);
+        if (!node || IsEmpty(node->m_LogicalId) || !StringsEqual(expected, node->m_LogicalId))
+        {
+            RequestSendError(ctx, 409, "stale_element", "element id now resolves to a different runtime instance; re-query the element before sending input");
+            return false;
+        }
+        return true;
+    }
+
     static bool HasSceneCapability()
     {
         return g_AutomationBridge.m_Register != 0;
@@ -703,8 +719,8 @@ namespace dmAutomationBridge
         if (HasSceneCapability())
         {
             AppendCapability(&names, &versions, &first, "scene");
-            AppendCapability(&names, &versions, &first, "nodes");
-            AppendCapability(&names, &versions, &first, "node");
+            AppendCapability(&names, &versions, &first, "elements");
+            AppendCapability(&names, &versions, &first, "element");
             AppendCapability(&names, &versions, &first, "scene.pagination");
             AppendCapability(&names, &versions, &first, "scene.identity");
         }
@@ -1154,11 +1170,11 @@ namespace dmAutomationBridge
         StringBufferAppend(response, "]");
     }
 
-    static void HandleNodes(RequestContext* ctx)
+    static void HandleElements(RequestContext* ctx)
     {
         if (!HasSceneCapability())
         {
-            RequestSendError(ctx, 501, "unsupported_capability", "nodes is unavailable because the runtime has no game-object register");
+            RequestSendError(ctx, 501, "unsupported_capability", "elements are unavailable because the runtime has no game-object register");
             return;
         }
         RefreshSnapshotForRequest();
@@ -1181,7 +1197,7 @@ namespace dmAutomationBridge
 
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"nodes\":[");
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"elements\":[");
         for (uint32_t i = 0; i < snapshot->m_Nodes.m_Count; ++i)
         {
             const Node* node = &snapshot->m_Nodes.m_Data[i];
@@ -1256,11 +1272,11 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
-    static void HandleNode(RequestContext* ctx)
+    static void HandleElement(RequestContext* ctx)
     {
         if (!HasSceneCapability())
         {
-            RequestSendError(ctx, 501, "unsupported_capability", "node is unavailable because the runtime has no game-object register");
+            RequestSendError(ctx, 501, "unsupported_capability", "element is unavailable because the runtime has no game-object register");
             return;
         }
         RefreshSnapshotForRequest();
@@ -1268,21 +1284,21 @@ namespace dmAutomationBridge
         const char* id = RequestGetParam(ctx, "id");
         if (IsEmpty(id))
         {
-            RequestSendError(ctx, 400, "bad_request", "missing node id");
+            RequestSendError(ctx, 400, "bad_request", "missing element id");
             return;
         }
 
         const Node* node = FindNodeById(id);
         if (!node)
         {
-            RequestSendError(ctx, 404, "not_found", "node id was not found");
+            RequestSendError(ctx, 404, "not_found", "element id was not found");
             return;
         }
 
         IncludeOptions include = ParseInclude(ctx, true, false);
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"node\":");
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":{\"element\":");
         AppendNodeJson(&response, &g_AutomationBridge.m_Snapshot, node, &include, include.m_Children, false);
         StringBufferAppend(&response, ",\"scene_sequence\":");
         AppendNumber(&response, (double)g_AutomationBridge.m_Snapshot.m_Sequence);
@@ -1498,6 +1514,7 @@ namespace dmAutomationBridge
         const char* id = RequestGetParam(ctx, "id");
         if (!IsEmpty(id))
         {
+            if (!ValidateExpectedLogicalIdentity(ctx, id, "expected_logical_id")) return;
             const char* error = 0;
             if (!GetNodeCenter(id, &x, &y, &error))
             {
@@ -1535,6 +1552,8 @@ namespace dmAutomationBridge
         const char* to_id = RequestGetParam(ctx, "to_id");
         if (!IsEmpty(from_id) && !IsEmpty(to_id))
         {
+            if (!ValidateExpectedLogicalIdentity(ctx, from_id, "expected_from_logical_id") ||
+                !ValidateExpectedLogicalIdentity(ctx, to_id, "expected_to_logical_id")) return;
             const char* error = 0;
             if (!GetNodeCenter(from_id, &x1, &y1, &error) || !GetNodeCenter(to_id, &x2, &y2, &error))
             {
@@ -1648,10 +1667,17 @@ namespace dmAutomationBridge
         RefreshSnapshotForRequest();
         if (!ValidateExpectedScene(ctx)) return;
         const char* value = RequestGetParam(ctx, "keys");
+        bool parse_special_keys = value != 0;
         if (!value) value = RequestGetParam(ctx, "text");
         if (IsEmpty(value) || strlen(value) > MAX_KEY_INPUT_BYTES)
         {
             RequestSendError(ctx, IsEmpty(value) ? 400 : 413, IsEmpty(value) ? "bad_request" : "input_too_large", "provide text/keys no larger than 4096 bytes");
+            return;
+        }
+        const char* key_error = 0;
+        if (parse_special_keys && !ValidateSpecialKeyInput(value, &key_error))
+        {
+            RequestSendError(ctx, 400, "unsupported_key", key_error);
             return;
         }
         const char* client_id = 0;
@@ -1660,7 +1686,8 @@ namespace dmAutomationBridge
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
         InputReceipt* receipt = 0;
-        if (!AddKeyInput(value, client_id, session_id, request_id, g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
+        if (!AddKeyInput(value, parse_special_keys, client_id, session_id, request_id,
+                         g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
@@ -2650,8 +2677,8 @@ namespace dmAutomationBridge
         {"/coordinates/convert", "POST", HandleCoordinateConvert},
         {"/frame", "GET", HandleFrame},
         {"/scene", "GET", HandleScene},
-        {"/nodes", "GET", HandleNodes},
-        {"/node", "GET", HandleNode},
+        {"/elements", "GET", HandleElements},
+        {"/element", "GET", HandleElement},
         {"/input/click", "POST", HandleClick},
         {"/input/drag", "POST", HandleDrag},
         {"/input/drag_path", "POST", HandleDragPath},

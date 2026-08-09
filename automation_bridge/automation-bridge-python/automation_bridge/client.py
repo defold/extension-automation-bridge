@@ -18,7 +18,7 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .nodes import Element
+from .elements import Element
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
@@ -28,9 +28,20 @@ JsonDict = Dict[str, Any]
 Target = Union[Element, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
-PYTHON_PACKAGE_VERSION = "2.0.0"
-SUPPORTED_API_VERSION_MIN = 1
-SUPPORTED_API_VERSION_MAX = 1
+_NAMED_KEYS = {
+    "SPACE", "ESC", "ESCAPE", "UP", "DOWN", "LEFT", "RIGHT", "TAB", "ENTER",
+    "BACKSPACE", "INSERT", "DEL", "DELETE", "PAGEUP", "PAGEDOWN", "HOME", "END",
+    "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT",
+    *(f"F{number}" for number in range(1, 13)),
+}
+_KEY_ERROR = (
+    "key must be A-Z, 0-9, F1-F12, or one of SPACE, ESCAPE, UP, DOWN, LEFT, "
+    "RIGHT, TAB, ENTER, BACKSPACE, INSERT, DELETE, PAGEUP, PAGEDOWN, HOME, END, "
+    "LSHIFT, RSHIFT, LCTRL, RCTRL, LALT, or RALT; an optional KEY_ prefix is accepted"
+)
+PYTHON_PACKAGE_VERSION = "3.0.0"
+SUPPORTED_API_VERSION_MIN = 2
+SUPPORTED_API_VERSION_MAX = 2
 
 
 class AutomationBridgeError(RuntimeError):
@@ -58,6 +69,12 @@ class AutomationBridgeApiError(AutomationBridgeError):
         self.status = status
         self.response = response
         super().__init__(f"Automation Bridge API error {status} {code}: {message}")
+
+
+class StaleElementError(AutomationBridgeApiError):
+    """Raised when an element id now resolves to a different runtime instance."""
+
+    pass
 
 
 class SelectorError(AutomationBridgeError):
@@ -543,8 +560,11 @@ def request_json(
             status = response.getcode()
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
-        status = exc.code
-        body = exc.read().decode("utf-8", "replace")
+        try:
+            status = exc.code
+            body = exc.read().decode("utf-8", "replace")
+        finally:
+            exc.close()
     except urllib.error.URLError as exc:
         raise HttpError(method, url, str(exc)) from exc
     except OSError as exc:
@@ -568,7 +588,10 @@ def request_raw(url: str, method: str = "GET", timeout: float = 10.0) -> Tuple[i
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.getcode(), response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        try:
+            return exc.code, exc.read()
+        finally:
+            exc.close()
     except urllib.error.URLError as exc:
         raise HttpError(method, url, str(exc)) from exc
     except OSError as exc:
@@ -582,7 +605,10 @@ def request_bytes(url: str, data: bytes, method: str = "POST", timeout: float = 
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.getcode(), response.read()
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read()
+        try:
+            return exc.code, exc.read()
+        finally:
+            exc.close()
     except urllib.error.URLError as exc:
         raise HttpError(method, url, str(exc)) from exc
     except OSError as exc:
@@ -644,7 +670,7 @@ def _encode_system_reboot(args: Sequence[str]) -> bytes:
 
 
 class Client:
-    """High-level client for `/automation-bridge/v1` scene inspection and input control."""
+    """High-level client for `/automation-bridge/v2` scene inspection and input control."""
 
     SUPPORTED_API_VERSION_MIN = SUPPORTED_API_VERSION_MIN
     SUPPORTED_API_VERSION_MAX = SUPPORTED_API_VERSION_MAX
@@ -687,7 +713,7 @@ class Client:
         """Create a correlated client for an already-known engine service port."""
         self.port = int(port)
         self.timeout = timeout
-        self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v1"
+        self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v2"
         self._remotery_url = profiler_url
         self._last_window_size: Optional[Tuple[int, int]] = None
         self._last_scene_sequence: Optional[int] = None
@@ -999,12 +1025,12 @@ class Client:
 
     def elements(self, **selector: Any) -> List[Element]:
         """Return one server-filtered page of inspectable scene elements."""
-        elements, _, _ = self._select_nodes(selector)
+        elements, _, _ = self._select_elements(selector)
         return elements
 
     def element(self, **selector: Any) -> Element:
         """Return exactly one matching element or raise `SelectorError`."""
-        elements, metadata, selector_text = self._select_nodes(selector)
+        elements, metadata, selector_text = self._select_elements(selector)
         if len(elements) == 1:
             return elements[0]
         error = SelectorError(self._selector_error("expected exactly one element", selector, selector_text, elements, metadata))
@@ -1013,7 +1039,7 @@ class Client:
 
     def maybe_element(self, **selector: Any) -> Optional[Element]:
         """Return zero or one matching element, raising if multiple elements match."""
-        elements, metadata, selector_text = self._select_nodes(selector)
+        elements, metadata, selector_text = self._select_elements(selector)
         if len(elements) <= 1:
             return elements[0] if elements else None
         error = SelectorError(self._selector_error("expected zero or one element", selector, selector_text, elements, metadata))
@@ -1030,7 +1056,7 @@ class Client:
         normalized_include = _normalize_include(include)
         if normalized_include:
             params["include"] = normalized_include
-        return Element(self._request("GET", "/node", params)["node"])
+        return Element(self._request("GET", "/element", params)["element"])
 
     def parent(
         self,
@@ -1047,7 +1073,7 @@ class Client:
         """Return the complete native match count, independent of page size."""
         self._validate_selector(selector)
         params = self._server_params(selector, limit=0)
-        return int(self._request("GET", "/nodes", params).get("matched", 0))
+        return int(self._request("GET", "/elements", params).get("matched", 0))
 
     def click(
         self,
@@ -1065,6 +1091,8 @@ class Client:
         """Queue one FIFO click and optionally wait for the native release receipt."""
         if isinstance(target, Element):
             params: Dict[str, Any] = {"id": target.id}
+            if target.logical_id:
+                params["expected_logical_id"] = target.logical_id
         elif isinstance(target, str):
             params = {"id": target}
         else:
@@ -1098,12 +1126,16 @@ class Client:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
-        if self._is_node_ref(from_target) and self._is_node_ref(to_target):
+        if self._is_element_ref(from_target) and self._is_element_ref(to_target):
             params: Dict[str, Any] = {
-                "from_id": self._node_id(from_target),
-                "to_id": self._node_id(to_target),
+                "from_id": self._element_id(from_target),
+                "to_id": self._element_id(to_target),
                 "duration": duration,
             }
+            if isinstance(from_target, Element) and from_target.logical_id:
+                params["expected_from_logical_id"] = from_target.logical_id
+            if isinstance(to_target, Element) and to_target.logical_id:
+                params["expected_to_logical_id"] = to_target.logical_id
         else:
             x1, y1 = self._point(from_target)
             x2, y2 = self._point(to_target)
@@ -1247,8 +1279,8 @@ class Client:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
-        """Queue a FIFO special key such as `KEY_ENTER`."""
-        keys = key if key.startswith("{") and key.endswith("}") else f"{{{key}}}"
+        """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``."""
+        keys = f"{{{self._normalize_key(key)}}}"
         params = self._input_params()
         params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
@@ -1941,34 +1973,34 @@ class Client:
         observation: Dict[str, Any] = {}
 
         def sample() -> Optional[ObservationReceipt]:
-            node = self.maybe_element(**selector)
-            if node is None:
+            element = self.maybe_element(**selector)
+            if element is None:
                 observation.clear()
                 return None
-            node_identity = {
-                "logical": node.logical_id or node.snapshot_id,
-                "snapshot": node.snapshot_id,
-                "instance": node.instance_id or node.snapshot_id,
+            element_identity = {
+                "logical": element.logical_id or element.snapshot_id,
+                "snapshot": element.snapshot_id,
+                "instance": element.instance_id or element.snapshot_id,
             }[identity]
-            if observation.get("identity") != node_identity:
+            if observation.get("identity") != element_identity:
                 observation.update(
-                    identity=node_identity,
-                    node=node,
-                    first_frame=node.engine_frame,
-                    last_frame=node.engine_frame,
-                    first_sequence=node.scene_sequence,
-                    last_sequence=node.scene_sequence,
+                    identity=element_identity,
+                    element=element,
+                    first_frame=element.engine_frame,
+                    last_frame=element.engine_frame,
+                    first_sequence=element.scene_sequence,
+                    last_sequence=element.scene_sequence,
                     frames=1,
                 )
-            elif node.engine_frame != observation["last_frame"]:
-                observation["node"] = node
-                observation["last_frame"] = node.engine_frame
-                observation["last_sequence"] = node.scene_sequence
+            elif element.engine_frame != observation["last_frame"]:
+                observation["element"] = element
+                observation["last_frame"] = element.engine_frame
+                observation["last_sequence"] = element.scene_sequence
                 observation["frames"] += 1
             if observation["frames"] < minimum_frames:
                 return None
             return ObservationReceipt(
-                element=observation["node"],
+                element=observation["element"],
                 identity=observation["identity"],
                 first_frame=observation["first_frame"],
                 last_frame=observation["last_frame"],
@@ -1999,11 +2031,11 @@ class Client:
 
         def disappeared() -> Optional[ObservationReceipt]:
             nonlocal last, observed
-            node = self.maybe_element(id=element_id)
-            if node is not None:
-                if last is None or node.engine_frame != last.engine_frame:
+            element = self.maybe_element(id=element_id)
+            if element is not None:
+                if last is None or element.engine_frame != last.engine_frame:
                     observed += 1
-                last = node
+                last = element
                 return None
             current = self._request("GET", "/frame")
             return ObservationReceipt(
@@ -2052,7 +2084,8 @@ class Client:
             message = str(error.get("message", response))
             request_trace.update({"status": status, "error": response})
             self._trace_record("action" if path.startswith("/input/") else "request_error", request_trace)
-            raise AutomationBridgeApiError(code, message, status, response)
+            error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
+            raise error_type(code, message, status, response)
         data = response.get("data", {})
         self._remember_scene_sequence(data)
         request_trace.update({"status": status, "response": data})
@@ -2074,7 +2107,8 @@ class Client:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
-            raise AutomationBridgeApiError(code, message, status, response)
+            error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
+            raise error_type(code, message, status, response)
         data = response.get("data", {})
         self._remember_scene_sequence(data)
         return data
@@ -2126,6 +2160,21 @@ class Client:
             raise ValueError(f"{name} must be finite and between 0 and 60 seconds")
         return result
 
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        if not isinstance(key, str):
+            raise TypeError("key must be a string")
+        name = key.strip().upper()
+        if name.startswith("{") or name.endswith("}"):
+            if not (name.startswith("{") and name.endswith("}")):
+                raise ValueError(_KEY_ERROR)
+            name = name[1:-1]
+        if name.startswith("KEY_"):
+            name = name[4:]
+        if (len(name) == 1 and name in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") or name in _NAMED_KEYS:
+            return f"KEY_{name}"
+        raise ValueError(_KEY_ERROR)
+
     def _trace_record(self, kind: str, payload: Any) -> None:
         for trace in tuple(self._active_traces):
             trace.record(kind, payload)
@@ -2167,15 +2216,15 @@ class Client:
             return {}
         return {key: _encode_param(value) for key, value in params.items() if value is not None}
 
-    def _select_nodes(self, selector: Mapping[str, Any]) -> Tuple[List[Element], JsonDict, str]:
+    def _select_elements(self, selector: Mapping[str, Any]) -> Tuple[List[Element], JsonDict, str]:
         self._validate_selector(selector)
         limit = selector.get("limit", 50)
         params = self._server_params(selector, limit=limit)
-        data = self._request("GET", "/nodes", params)
-        server_nodes = [Element(node) for node in data.get("nodes", []) if isinstance(node, dict)]
-        filtered = [node for node in server_nodes if self._matches_client_filters(node, selector)]
+        data = self._request("GET", "/elements", params)
+        server_elements = [Element(element) for element in data.get("elements", []) if isinstance(element, dict)]
+        filtered = [element for element in server_elements if self._matches_client_filters(element, selector)]
         data = dict(data)
-        data["_nodes"] = server_nodes
+        data["_elements"] = server_elements
         return filtered, data, self._selector_text(selector)
 
     def _server_params(self, selector: Mapping[str, Any], limit: Any) -> Dict[str, Any]:
@@ -2198,21 +2247,21 @@ class Client:
                 params[key] = selector[key]
         return params
 
-    def _matches_client_filters(self, node: Element, selector: Mapping[str, Any]) -> bool:
-        if selector.get("enabled") is not None and node.enabled != bool(selector["enabled"]):
+    def _matches_client_filters(self, element: Element, selector: Mapping[str, Any]) -> bool:
+        if selector.get("enabled") is not None and element.enabled != bool(selector["enabled"]):
             return False
-        if selector.get("kind") is not None and node.kind != selector["kind"]:
+        if selector.get("kind") is not None and element.kind != selector["kind"]:
             return False
-        if selector.get("path") is not None and node.path != selector["path"]:
+        if selector.get("path") is not None and element.path != selector["path"]:
             return False
-        if selector.get("name_exact") is not None and node.name != selector["name_exact"]:
+        if selector.get("name_exact") is not None and element.name != selector["name_exact"]:
             return False
-        if selector.get("text_exact") is not None and node.text != selector["text_exact"]:
+        if selector.get("text_exact") is not None and element.text != selector["text_exact"]:
             return False
-        if selector.get("has_bounds") is not None and (node.bounds is not None) != bool(selector["has_bounds"]):
+        if selector.get("has_bounds") is not None and (element.bounds is not None) != bool(selector["has_bounds"]):
             return False
         visible_and_enabled = selector.get("visible_and_enabled")
-        if visible_and_enabled is not None and (node.visible and node.enabled) != bool(visible_and_enabled):
+        if visible_and_enabled is not None and (element.visible and element.enabled) != bool(visible_and_enabled):
             return False
         return True
 
@@ -2234,15 +2283,15 @@ class Client:
         prefix: str,
         selector: Mapping[str, Any],
         selector_text: str,
-        nodes: Sequence[Element],
+        elements: Sequence[Element],
         metadata: Mapping[str, Any],
     ) -> str:
-        candidates = metadata.get("_nodes", [])
-        shown = nodes if nodes else candidates
-        matched = int(metadata.get("matched", len(nodes)))
+        candidates = metadata.get("_elements", [])
+        shown = elements if elements else candidates
+        matched = int(metadata.get("matched", len(elements)))
         truncated = bool(metadata.get("truncated", False))
         lines = [
-            f"{prefix}; selector: {selector_text}; returned {len(nodes)}; "
+            f"{prefix}; selector: {selector_text}; returned {len(elements)}; "
             f"server matched {matched}; truncated={truncated}; "
             f"scene_sequence={metadata.get('scene_sequence')}; engine_frame={metadata.get('engine_frame')}"
         ]
@@ -2257,10 +2306,10 @@ class Client:
                 f"enabled={excluded.get('enabled', 0)}, bounds={excluded.get('bounds', 0)}"
             )
         if not shown:
-            shown = self._nearest_selector_nodes(selector)
+            shown = self._nearest_selector_elements(selector)
         if shown:
             lines.append("candidates:")
-            lines.extend(f"  {node.compact()}" for node in list(shown)[:10])
+            lines.extend(f"  {element.compact()}" for element in list(shown)[:10])
             requested_values = [
                 str(value)
                 for key, value in (
@@ -2269,7 +2318,7 @@ class Client:
                 )
                 if key in {"name", "name_exact", "text", "text_exact", "path"}
             ]
-            choices = [value for node in shown for value in (node.name, node.text or "", node.path) if value]
+            choices = [value for element in shown for value in (element.name, element.text or "", element.path) if value]
             nearest = []
             for value in requested_values:
                 nearest.extend(difflib.get_close_matches(value.strip("'\""), choices, n=3, cutoff=0.2))
@@ -2279,7 +2328,7 @@ class Client:
             lines.append("suggestion: add name_exact, text_exact, path, logical_id, or instance_id")
         return "\n".join(lines)
 
-    def _nearest_selector_nodes(self, selector: Mapping[str, Any], maximum: int = 5000) -> List[Element]:
+    def _nearest_selector_elements(self, selector: Mapping[str, Any], maximum: int = 5000) -> List[Element]:
         """Fetch bounded complete pages only while formatting a failed direct selector."""
         candidates: List[Element] = []
         cursor: Optional[str] = None
@@ -2287,8 +2336,8 @@ class Client:
             params: Dict[str, Any] = {"limit": min(500, maximum - len(candidates)), "include": "basic"}
             if cursor is not None:
                 params["cursor"] = cursor
-            data = self._request("GET", "/nodes", params)
-            candidates.extend(Element(raw) for raw in data.get("nodes", []) if isinstance(raw, dict))
+            data = self._request("GET", "/elements", params)
+            candidates.extend(Element(raw) for raw in data.get("elements", []) if isinstance(raw, dict))
             cursor = data.get("next_cursor")
             if not cursor:
                 break
@@ -2300,8 +2349,8 @@ class Client:
         if not requested:
             return candidates[:10]
         scored = []
-        for node in candidates:
-            choices = [node.name, node.text or "", node.path]
+        for element in candidates:
+            choices = [element.name, element.text or "", element.path]
             ratios = [
                 difflib.SequenceMatcher(None, expected, choice).ratio()
                 for expected in requested
@@ -2309,16 +2358,16 @@ class Client:
                 if choice
             ]
             score = max(ratios) if ratios else 0.0
-            scored.append((score, node))
+            scored.append((score, element))
         scored.sort(key=lambda item: item[0], reverse=True)
-        return [node for _, node in scored[:10]]
+        return [element for _, element in scored[:10]]
 
     @staticmethod
-    def _is_node_ref(target: Target) -> bool:
+    def _is_element_ref(target: Target) -> bool:
         return isinstance(target, (Element, str))
 
     @staticmethod
-    def _node_id(target: Target) -> str:
+    def _element_id(target: Target) -> str:
         if isinstance(target, Element):
             return target.id
         if isinstance(target, str):
