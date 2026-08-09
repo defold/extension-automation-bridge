@@ -1,7 +1,7 @@
 # Automation Bridge Extension
 
 Debug-only native extension for inspecting and controlling a running Defold game
-from local automation clients such as Codex. It provides scene and node queries,
+from local automation clients such as Codex. It provides scene and element queries,
 FIFO input with receipts, screenshots, optional native desktop video recording,
 and an opt-in Lua channel for application events, state, commands, semantic
 annotations, and input acknowledgements.

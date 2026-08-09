@@ -1,6 +1,6 @@
 """Optional, dependency-free pixel observations layered above scene assertions.
 
-The base client does not use pixels to decide node identity or visibility.
+The base client does not use pixels to decide element identity or visibility.
 This module is imported only by explicit visual waits/assertions.
 """
 

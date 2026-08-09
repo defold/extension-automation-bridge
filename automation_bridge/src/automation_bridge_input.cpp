@@ -12,6 +12,9 @@ namespace dmAutomationBridge
     static const float INPUT_VISUALIZATION_SECONDS = 1.0f;
     static const float DEFAULT_CONTROLLER_LEASE_SECONDS = 5.0f;
 
+    static dmHID::Key KeyFromName(const char* name);
+    static bool ParseSpecialKey(const char* keys, uint32_t index, char* name, uint32_t name_size, uint32_t* next_index);
+
     static const char* NormalizedId(const char* value, const char* fallback)
     {
         return IsEmpty(value) ? fallback : value;
@@ -291,7 +294,8 @@ namespace dmAutomationBridge
         return true;
     }
 
-    bool AddKeyInput(const char* keys, const char* client_id, const char* session_id, const char* request_id,
+    bool AddKeyInput(const char* keys, bool parse_special_keys,
+                     const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt)
     {
         if (IsEmpty(keys) || !CanQueueInputEvent())
@@ -303,6 +307,7 @@ namespace dmAutomationBridge
         event.m_Type = INPUT_EVENT_KEYS;
         event.m_Keys = DuplicateString(keys);
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
+        event.m_ParseSpecialKeys = parse_special_keys;
         if (!event.m_Keys || !InitReceipt(&event.m_Receipt, "key", client_id, session_id, request_id,
                                           scene_sequence, INPUT_DEVICE_AUTO, 0) ||
             !ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
@@ -477,12 +482,12 @@ namespace dmAutomationBridge
         const Node* node = FindNodeById(id);
         if (!node)
         {
-            *error = "node id was not found";
+            *error = "element id was not found";
             return false;
         }
         if (!node->m_Bounds.m_Valid)
         {
-            *error = "node has no screen bounds";
+            *error = "element has no screen bounds";
             return false;
         }
         *x = node->m_Bounds.m_CX;
@@ -529,6 +534,39 @@ namespace dmAutomationBridge
         memcpy(name, start, length);
         name[length] = 0;
         *next_index = (uint32_t)(end - keys) + 1;
+        return true;
+    }
+
+    bool ValidateSpecialKeyInput(const char* keys, const char** error)
+    {
+        if (IsEmpty(keys))
+        {
+            *error = "special key input is empty";
+            return false;
+        }
+        uint32_t index = 0;
+        uint32_t length = (uint32_t)strlen(keys);
+        while (index < length)
+        {
+            if (keys[index] != '{')
+            {
+                ++index;
+                continue;
+            }
+            char name[64];
+            uint32_t next_index = index;
+            if (!ParseSpecialKey(keys, index, name, sizeof(name), &next_index))
+            {
+                *error = "special keys must use balanced braces, for example {KEY_ENTER}";
+                return false;
+            }
+            if (KeyFromName(name) == dmHID::MAX_KEY_COUNT)
+            {
+                *error = "unsupported special key; accepted names include KEY_A-KEY_Z, KEY_0-KEY_9, KEY_F1-KEY_F12, KEY_SPACE, KEY_ESCAPE, arrows, modifiers, and navigation keys";
+                return false;
+            }
+            index = next_index;
+        }
         return true;
     }
 
@@ -736,7 +774,7 @@ namespace dmAutomationBridge
         }
         char key_name[64];
         uint32_t next_index = event->m_KeyIndex;
-        if (ParseSpecialKey(event->m_Keys, event->m_KeyIndex, key_name, sizeof(key_name), &next_index))
+        if (event->m_ParseSpecialKeys && ParseSpecialKey(event->m_Keys, event->m_KeyIndex, key_name, sizeof(key_name), &next_index))
         {
             dmHID::Key key = KeyFromName(key_name);
             event->m_KeyIndex = next_index;

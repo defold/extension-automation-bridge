@@ -288,6 +288,12 @@ Boolean filters include `visible`, `enabled`, `has_bounds`, and
 `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, semantic metadata,
 visibility, bounds, children, and `raw`.
 
+When an `Element` is passed directly to `click()`, or `Element` objects are passed
+as both endpoints of `drag()`, the wrapper also sends their logical runtime
+identities. If a path-derived element id has since been reused by another
+instance, input fails with `engine.StaleElementError`; re-query the selector and
+retry deliberately.
+
 ## Input
 
 Input targets can be elements, element ids, point mappings, `(x, y)` pairs, or raw
@@ -300,6 +306,11 @@ game.drag(first, second, duration=0.2, easing="ease_in_out")
 game.type_text("Hello")
 game.key("SPACE")
 ```
+
+`key()` accepts case-insensitive letters, digits, function keys, and common names
+such as `SPACE`, `ESCAPE`, and `ENTER`, with or without the `KEY_` prefix. Unknown
+names are rejected before input is queued. `type_text()` always treats braces and
+other characters as literal UTF-8 text.
 
 `click()`, `drag()`, and `drag_path()` wait for native release by default.
 `type_text()` and `key()` return after the request is accepted unless a `wait`

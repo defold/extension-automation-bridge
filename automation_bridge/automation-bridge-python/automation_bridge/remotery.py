@@ -196,7 +196,7 @@ class RemoteryCounterStats:
 
 @dataclass(frozen=True)
 class RemoterySample:
-    """One node in a profiler sample tree."""
+    """One entry in a profiler sample call tree."""
 
     name_hash: int
     name: Optional[str]

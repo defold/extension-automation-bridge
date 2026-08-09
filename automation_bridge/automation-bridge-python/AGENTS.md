@@ -31,10 +31,18 @@
   escape hatch.
 - Selectors support substring, exact, boolean, identity, and pagination filters.
   `count()` remains complete regardless of page limits. `Element` values are
-  snapshots, so re-query after input or scene changes.
+  snapshots, so re-query after input or scene changes. Passing an `Element`
+  directly to `click()`, or `Element` objects as both endpoints of `drag()`,
+  sends their logical runtime identities and raises `engine.StaleElementError`
+  if a path now belongs to another instance; this guard does not turn a snapshot
+  into a live locator.
 - A visible component may expose the useful label while its parent game object
   receives input; use `game.parent(component)` when appropriate. Input targets
   may be elements, ids, point mappings, `(x, y)` pairs, or raw coordinates.
+- `game.key(...)` accepts case-insensitive letters, digits, function keys, and
+  common names such as `SPACE`, `ESCAPE`, and `ENTER`, with or without `KEY_`.
+  Invalid names fail before input is queued; use `type_text(...)` for literal
+  UTF-8 text, including braces.
 - Prefer events, published state, commands, input acknowledgements, frame waits,
   `wait_for_element(...)`, `observe_element(...)`, and
   `wait_for_disappearance(...)` over sleeps.

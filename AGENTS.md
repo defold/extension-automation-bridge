@@ -21,6 +21,11 @@
 - Treat public docstrings as the exact callable API; for example, use
   `help(engine.Client)` or `help(engine.Client.drag)`. The wrapper overview and
   examples are in `automation_bridge/automation-bridge-python/README.md`.
+- `game.key(...)` accepts normalized names such as `M`, `SPACE`, and
+  `KEY_ENTER`; invalid names fail before queueing. Passing an `Element` directly
+  to `click()`, or `Element` objects as both endpoints of `drag()`, adds a stable
+  runtime-identity guard. Elements remain snapshots and should be re-queried
+  after state or scene changes.
 - Wrapper-specific agent guidance is in
   `automation_bridge/automation-bridge-python/AGENTS.md`.
 - Use the native HTTP API only for endpoint work, curl-level debugging, or a

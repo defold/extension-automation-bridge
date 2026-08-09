@@ -16,9 +16,9 @@
 
 namespace dmAutomationBridge
 {
-    static const char* API_PREFIX = "/automation-bridge/v1";
-    static const char* API_VERSION = "1";
-    static const char* NATIVE_VERSION = "1.3.0";
+    static const char* API_PREFIX = "/automation-bridge/v2";
+    static const char* API_VERSION = "2";
+    static const char* NATIVE_VERSION = "2.0.0";
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_INPUT_HISTORY = 256;
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;
@@ -251,6 +251,7 @@ namespace dmAutomationBridge
         char*      m_Keys;
         uint32_t   m_KeyIndex;
         dmHID::Key m_ActiveKey;
+        bool       m_ParseSpecialKeys;
     };
 
     struct InputVisualization
@@ -569,7 +570,9 @@ namespace dmAutomationBridge
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt);
-    bool AddKeyInput(const char* keys, const char* client_id, const char* session_id, const char* request_id,
+    bool ValidateSpecialKeyInput(const char* keys, const char** error);
+    bool AddKeyInput(const char* keys, bool parse_special_keys,
+                     const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt);
     bool AppendPointerMove(uint64_t input_id, const InputPoint* point, float lease, const char** error);
     bool AppendPointerHold(uint64_t input_id, float duration, float lease, const char** error);
