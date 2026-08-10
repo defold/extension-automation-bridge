@@ -607,7 +607,7 @@ class Client:
                 raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
             port = int(port_path.read_text(encoding="utf-8").strip())
         self.port = int(port)
-        self.base_url = f"http://localhost:{self.port}"
+        self.base_url = f"http://127.0.0.1:{self.port}"
         self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
         self._cached_engine_identity = self._read_cached_engine_identity()
         self._remotery_url: Optional[str] = self._read_cached_remotery_url()
@@ -1046,33 +1046,55 @@ class Client:
         ports = self._engine_service_ports()
         return ports[0] if ports else None
 
-    def _engine_service_ports(self) -> list:
+    def _cached_engine_service_port_value(self) -> Optional[int]:
+        """Return a cached port only when it has enough identity data for validation."""
+        port = self._engine_service_port
+        cached = self._cached_engine_identity
+        if port is None or port <= 0 or not isinstance(cached, dict):
+            return None
+        if cached.get("port") != port:
+            return None
+        for key in ("engine_instance_id", "project_identity"):
+            value = cached.get(key)
+            if not isinstance(value, str) or not value:
+                return None
+        return port
+
+    def _engine_service_ports(self, lines: Optional[list] = None) -> list:
         """Return candidate engine service ports from current logs, then the cached port."""
-        candidates = self._current_registration_engine_service_ports()
+        candidates = self._current_registration_engine_service_ports(lines)
 
         if self._engine_service_port is not None:
             self._append_port_candidate(candidates, self._engine_service_port)
         return candidates
 
-    def _current_registration_engine_service_ports(self) -> list:
+    def _current_registration_engine_service_ports(self, lines: Optional[list] = None) -> list:
         """Return ports logged before the latest Automation Bridge endpoint registration only."""
-        return self._latest_registration_engine_service_ports(self._console_lines())
+        if lines is None:
+            lines = self._console_lines()
+        return self._latest_registration_engine_service_ports(lines)
 
-    def _remotery_url_value(self) -> Optional[str]:
+    def _cached_remotery_url_value(self) -> Optional[str]:
+        """Return the cached Remotery URL without reading the editor console."""
+        return self._remotery_url
+
+    def _remotery_url_value(self, lines: Optional[list] = None) -> Optional[str]:
         """Return the Remotery websocket URL from current logs, then the cached URL."""
-        urls = self._remotery_urls()
+        urls = self._remotery_urls(lines)
         return urls[0] if urls else None
 
-    def _remotery_urls(self) -> list:
+    def _remotery_urls(self, lines: Optional[list] = None) -> list:
         """Return candidate Remotery websocket URLs from current logs, then the cached URL."""
-        candidates = self._current_registration_remotery_urls()
+        candidates = self._current_registration_remotery_urls(lines)
         if self._remotery_url is not None:
             self._append_unique_candidate(candidates, self._remotery_url)
         return candidates
 
-    def _current_registration_remotery_urls(self) -> list:
+    def _current_registration_remotery_urls(self, lines: Optional[list] = None) -> list:
         """Return Remotery websocket URLs logged before the latest endpoint registration only."""
-        return self._latest_registration_remotery_urls(self._console_lines())
+        if lines is None:
+            lines = self._console_lines()
+        return self._latest_registration_remotery_urls(lines)
 
     @classmethod
     def _latest_registration_engine_service_ports(cls, lines: list) -> list:
@@ -1173,6 +1195,23 @@ class Client:
             if cached_process is not None and cached_process == current_process:
                 return True
             self._record_lifecycle("cached_port_rejected", port=port, reason="engine_instance_mismatch")
+            return False
+        return True
+
+    def _cached_engine_health_matches(self, port: int, health: dict) -> bool:
+        """Return whether health describes the exact engine identity stored for this port."""
+        cached = self._cached_engine_identity
+        identity = health.get("identity", {}) if isinstance(health, dict) else {}
+        if not isinstance(cached, dict) or not isinstance(identity, dict):
+            return False
+        if cached.get("port") != int(port):
+            return False
+        for key in ("engine_instance_id", "project_identity"):
+            cached_value = cached.get(key)
+            if not cached_value or identity.get(key) != cached_value:
+                return False
+        cached_process = cached.get("process_id")
+        if cached_process is not None and identity.get("process_id") != cached_process:
             return False
         return True
 
