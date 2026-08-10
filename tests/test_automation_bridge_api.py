@@ -465,6 +465,238 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertTrue(accepted)
 
+    def test_editor_connection_uses_validated_cache_without_reading_console(self):
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:cached",
+                "project_identity": "project:same",
+                "process_id": 123,
+            },
+            "lifecycle": {"current_stage": "initial_scene_ready"},
+        }
+        health_ports = []
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", side_effect=AssertionError("console read")) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(43210, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17815/rmt", bridge._remotery_url)
+        self.assertEqual([43210], health_ports)
+        console_read.assert_not_called()
+        self.assertEqual(
+            ["bridge_healthy", "initial_scene_ready"],
+            [event["stage"] for event in project.lifecycle_events],
+        )
+
+    def test_editor_connection_reads_console_once_after_cached_identity_rejection(self):
+        health_ports = []
+        health_by_port = {
+            43210: {
+                "identity": {
+                    "engine_instance_id": "engine:other",
+                    "project_identity": "project:other",
+                    "process_id": 999,
+                }
+            },
+            54321: {
+                "identity": {
+                    "engine_instance_id": "engine:current",
+                    "project_identity": "project:same",
+                    "process_id": 456,
+                }
+            },
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            health = health_by_port[bridge.port]
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:17816/rmt)",
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", bridge._remotery_url)
+        self.assertEqual([43210, 54321], health_ports)
+        console_read.assert_called_once_with()
+        self.assertEqual("cached_port_rejected", project.lifecycle_events[0]["stage"])
+
+    def test_editor_connection_reads_console_once_when_cached_port_is_unreachable(self):
+        health_ports = []
+        current_health = {
+            "identity": {
+                "engine_instance_id": "engine:current",
+                "project_identity": "project:same",
+                "process_id": 456,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            if bridge.port == 43210:
+                raise AutomationBridgeError("cached endpoint is unavailable")
+            bridge._last_health = current_health
+            return current_health
+
+        lines = [
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual([43210, 54321], health_ports)
+        console_read.assert_called_once_with()
+
+    def test_editor_connection_refreshes_same_process_reboot_from_one_console_read(self):
+        health_ports = []
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:rebooted",
+                "project_identity": "project:same",
+                "process_id": 123,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:17816/rmt)",
+            "INFO:ENGINE: Engine service started on port 43210",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(43210, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", bridge._remotery_url)
+        self.assertEqual([43210, 43210], health_ports)
+        console_read.assert_called_once_with()
+        self.assertEqual("engine:rebooted", project._cached_engine_identity["engine_instance_id"])
+
+    def test_editor_connection_skips_fast_path_when_cached_identity_is_missing(self):
+        health_ports = []
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:current",
+                "project_identity": "project:same",
+                "process_id": 456,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual([54321], health_ports)
+        console_read.assert_called_once_with()
+
     def test_editor_installations_returns_newest_valid_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -507,6 +739,7 @@ class EngineClientUnitTest(unittest.TestCase):
         project = EditorApiClient(".", port=12345)
         project._openapi_document = EDITOR_OPENAPI
 
+        self.assertEqual("http://127.0.0.1:12345", project.base_url)
         self.assertFalse(hasattr(project, "extensions"))
         self.assertFalse(hasattr(project, "window"))
         self.assertFalse(hasattr(project, "help"))
@@ -786,7 +1019,7 @@ class EngineClientUnitTest(unittest.TestCase):
             with project.console.stream(connect_timeout=3, read_timeout=1.5) as stream:
                 self.assertEqual("streamed line", stream.readline())
                 self.assertIsNone(stream.readline())
-        urlopen.assert_called_once_with("http://localhost:12345/console/stream", timeout=3)
+        urlopen.assert_called_once_with("http://127.0.0.1:12345/console/stream", timeout=3)
         response.fp.raw._sock.settimeout.assert_called_with(1.5)
         response.close.assert_called_once_with()
 

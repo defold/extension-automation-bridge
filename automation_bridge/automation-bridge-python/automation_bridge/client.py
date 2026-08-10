@@ -752,46 +752,80 @@ class Client:
             time.sleep(0.5)
             editor._build_and_run_command(build_command, timeout=timeout)
 
-        def bridge_after_build() -> Optional["Client"]:
-            service_ports = editor._engine_service_ports()
-            registration_ports = editor._current_registration_engine_service_ports()
-            profiler_url = cls._editor_profiler_url(editor, fresh_build=fresh_build)
-            for service_port in service_ports:
-                if not service_port:
-                    continue
-                try:
-                    bridge = cls(
-                        service_port,
-                        profiler_url=profiler_url,
-                        required_capabilities=required_capabilities,
-                    )
-                    health = bridge.health()
-                    registration_is_authoritative = service_port in registration_ports
-                    if not editor._validate_cached_engine_health(
-                        service_port,
-                        health,
-                        fresh_build=fresh_build or registration_is_authoritative,
-                    ):
-                        continue
-                except (IncompatibleApiVersionError, UnsupportedCapabilityError):
-                    raise
-                except AutomationBridgeError:
-                    continue
-                identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
-                editor._remember_engine_service_port(
+        def connect_candidate(
+            service_port: int,
+            profiler_url: Optional[str],
+            *,
+            registration_is_authoritative: bool,
+            require_cached_identity_match: bool = False,
+        ) -> Optional["Client"]:
+            try:
+                bridge = cls(
                     service_port,
-                    identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
-                    identity.get("project_identity") if isinstance(identity, Mapping) else None,
-                    identity.get("process_id") if isinstance(identity, Mapping) else None,
+                    profiler_url=profiler_url,
+                    required_capabilities=required_capabilities,
                 )
-                editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
-                lifecycle = health.get("lifecycle", {})
-                if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
-                    editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
-                if profiler_url:
-                    editor._remember_remotery_url(profiler_url)
-                bridge.logs.start()
-                return bridge
+                health = bridge.health()
+                if not editor._validate_cached_engine_health(
+                    service_port,
+                    health,
+                    fresh_build=fresh_build or registration_is_authoritative,
+                ):
+                    return None
+                if require_cached_identity_match and not editor._cached_engine_health_matches(
+                    service_port,
+                    health,
+                ):
+                    return None
+            except (IncompatibleApiVersionError, UnsupportedCapabilityError):
+                raise
+            except AutomationBridgeError:
+                return None
+            identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
+            editor._remember_engine_service_port(
+                service_port,
+                identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
+                identity.get("project_identity") if isinstance(identity, Mapping) else None,
+                identity.get("process_id") if isinstance(identity, Mapping) else None,
+            )
+            editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
+            lifecycle = health.get("lifecycle", {})
+            if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
+                editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
+            if profiler_url:
+                editor._remember_remotery_url(profiler_url)
+            bridge.logs.start()
+            return bridge
+
+        if not fresh_build:
+            cached_port = editor._cached_engine_service_port_value()
+            if cached_port is not None:
+                cached_bridge = connect_candidate(
+                    cached_port,
+                    editor._cached_remotery_url_value(),
+                    registration_is_authoritative=False,
+                    require_cached_identity_match=True,
+                )
+                if cached_bridge is not None:
+                    return cached_bridge
+
+        def bridge_after_build() -> Optional["Client"]:
+            console_lines = editor._console_lines()
+            service_ports = editor._engine_service_ports(console_lines)
+            registration_ports = editor._current_registration_engine_service_ports(console_lines)
+            profiler_url = cls._editor_profiler_url(
+                editor,
+                fresh_build=fresh_build,
+                console_lines=console_lines,
+            )
+            for service_port in service_ports:
+                bridge = connect_candidate(
+                    service_port,
+                    profiler_url,
+                    registration_is_authoritative=service_port in registration_ports,
+                )
+                if bridge is not None:
+                    return bridge
             return None
 
         if fresh_build and cls._last_build_missing_engine_service_port(editor):
@@ -871,11 +905,21 @@ class Client:
         return editor._last_build_had_engine_service_port is False
 
     @staticmethod
-    def _editor_profiler_url(editor: Any, fresh_build: bool) -> Optional[str]:
+    def _editor_profiler_url(
+        editor: Any,
+        fresh_build: bool,
+        console_lines: Optional[list] = None,
+    ) -> Optional[str]:
         if fresh_build:
-            urls = editor._current_registration_remotery_urls()
+            urls = (
+                editor._current_registration_remotery_urls()
+                if console_lines is None
+                else editor._current_registration_remotery_urls(console_lines)
+            )
             return urls[0] if urls else None
-        return editor._remotery_url_value()
+        if console_lines is None:
+            return editor._remotery_url_value()
+        return editor._remotery_url_value(console_lines)
 
     def wait_ready(
         self,
