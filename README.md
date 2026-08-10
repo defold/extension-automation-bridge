@@ -38,6 +38,13 @@ application_api = 1
 
 - Native extension endpoint reference: [`automation_bridge/`](automation_bridge/README.md)
 - Dependency-free Python helpers for editor bootstrap, element queries, input gestures, race-free events/state/commands, semantic annotations, timeline markers, waits, screenshots, Metal GPU traces, and diagnostics: [`automation_bridge/automation-bridge-python/`](automation_bridge/automation-bridge-python/README.md)
+- Portable Agent Plugin and MCP server for Codex and other Agent Plugins clients: [`plugins/automation-bridge/`](plugins/automation-bridge/README.md)
+
+The repository-local marketplace is declared in
+`.agents/plugins/marketplace.json`. The plugin bundles the Python wrapper, so a
+Codex installation copied into its plugin cache does not depend on this source
+checkout. See the plugin README for installation, direct MCP configuration,
+supported protocol versions, and validation commands.
 
 ## Examples
 
