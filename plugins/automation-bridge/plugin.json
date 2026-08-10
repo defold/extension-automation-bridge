@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "automation-bridge",
+  "version": "0.1.0+codex.20260809213257",
+  "description": "Inspect and control Defold Editor projects and debug games through Automation Bridge.",
+  "author": {
+    "name": "Defold",
+    "url": "https://github.com/defold"
+  },
+  "homepage": "https://github.com/defold/extension-automation-bridge",
+  "repository": "https://github.com/defold/extension-automation-bridge",
+  "keywords": [
+    "defold",
+    "automation",
+    "testing",
+    "mcp",
+    "agent-plugin"
+  ]
+}

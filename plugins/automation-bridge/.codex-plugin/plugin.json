@@ -1,0 +1,37 @@
+{
+  "name": "automation-bridge",
+  "version": "0.1.0+codex.20260809213257",
+  "description": "Inspect and control Defold Editor projects and debug games through Automation Bridge.",
+  "author": {
+    "name": "Defold",
+    "url": "https://github.com/defold"
+  },
+  "homepage": "https://github.com/defold/extension-automation-bridge",
+  "repository": "https://github.com/defold/extension-automation-bridge",
+  "keywords": [
+    "defold",
+    "automation",
+    "testing",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Automation Bridge",
+    "shortDescription": "Automate and inspect Defold projects.",
+    "longDescription": "Build, run, inspect, test, and diagnose Defold projects through focused MCP tools and the complete Automation Bridge Python API.",
+    "developerName": "Defold",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/defold/extension-automation-bridge",
+    "defaultPrompt": [
+      "Build my Defold project and inspect the running game.",
+      "Test this Defold interaction and capture evidence.",
+      "Diagnose this Defold project with Automation Bridge."
+    ]
+  }
+}

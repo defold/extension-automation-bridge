@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "automation-bridge": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/run_mcp.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
+}

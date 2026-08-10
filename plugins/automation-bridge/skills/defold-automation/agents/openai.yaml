@@ -1,0 +1,10 @@
+interface:
+  display_name: "Defold Automation"
+  short_description: "Automate and inspect Defold projects"
+  default_prompt: "Use $defold-automation to build and inspect my Defold project."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "automation-bridge"
+      description: "Automation Bridge MCP server"
+      transport: "stdio"

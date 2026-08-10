@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "automation-bridge": {
+      "command": "python3",
+      "args": [
+        "scripts/run_mcp.py"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1"
+      },
+      "cwd": "."
+    }
+  }
+}
