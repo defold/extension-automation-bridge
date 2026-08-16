@@ -3045,18 +3045,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.reset_if_popup_is_visible()
         screen = self.bridge.screen()
         window = screen["window"]
-        y = max(4, window["height"] - 16)
-        start = (max(4, window["width"] * 0.15), y)
-        end = (min(window["width"] - 4, window["width"] * 0.85), y)
+        requested_y = max(4, window["height"] - 16) + 0.75
+        requested_start = (max(4, window["width"] * 0.15) + 0.75, requested_y)
+        requested_end = (min(window["width"] - 4, window["width"] * 0.85) + 0.75, requested_y)
+        # Native HID receives integer framebuffer coordinates. The overlay must
+        # mark those exact coordinates, not the fractional request values.
+        start = (int(requested_start[0]), int(requested_start[1]))
+        end = (int(requested_end[0]), int(requested_end[1]))
         baseline_path = self.bridge.screenshot(wait=True, timeout=5)
-        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
 
-        self.bridge.drag(start, end, duration=1.0, wait=0)
+        self.bridge.drag(requested_start, requested_end, duration=1.0, wait=0, visualize=True)
         last_observation = {"path": None, "orange_pixels": 0, "baseline_path": baseline_path, "baseline_orange": baseline_orange}
 
         def visible_overlay():
             screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
-            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end)
+            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3)
             last_observation["path"] = screenshot_path
             last_observation["orange_pixels"] = orange_pixels
             print(
@@ -3075,6 +3079,27 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
         finally:
             time.sleep(1.0)
+
+    def test_drag_without_visualization_has_no_debug_overlay(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        time.sleep(1.05)
+        screen = self.bridge.screen()
+        window = screen["window"]
+        y = max(4, window["height"] - 32)
+        start = (max(4, window["width"] * 0.2), y)
+        end = (min(window["width"] - 4, window["width"] * 0.8), y)
+        baseline_path = self.bridge.screenshot(wait=True, timeout=5)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
+
+        self.bridge.drag(start, end, duration=0.4, wait=0, visualize=False)
+        observed = []
+        for _ in range(3):
+            screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+            observed.append(_count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3))
+            time.sleep(0.05)
+
+        self.assertLessEqual(max(observed), baseline_orange + 5, (baseline_path, baseline_orange, observed))
 
     def test_screenshot_rows_match_top_left_scene_bounds(self):
         self.ensure_running_bridge()
