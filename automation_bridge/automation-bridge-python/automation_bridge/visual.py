@@ -115,7 +115,7 @@ def _encode_png(image: _Image) -> bytes:
     return (
         b"\x89PNG\r\n\x1a\n"
         + _png_chunk(b"IHDR", header)
-        + _png_chunk(b"IDAT", zlib.compress(rows))
+        + _png_chunk(b"IDAT", zlib.compress(rows, level=zlib.Z_BEST_SPEED))
         + _png_chunk(b"IEND", b"")
     )
 
