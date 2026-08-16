@@ -260,11 +260,16 @@ class TraceSession:
             if method != "POST" or not isinstance(path_value, str) or not path_value.startswith("/input/"):
                 continue
             try:
+                params = payload.get("params")
+                json_body = payload.get("json_body")
+                if json_body is None:
+                    json_body = params
+                    params = None
                 client.request(
                     "POST",
                     path_value,
-                    params=payload.get("params"),
-                    json=payload.get("json_body"),
+                    params=params,
+                    json_body=json_body,
                 )
                 replayed += 1
             except BaseException as error:

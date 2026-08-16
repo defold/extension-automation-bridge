@@ -83,7 +83,7 @@ class MetalCaptureClient:
             self.bridge.request(
                 "POST",
                 "/metal",
-                params={"path": str(output), "frames": frames},
+                json_body={"path": str(output), "frames": frames},
             )
         )
         self.bridge._trace_record("metal_capture_started", capture.to_dict())

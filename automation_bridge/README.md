@@ -522,7 +522,22 @@ automation_bridge.command("my_game.load_fixture", function(data)
 end)
 ```
 
-Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-encoded-json>&timeout_ms=30000`. The HTTP 200 response contains a command id. Poll `GET /commands?id=<id>` for `pending`, `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua callbacks run on the engine update thread and cannot be safely preempted; a running cancellation returns `409 command_not_cancellable`.
+Submit commands in a JSON body. The `data` field is itself a string containing
+strict JSON:
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"name":"my_game.load_fixture","data":"{\"name\":\"standard\"}","timeout_ms":30000}' \
+  "$BASE/commands" | python3 -m json.tool
+```
+
+Query parameters remain supported for short curl requests, but clients should
+use the body because Defold bounds the complete request resource. The HTTP 200
+response contains a command id. Poll `GET /commands?id=<id>` for `pending`,
+`running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON
+result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua
+callbacks run on the engine update thread and cannot be safely preempted; a
+running cancellation returns `409 command_not_cancellable`.
 
 ### Native delivery and application acknowledgement
 
@@ -553,11 +568,18 @@ Annotations are copied into matching scene snapshots and can be queried with the
 
 ### Timeline markers
 
-`POST /markers?name=workflow_started&data=<url-encoded-json>&recording_timestamp_us=...`
-inserts a `marker` event. Native monotonic time is always recorded. The optional
-recording timestamp is caller-supplied, allowing a client to correlate markers
-with its own media or trace clock. Native video recording does not add this
-correlation automatically.
+Use a JSON body to insert a `marker` event without constraining marker data to
+the request-resource limit:
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"name":"workflow_started","data":"{\"case\":7}","recording_timestamp_us":1234}' \
+  "$BASE/markers" | python3 -m json.tool
+```
+
+Native monotonic time is always recorded. The optional recording timestamp is
+caller-supplied, allowing a client to correlate markers with its own media or
+trace clock. Native video recording does not add this correlation automatically.
 
 ## Metal GPU trace capture (macOS)
 
@@ -568,17 +590,16 @@ Captures complete rendered frames to a Metal `.gputrace` on macOS when Defold is
 Schedule a one-frame capture:
 
 ```sh
-curl -fsS -X POST --get \
-  --data-urlencode "path=/tmp/fontgen.gputrace" \
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/fontgen.gputrace"}' \
   "$BASE/metal" | python3 -m json.tool
 ```
 
 Use `frames` to capture more than one frame:
 
 ```sh
-curl -fsS -X POST --get \
-  --data-urlencode "path=/tmp/fontgen.gputrace" \
-  --data-urlencode "frames=60" \
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/fontgen.gputrace","frames":60}' \
   "$BASE/metal" | python3 -m json.tool
 ```
 

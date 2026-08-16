@@ -103,7 +103,7 @@ The package root exposes only `editor` and `engine`.
 - Capture and diagnostics: screenshots, historical `game.logs`, live engine
   logs, profiling, visual comparison, tracing, `game.video_recording`, and
   `game.metal_capture` on supported macOS/Metal runtimes.
-- Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
+- Raw engine escape hatch: `game.request(method, path, params=..., json_body=...)`.
 
 ## Bootstrap
 
@@ -293,11 +293,13 @@ Capability declarations may use `name>=N`. Incompatible API versions raise
 ## Raw requests
 
 Named helpers are preferred. For endpoint-level debugging, use the single raw
-escape hatch:
+escape hatch. `params` are URL query fields; use `json_body` for `POST` and
+`PUT` payloads so Defold's request-resource limit does not constrain their
+size. The former `json` spelling remains accepted as a compatibility alias:
 
 ```python
 health = game.request("GET", "/health")
-result = game.request("POST", "/coordinates/convert", json={
+result = game.request("POST", "/coordinates/convert", json_body={
     "point": {"x": 0.5, "y": 0.5},
     "from_space": "normalized_viewport",
     "to_space": "window",

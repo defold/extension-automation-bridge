@@ -248,8 +248,8 @@ class VideoRecordingTest(unittest.TestCase):
             self.traces = []
             self.fail_stop = fail_stop
 
-        def request(self, method, path, *, params=None, json=None):
-            self.requests.append((method, path, json))
+        def request(self, method, path, *, params=None, json_body=None):
+            self.requests.append((method, path, json_body))
             if path == "/recording/capabilities":
                 return {"backend": "screen_capture_kit", "available": True,
                         "application_window": True, "application_audio": True,
@@ -257,9 +257,9 @@ class VideoRecordingTest(unittest.TestCase):
                         "containers": ["mp4"], "video_codecs": ["h264"],
                         "minimum_platform_version": "macOS 15.0"}
             if path == "/recording/start":
-                return {"path": json["path"], "active": True, "finalized": False,
-                        "audio": json.get("audio", True), "width": json.get("width", 800),
-                        "height": json.get("height", 600), "fps": json["fps"]}
+                return {"path": json_body["path"], "active": True, "finalized": False,
+                        "audio": json_body.get("audio", True), "width": json_body.get("width", 800),
+                        "height": json_body.get("height", 600), "fps": json_body["fps"]}
             if path == "/recording/stop":
                 if self.fail_stop:
                     raise RuntimeError("native finalization failed")
@@ -313,13 +313,14 @@ class MetalCaptureTest(unittest.TestCase):
             self.traces = []
             self.states = list(states or [])
 
-        def request(self, method, path, *, params=None, json=None):
-            self.requests.append((method, path, params))
+        def request(self, method, path, *, params=None, json_body=None):
+            self.requests.append((method, path, params, json_body))
+            request_data = json_body if json_body is not None else params
             if method == "POST":
                 return {
                     "state": "pending",
-                    "path": params["path"],
-                    "frames": params["frames"],
+                    "path": request_data["path"],
+                    "frames": request_data["frames"],
                     "frames_captured": 0,
                     "stop_requested": False,
                 }
@@ -356,8 +357,9 @@ class MetalCaptureTest(unittest.TestCase):
         self.assertTrue(capture.complete)
         self.assertEqual(2, capture.frames_captured)
         self.assertEqual(("POST", "/metal"), bridge.requests[0][:2])
-        self.assertTrue(bridge.requests[0][2]["path"].endswith("/traces/frame.gputrace"))
-        self.assertEqual(2, bridge.requests[0][2]["frames"])
+        self.assertIsNone(bridge.requests[0][2])
+        self.assertTrue(bridge.requests[0][3]["path"].endswith("/traces/frame.gputrace"))
+        self.assertEqual(2, bridge.requests[0][3]["frames"])
         self.assertEqual(
             ["metal_capture_started", "metal_capture_finished"],
             [kind for kind, _ in bridge.traces],
@@ -402,8 +404,8 @@ class _TraceClient:
     def screenshot(self, wait=True):
         raise RuntimeError("screenshot unavailable")
 
-    def request(self, method, path, *, params=None, json=None):
-        self.posts.append((path, params, json))
+    def request(self, method, path, *, params=None, json_body=None):
+        self.posts.append((path, params, json_body))
         return {"accepted": True}
 
 
@@ -438,7 +440,7 @@ class TraceTest(unittest.TestCase):
 
             report = TraceSession.replay(client, path)
             self.assertEqual(1, report["replayed"])
-            self.assertEqual([("/input/drag", {"duration": 0.5}, None)], client.posts)
+            self.assertEqual([("/input/drag", None, {"duration": 0.5})], client.posts)
             self.assertIn("application_state", report["missing_prerequisites"])
             with self.assertRaises(TraceError):
                 TraceSession.replay(client, path, require_deterministic=True)
