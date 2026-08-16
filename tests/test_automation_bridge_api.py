@@ -213,6 +213,34 @@ class EngineClientUnitTest(unittest.TestCase):
             required_capabilities=("scene", "input.drag"),
         )
 
+    def test_raw_request_uses_json_body_and_retains_json_alias(self):
+        bridge = EngineClient(1)
+        with mock.patch.object(bridge, "_request", return_value={}) as request:
+            bridge.request(
+                "post",
+                "/markers",
+                params={"query": "value"},
+                json_body={"body": "value"},
+            )
+            request.assert_called_once_with(
+                "POST",
+                "/markers",
+                {"query": "value"},
+                json_body={"body": "value"},
+            )
+
+            request.reset_mock()
+            bridge.request("post", "/markers", json={"legacy": True})
+            request.assert_called_once_with(
+                "POST",
+                "/markers",
+                None,
+                json_body={"legacy": True},
+            )
+
+        with self.assertRaisesRegex(ValueError, "either json_body.*json compatibility alias"):
+            bridge.request("POST", "/markers", json_body={}, json={})
+
     def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
         class ScriptedClient:
             timeout = 10.0
@@ -220,7 +248,7 @@ class EngineClientUnitTest(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            def request(self, method, path, *, params=None, json=None):
+            def request(self, method, path, *, params=None, json_body=None):
                 self.requests.append((path, params))
                 if path == "/events/cursor":
                     return {"cursor": 5, "oldest_cursor": 2}
@@ -266,7 +294,7 @@ class EngineClientUnitTest(unittest.TestCase):
         class OverflowClient:
             timeout = 10.0
 
-            def request(self, method, path, *, params=None, json=None):
+            def request(self, method, path, *, params=None, json_body=None):
                 if path == "/events/cursor":
                     return {"cursor": 20, "oldest_cursor": 10}
                 return {"events": [], "next_cursor": 10, "oldest_cursor": 10, "latest_cursor": 20, "overflow": True}
@@ -312,14 +340,14 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("status_ready", element.localization_key)
         self.assertEqual("status", element.role)
 
-    def test_command_and_marker_encode_bounded_json(self):
+    def test_command_and_marker_use_json_bodies(self):
         class ApplicationClient(EngineClient):
             def __init__(self):
                 super().__init__(12345)
                 self.requests = []
 
-            def _request(self, method, path, params=None):
-                self.requests.append((method, path, params))
+            def _request(self, method, path, params=None, json_body=None):
+                self.requests.append((method, path, params, json_body))
                 if path == "/commands":
                     return {"command_id": 9, "state": "pending"}
                 if path == "/markers":
@@ -331,10 +359,13 @@ class EngineClientUnitTest(unittest.TestCase):
         marker = bridge.mark("workflow_started", {"case": 7}, recording_timestamp_us=1234)
 
         self.assertEqual(9, accepted["command_id"])
-        self.assertEqual('{"name":"standard"}', bridge.requests[0][2]["data"])
-        self.assertEqual(2000, bridge.requests[0][2]["timeout_ms"])
+        self.assertIsNone(bridge.requests[0][2])
+        self.assertEqual('{"name":"standard"}', bridge.requests[0][3]["data"])
+        self.assertEqual(2000, bridge.requests[0][3]["timeout_ms"])
         self.assertEqual(12, marker["event_sequence"])
-        self.assertEqual(1234, bridge.requests[1][2]["recording_timestamp_us"])
+        self.assertIsNone(bridge.requests[1][2])
+        self.assertEqual('{"case":7}', bridge.requests[1][3]["data"])
+        self.assertEqual(1234, bridge.requests[1][3]["recording_timestamp_us"])
 
     def test_health_rejects_incompatible_native_api_version(self):
         bridge = FakeEngineClient()
@@ -2024,6 +2055,50 @@ class EngineClientUnitTest(unittest.TestCase):
             server.request_bytes,
         )
 
+    def test_start_command_uses_json_body_for_large_payload(self):
+        response = b'{"ok":true,"data":{"command_id":9,"state":"pending"}}'
+        command_data = {"value": "x" * 30000}
+        with FakeHttpServer(response) as server:
+            accepted = EngineClient(server.port, timeout=1.0).start_command(
+                "test.load_fixture",
+                command_data,
+                timeout=2,
+            )
+
+        self.assertEqual(9, accepted["command_id"])
+        self.assertEqual("POST /automation-bridge/v2/commands HTTP/1.1", server.request_line)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertEqual(
+            {
+                "name": "test.load_fixture",
+                "data": json.dumps(command_data, separators=(",", ":")),
+                "timeout_ms": 2000,
+            },
+            json.loads(server.request_body),
+        )
+
+    def test_mark_uses_json_body_for_large_payload(self):
+        response = b'{"ok":true,"data":{"event_sequence":12}}'
+        marker_data = {"value": "x" * 30000}
+        with FakeHttpServer(response) as server:
+            marker = EngineClient(server.port, timeout=1.0).mark(
+                "workflow_started",
+                marker_data,
+                recording_timestamp_us=1234,
+            )
+
+        self.assertEqual(12, marker["event_sequence"])
+        self.assertEqual("POST /automation-bridge/v2/markers HTTP/1.1", server.request_line)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertEqual(
+            {
+                "name": "workflow_started",
+                "data": json.dumps(marker_data, separators=(",", ":")),
+                "recording_timestamp_us": 1234,
+            },
+            json.loads(server.request_body),
+        )
+
     def test_screenshot_waits_for_native_complete_receipt(self):
         class ScreenshotClient(EngineClient):
             def __init__(self):
@@ -2970,18 +3045,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.reset_if_popup_is_visible()
         screen = self.bridge.screen()
         window = screen["window"]
-        y = max(4, window["height"] - 16)
-        start = (max(4, window["width"] * 0.15), y)
-        end = (min(window["width"] - 4, window["width"] * 0.85), y)
+        requested_y = max(4, window["height"] - 16) + 0.75
+        requested_start = (max(4, window["width"] * 0.15) + 0.75, requested_y)
+        requested_end = (min(window["width"] - 4, window["width"] * 0.85) + 0.75, requested_y)
+        # Native HID receives integer framebuffer coordinates. The overlay must
+        # mark those exact coordinates, not the fractional request values.
+        start = (int(requested_start[0]), int(requested_start[1]))
+        end = (int(requested_end[0]), int(requested_end[1]))
         baseline_path = self.bridge.screenshot(wait=True, timeout=5)
-        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
 
-        self.bridge.drag(start, end, duration=1.0, wait=0)
+        self.bridge.drag(requested_start, requested_end, duration=1.0, wait=0, visualize=True)
         last_observation = {"path": None, "orange_pixels": 0, "baseline_path": baseline_path, "baseline_orange": baseline_orange}
 
         def visible_overlay():
             screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
-            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end)
+            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3)
             last_observation["path"] = screenshot_path
             last_observation["orange_pixels"] = orange_pixels
             print(
@@ -3000,6 +3079,27 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
         finally:
             time.sleep(1.0)
+
+    def test_drag_without_visualization_has_no_debug_overlay(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        time.sleep(1.05)
+        screen = self.bridge.screen()
+        window = screen["window"]
+        y = max(4, window["height"] - 32)
+        start = (max(4, window["width"] * 0.2), y)
+        end = (min(window["width"] - 4, window["width"] * 0.8), y)
+        baseline_path = self.bridge.screenshot(wait=True, timeout=5)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
+
+        self.bridge.drag(start, end, duration=0.4, wait=0, visualize=False)
+        observed = []
+        for _ in range(3):
+            screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+            observed.append(_count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3))
+            time.sleep(0.05)
+
+        self.assertLessEqual(max(observed), baseline_orange + 5, (baseline_path, baseline_orange, observed))
 
     def test_screenshot_rows_match_top_left_scene_bounds(self):
         self.ensure_running_bridge()
@@ -3215,7 +3315,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("key", special_key["kind"])
 
         with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
-            self.bridge.request("POST", "/input/key", json={
+            self.bridge.request("POST", "/input/key", json_body={
                 "keys": "{M}",
                 "client_id": self.bridge.client_id,
                 "session_id": self.bridge.session_id,

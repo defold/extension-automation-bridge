@@ -358,11 +358,11 @@ class InputController:
         lease: float = 5.0,
     ) -> JsonDict:
         """Acquire/renew control and configure the default exclusive input device."""
-        params = self._bridge._input_params(lease=lease)
-        params["device"] = device
+        json_body = self._bridge._input_json_body(lease=lease)
+        json_body["device"] = device
         if visualize is not None:
-            params["visualize"] = visualize
-        return self._bridge._request("PUT", "/input/configure", json_body=params)
+            json_body["visualize"] = visualize
+        return self._bridge._request("PUT", "/input/configure", json_body=json_body)
 
     def pending(self) -> List[InputReceipt]:
         """Return FIFO-ordered accepted/started input receipts."""
@@ -427,15 +427,15 @@ class InputController:
 
     def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
         """Request cancellation, releasing active pointer/key state by default."""
-        params = self._bridge._input_params()
-        params.update({"input_id": input_id, "release": release})
-        return InputReceipt(self._bridge._request("POST", "/input/cancel", json_body=params))
+        json_body = self._bridge._input_json_body()
+        json_body.update({"input_id": input_id, "release": release})
+        return InputReceipt(self._bridge._request("POST", "/input/cancel", json_body=json_body))
 
     def flush(self, release: bool = True) -> JsonDict:
         """Cancel this session's active and later queued inputs."""
-        params = self._bridge._input_params()
-        params["release"] = release
-        return self._bridge._request("POST", "/input/flush", json_body=params)
+        json_body = self._bridge._input_json_body()
+        json_body["release"] = release
+        return self._bridge._request("POST", "/input/flush", json_body=json_body)
 
     def interruption_scope(
         self,
@@ -486,8 +486,8 @@ class PointerSession:
         """Append one continuous movement segment without releasing the pointer."""
         self._ensure_open()
         x, y = self._bridge._point(target)
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update(
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update(
             {
                 "input_id": self.input_id,
                 "x": x,
@@ -497,29 +497,29 @@ class PointerSession:
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/move", json_body=params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/move", json_body=json_body))
         return self.receipt
 
     def hold(self, duration: float) -> InputReceipt:
         """Keep the pointer down at its current position for `duration`."""
         self._ensure_open()
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update(
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update(
             {
                 "input_id": self.input_id,
                 "duration": duration,
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/hold", json_body=params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/hold", json_body=json_body))
         return self.receipt
 
     def up(self, wait: Union[str, bool] = "released", timeout: float = 10.0) -> InputReceipt:
         """Request one final up event and optionally wait for native release injection."""
         self._ensure_open()
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update({"input_id": self.input_id, "pointer_lease": self.lease})
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/up", json_body=params))
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update({"input_id": self.input_id, "pointer_lease": self.lease})
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/up", json_body=json_body))
         self.closed = True
         if wait:
             target_state = "released" if wait is True else str(wait)
@@ -942,10 +942,23 @@ class Client:
         path: str,
         *,
         params: Optional[Mapping[str, Any]] = None,
+        json_body: Optional[Mapping[str, Any]] = None,
         json: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
-        """Call a raw Automation Bridge path and return its ``data`` object."""
-        return self._request(method.upper(), path, params, json_body=json)
+        """Call a raw Automation Bridge path and return its ``data`` object.
+
+        ``params`` are encoded into the URL. Use ``json_body`` for ``POST`` and
+        ``PUT`` payloads so they are not constrained by Defold's request-resource
+        limit. ``json`` is retained as a compatibility alias for ``json_body``.
+        """
+        if json_body is not None and json is not None:
+            raise ValueError("request accepts either json_body or its json compatibility alias, not both")
+        return self._request(
+            method.upper(),
+            path,
+            params,
+            json_body=json_body if json_body is not None else json,
+        )
 
     def health(self) -> JsonDict:
         """Return and validate API version, capabilities, identity, and backend data."""
@@ -1134,20 +1147,20 @@ class Client:
     ) -> InputReceipt:
         """Queue one FIFO click and optionally wait for the native release receipt."""
         if isinstance(target, Element):
-            params: Dict[str, Any] = {"id": target.id}
+            json_body: Dict[str, Any] = {"id": target.id}
             if target.logical_id:
-                params["expected_logical_id"] = target.logical_id
+                json_body["expected_logical_id"] = target.logical_id
         elif isinstance(target, str):
-            params = {"id": target}
+            json_body = {"id": target}
         else:
             x_value, y_value = self._point(target, y)
-            params = {"x": x_value, "y": y_value}
+            json_body = {"x": x_value, "y": y_value}
 
-        params.update(self._input_params())
-        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        json_body.update(self._input_json_body())
+        json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if pointer_id:
-            params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self._request("POST", "/input/click", json_body=params))
+            json_body["pointer_id"] = pointer_id
+        receipt = InputReceipt(self._request("POST", "/input/click", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1171,32 +1184,32 @@ class Client:
     ) -> InputReceipt:
         """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
-            params: Dict[str, Any] = {
+            json_body: Dict[str, Any] = {
                 "from_id": self._element_id(from_target),
                 "to_id": self._element_id(to_target),
                 "duration": duration,
             }
             if isinstance(from_target, Element) and from_target.logical_id:
-                params["expected_from_logical_id"] = from_target.logical_id
+                json_body["expected_from_logical_id"] = from_target.logical_id
             if isinstance(to_target, Element) and to_target.logical_id:
-                params["expected_to_logical_id"] = to_target.logical_id
+                json_body["expected_to_logical_id"] = to_target.logical_id
         else:
             x1, y1 = self._point(from_target)
             x2, y2 = self._point(to_target)
-            params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
+            json_body = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
 
         controller_lease = min(60.0, max(5.0, duration + hold_before + hold_after + 2.0))
-        params.update(self._input_params(lease=controller_lease))
-        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        json_body.update(self._input_json_body(lease=controller_lease))
+        json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if easing != "linear":
-            params["easing"] = easing
+            json_body["easing"] = easing
         if hold_before:
-            params["hold_before"] = hold_before
+            json_body["hold_before"] = hold_before
         if hold_after:
-            params["hold_after"] = hold_after
+            json_body["hold_after"] = hold_after
         if pointer_id:
-            params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self._request("POST", "/input/drag", json_body=params))
+            json_body["pointer_id"] = pointer_id
+        receipt = InputReceipt(self._request("POST", "/input/drag", json_body=json_body))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1244,8 +1257,8 @@ class Client:
         easing_values = [easing] * expected_segments if isinstance(easing, str) else list(easing)
         if len(easing_values) != expected_segments or any(value not in _INPUT_EASINGS for value in easing_values):
             raise ValueError(f"drag_path requires {expected_segments} supported easing values")
-        params = self._input_params(lease=min(60.0, max(5.0, total_duration + 2.0)))
-        params.update(
+        json_body = self._input_json_body(lease=min(60.0, max(5.0, total_duration + 2.0)))
+        json_body.update(
             {
                 "points": ";".join(f"{x},{y}" for x, y in normalized_points),
                 "durations": ",".join(str(value) for value in duration_values),
@@ -1259,7 +1272,7 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=params))
+        receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=json_body))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1282,8 +1295,8 @@ class Client:
         if lease <= 0:
             raise ValueError("lease must be greater than zero")
         x, y = self._point(start)
-        params = self._input_params(lease=max(5.0, lease))
-        params.update(
+        json_body = self._input_json_body(lease=max(5.0, lease))
+        json_body.update(
             {
                 "x": x,
                 "y": y,
@@ -1294,7 +1307,7 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=params))
+        receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=json_body))
         return PointerSession(self, receipt, lease)
 
     def type_text(
@@ -1307,9 +1320,9 @@ class Client:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue FIFO text input and optionally wait for native completion."""
-        params = self._input_params()
-        params.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
+        json_body = self._input_json_body()
+        json_body.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1325,9 +1338,9 @@ class Client:
     ) -> InputReceipt:
         """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``."""
         keys = f"{{{self._normalize_key(key)}}}"
-        params = self._input_params()
-        params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
+        json_body = self._input_json_body()
+        json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1426,8 +1439,13 @@ class Client:
         if len(payload.encode("utf-8")) > 32768:
             raise ValueError("command JSON payload exceeds 32768 bytes")
         return self._request(
-            "POST", "/commands",
-            {"name": name, "data": payload, "timeout_ms": max(1, int(timeout * 1000))},
+            "POST",
+            "/commands",
+            json_body={
+                "name": name,
+                "data": payload,
+                "timeout_ms": max(1, int(timeout * 1000)),
+            },
         )
 
     def command_status(self, command_id: int) -> JsonDict:
@@ -1479,8 +1497,13 @@ class Client:
         if recording_timestamp_us is None:
             recording_timestamp_us = time.monotonic_ns() // 1000
         return self._request(
-            "POST", "/markers",
-            {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
+            "POST",
+            "/markers",
+            json_body={
+                "name": name,
+                "data": payload,
+                "recording_timestamp_us": int(recording_timestamp_us),
+            },
         )
 
     def screenshot(
@@ -2157,16 +2180,16 @@ class Client:
         self._remember_scene_sequence(data)
         return data
 
-    def _input_params(self, lease: float = 5.0) -> Dict[str, Any]:
+    def _input_json_body(self, lease: float = 5.0) -> Dict[str, Any]:
         """Return ownership and per-request correlation fields for mutating input calls."""
-        params: Dict[str, Any] = {
+        json_body: Dict[str, Any] = {
             "client_id": self.client_id,
             "session_id": self.session_id,
             "request_id": f"r-{uuid.uuid4().hex[:12]}",
         }
         if lease != 5.0:
-            params["lease"] = lease
-        return params
+            json_body["lease"] = lease
+        return json_body
 
     def _wait_input_compat(
         self,

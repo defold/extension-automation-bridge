@@ -604,6 +604,11 @@ namespace dmAutomationBridge
     static void AddVisualizationPoint(float x, float y, bool reset)
     {
         InputVisualization* visualization = &g_AutomationBridge.m_InputVisualization;
+        // InjectPointer passes integer framebuffer coordinates to HID. Store
+        // those same coordinates so fractional request values cannot make the
+        // debug overlay differ from the event the game actually receives.
+        x = (float)(int32_t)x;
+        y = (float)(int32_t)y;
         if (reset)
         {
             memset(visualization, 0, sizeof(*visualization));
