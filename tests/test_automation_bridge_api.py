@@ -95,14 +95,20 @@ def _read_automation_bridge_png(path):
     raw = zlib.decompress(bytes(idat))
     stride = width * 4
     pixels = bytearray()
+    previous = bytearray(stride)
     offset = 0
     for _ in range(height):
         filter_type = raw[offset]
-        if filter_type != 0:
+        if filter_type not in (0, 2):
             raise AssertionError(f"unexpected png filter {filter_type}: {path}")
         offset += 1
-        pixels.extend(raw[offset : offset + stride])
+        row = bytearray(raw[offset : offset + stride])
         offset += stride
+        if filter_type == 2:
+            for index, value in enumerate(row):
+                row[index] = (value + previous[index]) & 0xFF
+        pixels.extend(row)
+        previous = row
     return width, height, bytes(pixels)
 
 
@@ -2162,7 +2168,8 @@ class EngineClientUnitTest(unittest.TestCase):
                         "sha256": "native-sha",
                     }
 
-            receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
+            with mock.patch("automation_bridge.visual.zlib.compress", wraps=zlib.compress) as compress:
+                receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
 
             self.assertEqual((2, 1), (receipt.width, receipt.height))
             self.assertEqual(0.5, receipt.raw["resolution_multiplier"])
@@ -2171,6 +2178,8 @@ class EngineClientUnitTest(unittest.TestCase):
             self.assertTrue(receipt.exists())
             self.assertEqual((2, 1), _read_automation_bridge_png(receipt.path)[:2])
             self.assertEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), receipt.sha256)
+            compress.assert_called_once()
+            self.assertEqual(zlib.Z_BEST_SPEED, compress.call_args.kwargs["level"])
 
     def test_screenshot_validates_resolution_multiplier(self):
         bridge = EngineClient(1)
