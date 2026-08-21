@@ -510,7 +510,40 @@ namespace dmAutomationBridge
             {"KEY_F1", dmHID::KEY_F1}, {"KEY_F2", dmHID::KEY_F2}, {"KEY_F3", dmHID::KEY_F3},
             {"KEY_F4", dmHID::KEY_F4}, {"KEY_F5", dmHID::KEY_F5}, {"KEY_F6", dmHID::KEY_F6},
             {"KEY_F7", dmHID::KEY_F7}, {"KEY_F8", dmHID::KEY_F8}, {"KEY_F9", dmHID::KEY_F9},
-            {"KEY_F10", dmHID::KEY_F10}, {"KEY_F11", dmHID::KEY_F11}, {"KEY_F12", dmHID::KEY_F12}
+            {"KEY_F10", dmHID::KEY_F10}, {"KEY_F11", dmHID::KEY_F11}, {"KEY_F12", dmHID::KEY_F12},
+            // Punctuation and symbol keys -- every remaining named key in dmHID's Key enum,
+            // so any key_trigger a game.input_binding can express is reachable by name.
+            {"KEY_EXCLAIM", dmHID::KEY_EXCLAIM}, {"KEY_QUOTEDBL", dmHID::KEY_QUOTEDBL},
+            {"KEY_HASH", dmHID::KEY_HASH}, {"KEY_DOLLAR", dmHID::KEY_DOLLAR},
+            {"KEY_AMPERSAND", dmHID::KEY_AMPERSAND}, {"KEY_QUOTE", dmHID::KEY_QUOTE},
+            {"KEY_LPAREN", dmHID::KEY_LPAREN}, {"KEY_RPAREN", dmHID::KEY_RPAREN},
+            {"KEY_ASTERISK", dmHID::KEY_ASTERISK}, {"KEY_PLUS", dmHID::KEY_PLUS},
+            {"KEY_COMMA", dmHID::KEY_COMMA}, {"KEY_MINUS", dmHID::KEY_MINUS},
+            {"KEY_PERIOD", dmHID::KEY_PERIOD}, {"KEY_SLASH", dmHID::KEY_SLASH},
+            {"KEY_COLON", dmHID::KEY_COLON}, {"KEY_SEMICOLON", dmHID::KEY_SEMICOLON},
+            {"KEY_LESS", dmHID::KEY_LESS}, {"KEY_EQUALS", dmHID::KEY_EQUALS},
+            {"KEY_GREATER", dmHID::KEY_GREATER}, {"KEY_QUESTION", dmHID::KEY_QUESTION},
+            {"KEY_AT", dmHID::KEY_AT}, {"KEY_LBRACKET", dmHID::KEY_LBRACKET},
+            {"KEY_BACKSLASH", dmHID::KEY_BACKSLASH}, {"KEY_RBRACKET", dmHID::KEY_RBRACKET},
+            {"KEY_CARET", dmHID::KEY_CARET}, {"KEY_UNDERSCORE", dmHID::KEY_UNDERSCORE},
+            {"KEY_BACKQUOTE", dmHID::KEY_BACKQUOTE}, {"KEY_LBRACE", dmHID::KEY_LBRACE},
+            {"KEY_PIPE", dmHID::KEY_PIPE}, {"KEY_RBRACE", dmHID::KEY_RBRACE},
+            {"KEY_TILDE", dmHID::KEY_TILDE},
+            // Keypad
+            {"KEY_KP_0", dmHID::KEY_KP_0}, {"KEY_KP_1", dmHID::KEY_KP_1},
+            {"KEY_KP_2", dmHID::KEY_KP_2}, {"KEY_KP_3", dmHID::KEY_KP_3},
+            {"KEY_KP_4", dmHID::KEY_KP_4}, {"KEY_KP_5", dmHID::KEY_KP_5},
+            {"KEY_KP_6", dmHID::KEY_KP_6}, {"KEY_KP_7", dmHID::KEY_KP_7},
+            {"KEY_KP_8", dmHID::KEY_KP_8}, {"KEY_KP_9", dmHID::KEY_KP_9},
+            {"KEY_KP_DIVIDE", dmHID::KEY_KP_DIVIDE}, {"KEY_KP_MULTIPLY", dmHID::KEY_KP_MULTIPLY},
+            {"KEY_KP_SUBTRACT", dmHID::KEY_KP_SUBTRACT}, {"KEY_KP_ADD", dmHID::KEY_KP_ADD},
+            {"KEY_KP_DECIMAL", dmHID::KEY_KP_DECIMAL}, {"KEY_KP_EQUAL", dmHID::KEY_KP_EQUAL},
+            {"KEY_KP_ENTER", dmHID::KEY_KP_ENTER}, {"KEY_KP_NUM_LOCK", dmHID::KEY_KP_NUM_LOCK},
+            // Lock/system keys
+            {"KEY_CAPS_LOCK", dmHID::KEY_CAPS_LOCK}, {"KEY_SCROLL_LOCK", dmHID::KEY_SCROLL_LOCK},
+            {"KEY_PAUSE", dmHID::KEY_PAUSE}, {"KEY_LSUPER", dmHID::KEY_LSUPER},
+            {"KEY_RSUPER", dmHID::KEY_RSUPER}, {"KEY_MENU", dmHID::KEY_MENU},
+            {"KEY_BACK", dmHID::KEY_BACK}
         };
         for (uint32_t i = 0; i < DM_ARRAY_SIZE(keys); ++i)
         {
@@ -562,7 +595,7 @@ namespace dmAutomationBridge
             }
             if (KeyFromName(name) == dmHID::MAX_KEY_COUNT)
             {
-                *error = "unsupported special key; accepted names include KEY_A-KEY_Z, KEY_0-KEY_9, KEY_F1-KEY_F12, KEY_SPACE, KEY_ESCAPE, arrows, modifiers, and navigation keys";
+                *error = "unsupported special key; accepted names include KEY_A-KEY_Z, KEY_0-KEY_9, KEY_F1-KEY_F12, KEY_SPACE, KEY_ESCAPE, arrows, modifiers, navigation keys, punctuation/symbol keys (e.g. KEY_EQUALS, KEY_MINUS, KEY_COMMA), keypad keys (KEY_KP_0-KEY_KP_9 etc.), and lock/system keys";
                 return false;
             }
             index = next_index;
