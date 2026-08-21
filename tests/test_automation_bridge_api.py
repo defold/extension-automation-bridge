@@ -44,7 +44,7 @@ from automation_bridge.engine import (  # noqa: E402
 EngineClient = engine.Client
 EditorApiClient = editor.Client
 InstallationType = editor.Installation
-from automation_bridge.client import EngineLogStream, _encode_system_reboot  # noqa: E402
+from automation_bridge.client import EngineLogStream, _encode_system_reboot, request_json  # noqa: E402
 from automation_bridge.profiler import (  # noqa: E402
     ProfilerCapture,
     ProfilerConnection,
@@ -1536,18 +1536,19 @@ class EngineClientUnitTest(unittest.TestCase):
 
         bridge.key("KEY_UP", wait=False, hold=1.5)
         bridge.key("KEY_UP", wait=False, hold=6)
-        bridge.key("KEY_UP", wait=False, hold=59)
+        # This fake-client call validates the inclusive boundary immediately; it
+        # does not execute or wait for a real 60-second native hold.
+        bridge.key("KEY_UP", wait=False, hold=60)
         bridge.key("KEY_UP", wait=False)
 
-        short_hold, long_hold, capped_hold, tapped = (request[2] for request in bridge.api_requests)
+        short_hold, long_hold, maximum_hold, tapped = (request[2] for request in bridge.api_requests)
         self.assertEqual("{KEY_UP}", short_hold["keys"])
         self.assertEqual(1.5, short_hold["hold"])
-        # A 1.5s hold fits inside the default 5s controller lease, so none is sent.
-        self.assertNotIn("lease", short_hold)
-        # Longer holds size the controller lease to cover the hold plus queue margin
-        # (the drag helpers' formula) so native lease expiry can't cancel them mid-hold.
-        self.assertEqual(8.0, long_hold["lease"])
-        self.assertEqual(60.0, capped_hold["lease"])
+        self.assertEqual(6.0, long_hold["hold"])
+        self.assertEqual(60.0, maximum_hold["hold"])
+        # Finite key holds reserve their controller lifetime in the native bridge.
+        # The public wrapper should not duplicate that lease policy.
+        self.assertTrue(all("lease" not in request for request in (short_hold, long_hold, maximum_hold)))
         self.assertNotIn("hold", tapped)
 
     def test_key_hold_rejects_invalid_durations_before_queueing(self):
@@ -1559,6 +1560,21 @@ class EngineClientUnitTest(unittest.TestCase):
             bridge.key("KEY_UP", wait=False, hold="2")
 
         self.assertEqual([], bridge.api_requests)
+
+    def test_key_hold_requires_input_key_v2_before_queueing(self):
+        bridge = FakeInputClient(input_key_version="1")
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.key>=2"):
+            bridge.key("KEY_UP", wait=False, hold=1)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_key_tap_remains_compatible_with_input_key_v1(self):
+        bridge = FakeInputClient(input_key_version="1")
+
+        bridge.key("KEY_UP", wait=False)
+
+        self.assertEqual("{KEY_UP}", bridge.api_requests[0][2]["keys"])
 
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
@@ -2079,6 +2095,24 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual("stale_element", raised.exception.code)
 
+    def test_error_envelope_status_overrides_remapped_http_transport_status(self):
+        response = b'{"ok":false,"error":{"status":409,"code":"stale_element","message":"refresh it"}}'
+        with FakeHttpServer(response, status=500, reason="Internal Server Error") as server:
+            bridge = EngineClient(server.port, timeout=1.0)
+            with self.assertRaises(StaleElementError) as raised:
+                bridge.click("e:1", wait=False)
+
+        self.assertEqual(409, raised.exception.status)
+
+    def test_error_envelope_cannot_turn_failure_status_into_success(self):
+        response = b'{"ok":false,"error":{"status":200,"code":"bad_request","message":"invalid"}}'
+        with FakeHttpServer(response, status=500, reason="Internal Server Error") as server:
+            bridge = EngineClient(server.port, timeout=1.0)
+            with self.assertRaises(AutomationBridgeApiError) as raised:
+                bridge.request("POST", "/input/key", json_body={"keys": "{KEY_ENTER}"})
+
+        self.assertEqual(500, raised.exception.status)
+
     def test_convert_point_uses_json_body(self):
         response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
         with FakeHttpServer(response) as server:
@@ -2488,10 +2522,16 @@ class FakeEngineClient(EngineClient):
 
 
 class FakeInputClient(EngineClient):
-    def __init__(self, statuses=None):
+    def __init__(self, statuses=None, input_key_version="2"):
         super().__init__(12345, client_id="test-client", session_id="test-session")
         self.api_requests = []
         self.statuses = list(statuses or [])
+        self._last_health = {
+            "version": "2",
+            "capabilities": ["input.key"],
+            "capability_versions": {"input.key": input_key_version},
+            "backend": {"headless": False, "graphics": True, "hid": True},
+        }
 
     def _request(self, method, path, params=None, json_body=None):
         params = json_body if json_body is not None else params
@@ -3288,6 +3328,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertIn("scene.pagination", health["capabilities"])
         self.assertGreaterEqual(health["engine_frame"], 0)
         self.assertEqual("1", health["capability_versions"]["scene"])
+        self.assertEqual("2", health["capability_versions"]["input.key"])
         self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
         self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
         self.assertGreater(health["identity"]["start_wall_time_us"], 0)
@@ -3330,9 +3371,23 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertIsNotNone(spawner_detail.instance_generation)
         self.assertIsNotNone(spawner_detail.logical_id)
 
+        transport_status, stale_response = request_json(
+            self.bridge.base_url + "/input/click",
+            method="POST",
+            json_body={
+                "id": spawner.id,
+                "expected_scene_sequence": 0,
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            },
+        )
+        self.assertEqual(500, transport_status)
+        self.assertEqual(409, stale_response["error"]["status"])
+
         with self.assertRaises(AutomationBridgeApiError) as stale:
             self.bridge.click(spawner, wait=0, expected_scene_sequence=0)
         self.assertEqual("stale_scene", stale.exception.code)
+        self.assertEqual(409, stale.exception.status)
 
         stale_spawner = Element({**spawner.raw, "logical_id": "instance:stale:g0"})
         with self.assertRaises(StaleElementError) as stale_identity:
@@ -3354,13 +3409,56 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
         special_key = self.bridge.key("KEY_ENTER")
         self.assertEqual("key", special_key["kind"])
+        for key in ("KEY_EQUALS", "KEY_KP_0", "KEY_CAPS_LOCK"):
+            with self.subTest(named_key=key):
+                named_key = self.bridge.key(key, wait="released")
+                self.assertEqual("released", named_key["state"])
 
-        held_key = self.bridge.key("KEY_ENTER", hold=0.3, wait="released")
+        hold_timer = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True)
+        # Physical keyboard state can update the demo before this assertion; verify
+        # the timer format here and its exact automated result below.
+        self.assertRegex(
+            hold_timer.text,
+            r"^(?:Hold SPACE|Holding SPACE|Last SPACE hold): \d+\.\d{2}s / 60s$",
+        )
+
+        held_key = self.bridge.key("KEY_SPACE", hold=0.3, wait="released")
         self.assertEqual("released", held_key["state"])
         self.assertAlmostEqual(0.3, held_key["requested_duration"], places=5)
         # actual_duration is release minus start: a tap measures ~one frame, so a
         # value near the requested hold proves the key genuinely stayed pressed.
         self.assertGreaterEqual(held_key["actual_duration"], 0.25)
+
+        def released_hold_timer_text():
+            text = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True).text
+            return text if text.startswith("Last SPACE hold: ") else None
+
+        timer_text = wait_until(released_hold_timer_text, timeout=2, message="hold timer did not stop")
+        displayed_duration = float(timer_text.split(": ", 1)[1].split("s", 1)[0])
+        self.assertGreaterEqual(displayed_duration, 0.2)
+        self.assertLess(displayed_duration, 0.6)
+
+        short_lease_hold = self.bridge.request("POST", "/input/key", json_body={
+            "keys": "{KEY_ENTER}",
+            "hold": 0.3,
+            "lease": 0.1,
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        })
+        short_lease_hold = self.bridge.input.wait(short_lease_hold, state="released", timeout=2)
+        self.assertEqual("released", short_lease_hold["state"])
+        self.assertGreaterEqual(short_lease_hold["actual_duration"], 0.25)
+
+        for payload in ({"text": "x" * 20}, {"keys": "{KEY_A}" * 20}):
+            with self.subTest(progressing_key_event=next(iter(payload))):
+                progressing = self.bridge.request("POST", "/input/key", json_body={
+                    **payload,
+                    "lease": 0.1,
+                    "client_id": self.bridge.client_id,
+                    "session_id": self.bridge.session_id,
+                })
+                progressing = self.bridge.input.wait(progressing, state="released", timeout=2)
+                self.assertEqual("released", progressing["state"])
 
         with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
             self.bridge.request("POST", "/input/key", json_body={
@@ -3378,6 +3476,39 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 "session_id": self.bridge.session_id,
             })
         self.assertEqual("bad_request", unheld_text.exception.code)
+
+        input_identity = {
+            "keys": "{KEY_ENTER}",
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        }
+        transport_status, invalid_response = request_json(
+            self.bridge.base_url + "/input/key",
+            method="POST",
+            json_body={**input_identity, "hold": "abc"},
+        )
+        self.assertEqual(500, transport_status)
+        self.assertEqual(400, invalid_response["error"]["status"])
+        for invalid_hold in ("", "abc", "nan"):
+            with self.subTest(invalid_query_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_query:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        params={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_query.exception.code)
+                self.assertEqual(400, invalid_query.exception.status)
+
+        for invalid_hold in ("", "abc", None, {}, [], True):
+            with self.subTest(invalid_json_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_json:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        json_body={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_json.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(

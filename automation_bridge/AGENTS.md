@@ -18,9 +18,8 @@
   path reuse across snapshots.
 - Use named coordinate spaces and `/coordinates/convert`; do not infer window,
   viewport, display, or GUI transforms.
-- Input is FIFO and receipt-based. Wait for the required phase. `text` is literal
-  UTF-8; `keys` contains one validated brace-wrapped special key, optionally kept
-  pressed for `hold` seconds (`0..60`) before its release.
+- Input is FIFO and receipt-based. Use `text` for literals and `keys` for
+  validated special-key tokens; wait for the required receipt phase.
 - Screenshot and Metal captures are asynchronous; poll their status receipts.
   Metal capture requires macOS, the Metal adapter, and
   `METAL_CAPTURE_ENABLED=1`; inspect completed traces with `gpudebug` when

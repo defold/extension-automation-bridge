@@ -17,7 +17,8 @@ namespace dmAutomationBridge
         dmWebServer::Request*    m_Request;
         char*                    m_Path;
         char*                    m_Route;
-        Array<QueryParam>      m_Query;
+        Array<QueryParam>        m_Query;
+        Array<QueryParam>        m_JsonFields;
     };
 
     typedef void (*RouteHandler)(RequestContext* ctx);
@@ -28,10 +29,29 @@ namespace dmAutomationBridge
         const char*  m_Method;
         RouteHandler m_Handler;
     };
+
+    static int WebServerTransportStatus(int status_code)
+    {
+        // Defold's embedded DLIB HTTP server only has reason phrases for these
+        // status codes. Passing any other code works but emits a warning. Keep
+        // unsupported failures non-2xx for old and generic clients; the precise
+        // logical status remains in the JSON error envelope. See DEVELOPMENT.md.
+        switch (status_code)
+        {
+            case 200:
+            case 302:
+            case 404:
+            case 500:
+                return status_code;
+            default:
+                return status_code >= 400 ? 500 : 200;
+        }
+    }
+
     static void SendResponse(dmWebServer::Request* request, int status_code, const char* content_type, const StringBuffer* response, const char* allow = 0)
     {
         const char* data = response->m_Data ? response->m_Data : "";
-        dmWebServer::SetStatusCode(request, status_code);
+        dmWebServer::SetStatusCode(request, WebServerTransportStatus(status_code));
         dmWebServer::SendAttribute(request, "Content-Type", content_type);
         dmWebServer::SendAttribute(request, "Cache-Control", "no-store");
         if (!IsEmpty(allow))
@@ -51,7 +71,9 @@ namespace dmAutomationBridge
     {
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"code\":");
+        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"status\":");
+        AppendNumber(&response, (double)status_code);
+        StringBufferAppend(&response, ",\"code\":");
         AppendJsonString(&response, code);
         StringBufferAppend(&response, ",\"message\":");
         AppendJsonString(&response, message);
@@ -399,7 +421,7 @@ namespace dmAutomationBridge
         return false;
     }
 
-    static bool JsonParseRootObject(const char* body, Array<QueryParam>* params)
+    static bool JsonParseRootObject(const char* body, Array<QueryParam>* params, Array<QueryParam>* fields)
     {
         const char* cursor = body;
         JsonSkipWhitespace(&cursor);
@@ -412,6 +434,11 @@ namespace dmAutomationBridge
             QueryParam param;
             memset(&param, 0, sizeof(param));
             if (!JsonParseString(&cursor, &param.m_Key)) return false;
+            if (!JsonPushParam(fields, param.m_Key, DuplicateString("1")))
+            {
+                FreeString(&param.m_Key);
+                return false;
+            }
             JsonSkipWhitespace(&cursor);
             if (*cursor != ':') { FreeString(&param.m_Key); return false; }
             ++cursor;
@@ -483,6 +510,7 @@ namespace dmAutomationBridge
         FreeString(&ctx->m_Path);
         FreeString(&ctx->m_Route);
         FreeQueryParams(&ctx->m_Query);
+        FreeQueryParams(&ctx->m_JsonFields);
     }
 
     static bool RequestHasApiPrefix(const RequestContext* ctx)
@@ -498,6 +526,11 @@ namespace dmAutomationBridge
     static bool RequestGetFloatParam(const RequestContext* ctx, const char* key, float* value)
     {
         return GetFloatParam(&ctx->m_Query, key, value);
+    }
+
+    static bool RequestHasParam(const RequestContext* ctx, const char* key)
+    {
+        return GetParam(&ctx->m_Query, key) != 0 || GetParam(&ctx->m_JsonFields, key) != 0;
     }
 
     static bool RequestGetBoolParam(const RequestContext* ctx, const char* key, bool* value)
@@ -739,7 +772,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "input.drag");
             AppendCapability(&names, &versions, &first, "input.drag_path");
             AppendCapability(&names, &versions, &first, "input.pointer");
-            AppendCapability(&names, &versions, &first, "input.key");
+            AppendCapability(&names, &versions, &first, "input.key", "2");
             AppendCapability(&names, &versions, &first, "input.receipts");
             AppendCapability(&names, &versions, &first, "input.queue");
             AppendCapability(&names, &versions, &first, "input.controller");
@@ -1682,11 +1715,10 @@ namespace dmAutomationBridge
             return;
         }
         float key_hold = 0.0f;
-        const char* hold_text = RequestGetParam(ctx, "hold");
-        if (!IsEmpty(hold_text) && !RequestGetFloatParam(ctx, "hold", &key_hold))
+        if (RequestHasParam(ctx, "hold") && !RequestGetFloatParam(ctx, "hold", &key_hold))
         {
-            // Supplied but unparseable (e.g. hold=abc) must fail loudly, not degrade to a
-            // tap -- distinguish it from the parameter simply being absent.
+            // Supplied but unparseable values, including null, objects, and arrays in a
+            // JSON body, must fail loudly instead of degrading to a tap.
             RequestSendError(ctx, 400, "bad_request", "hold must be finite and between 0 and 60 seconds");
             return;
         }
@@ -1696,7 +1728,8 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 400, "bad_request", "hold requires at least one {KEY_...} special key via the keys parameter; literal text cannot be held");
             return;
         }
-        if (key_hold * (float)special_key_count > MAX_INPUT_DURATION)
+        float requested_duration = key_hold * (float)special_key_count;
+        if (requested_duration > MAX_INPUT_DURATION)
         {
             RequestSendError(ctx, 400, "bad_request", "total key hold duration exceeds 60 seconds");
             return;
@@ -1707,13 +1740,12 @@ namespace dmAutomationBridge
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
         InputReceipt* receipt = 0;
-        if (!AddKeyInput(value, parse_special_keys, key_hold, client_id, session_id, request_id,
+        if (!AddKeyInput(value, parse_special_keys, key_hold, requested_duration, client_id, session_id, request_id,
                          g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
         }
-        receipt->m_RequestedDuration = key_hold * (float)special_key_count;
         SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
     }
 
@@ -2667,7 +2699,7 @@ namespace dmAutomationBridge
     {
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"code\":");
+        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"status\":405,\"code\":");
         AppendJsonString(&response, "method_not_allowed");
         StringBufferAppend(&response, ",\"message\":");
         StringBuffer message;
@@ -2765,7 +2797,7 @@ namespace dmAutomationBridge
                 return;
             }
             char* body = ReadRequestBody(request);
-            bool parsed = body && JsonParseRootObject(body, &ctx.m_Query);
+            bool parsed = body && JsonParseRootObject(body, &ctx.m_Query, &ctx.m_JsonFields);
             free(body);
             if (!parsed)
             {
