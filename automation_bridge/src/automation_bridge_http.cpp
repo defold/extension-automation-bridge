@@ -1675,9 +1675,30 @@ namespace dmAutomationBridge
             return;
         }
         const char* key_error = 0;
-        if (parse_special_keys && !ValidateSpecialKeyInput(value, &key_error))
+        uint32_t special_key_count = 0;
+        if (parse_special_keys && !ValidateSpecialKeyInput(value, &key_error, &special_key_count))
         {
             RequestSendError(ctx, 400, "unsupported_key", key_error);
+            return;
+        }
+        float key_hold = 0.0f;
+        const char* hold_text = RequestGetParam(ctx, "hold");
+        if (!IsEmpty(hold_text) && !RequestGetFloatParam(ctx, "hold", &key_hold))
+        {
+            // Supplied but unparseable (e.g. hold=abc) must fail loudly, not degrade to a
+            // tap -- distinguish it from the parameter simply being absent.
+            RequestSendError(ctx, 400, "bad_request", "hold must be finite and between 0 and 60 seconds");
+            return;
+        }
+        if (!ValidateDuration(ctx, key_hold, "hold")) return;
+        if (key_hold > 0.0f && special_key_count == 0)
+        {
+            RequestSendError(ctx, 400, "bad_request", "hold requires at least one {KEY_...} special key via the keys parameter; literal text cannot be held");
+            return;
+        }
+        if (key_hold * (float)special_key_count > MAX_INPUT_DURATION)
+        {
+            RequestSendError(ctx, 400, "bad_request", "total key hold duration exceeds 60 seconds");
             return;
         }
         const char* client_id = 0;
@@ -1686,12 +1707,13 @@ namespace dmAutomationBridge
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
         InputReceipt* receipt = 0;
-        if (!AddKeyInput(value, parse_special_keys, client_id, session_id, request_id,
+        if (!AddKeyInput(value, parse_special_keys, key_hold, client_id, session_id, request_id,
                          g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
         }
+        receipt->m_RequestedDuration = key_hold * (float)special_key_count;
         SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
     }
 

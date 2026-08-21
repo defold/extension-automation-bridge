@@ -1531,6 +1531,35 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual([], bridge.api_requests)
 
+    def test_key_hold_is_validated_and_forwarded(self):
+        bridge = FakeInputClient()
+
+        bridge.key("KEY_UP", wait=False, hold=1.5)
+        bridge.key("KEY_UP", wait=False, hold=6)
+        bridge.key("KEY_UP", wait=False, hold=59)
+        bridge.key("KEY_UP", wait=False)
+
+        short_hold, long_hold, capped_hold, tapped = (request[2] for request in bridge.api_requests)
+        self.assertEqual("{KEY_UP}", short_hold["keys"])
+        self.assertEqual(1.5, short_hold["hold"])
+        # A 1.5s hold fits inside the default 5s controller lease, so none is sent.
+        self.assertNotIn("lease", short_hold)
+        # Longer holds size the controller lease to cover the hold plus queue margin
+        # (the drag helpers' formula) so native lease expiry can't cancel them mid-hold.
+        self.assertEqual(8.0, long_hold["lease"])
+        self.assertEqual(60.0, capped_hold["lease"])
+        self.assertNotIn("hold", tapped)
+
+    def test_key_hold_rejects_invalid_durations_before_queueing(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(ValueError, "between 0 and 60"):
+            bridge.key("KEY_UP", wait=False, hold=60.5)
+        with self.assertRaises(TypeError):
+            bridge.key("KEY_UP", wait=False, hold="2")
+
+        self.assertEqual([], bridge.api_requests)
+
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
 
@@ -3326,6 +3355,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
         special_key = self.bridge.key("KEY_ENTER")
         self.assertEqual("key", special_key["kind"])
 
+        held_key = self.bridge.key("KEY_ENTER", hold=0.3, wait="released")
+        self.assertEqual("released", held_key["state"])
+        self.assertAlmostEqual(0.3, held_key["requested_duration"], places=5)
+        # actual_duration is release minus start: a tap measures ~one frame, so a
+        # value near the requested hold proves the key genuinely stayed pressed.
+        self.assertGreaterEqual(held_key["actual_duration"], 0.25)
+
         with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
             self.bridge.request("POST", "/input/key", json_body={
                 "keys": "{M}",
@@ -3333,6 +3369,15 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 "session_id": self.bridge.session_id,
             })
         self.assertEqual("unsupported_key", unsupported_key.exception.code)
+
+        with self.assertRaises(AutomationBridgeApiError) as unheld_text:
+            self.bridge.request("POST", "/input/key", json_body={
+                "text": "hello",
+                "hold": 1.0,
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("bad_request", unheld_text.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(

@@ -570,8 +570,8 @@ namespace dmAutomationBridge
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt);
-    bool ValidateSpecialKeyInput(const char* keys, const char** error);
-    bool AddKeyInput(const char* keys, bool parse_special_keys,
+    bool ValidateSpecialKeyInput(const char* keys, const char** error, uint32_t* out_special_key_count);
+    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt);
     bool AppendPointerMove(uint64_t input_id, const InputPoint* point, float lease, const char** error);

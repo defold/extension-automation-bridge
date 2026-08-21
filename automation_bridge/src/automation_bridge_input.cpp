@@ -294,7 +294,7 @@ namespace dmAutomationBridge
         return true;
     }
 
-    bool AddKeyInput(const char* keys, bool parse_special_keys,
+    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt)
     {
@@ -308,6 +308,7 @@ namespace dmAutomationBridge
         event.m_Keys = DuplicateString(keys);
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
         event.m_ParseSpecialKeys = parse_special_keys;
+        event.m_HoldAfter = key_hold; // per special-key hold in seconds; 0 = single-update tap
         if (!event.m_Keys || !InitReceipt(&event.m_Receipt, "key", client_id, session_id, request_id,
                                           scene_sequence, INPUT_DEVICE_AUTO, 0) ||
             !ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
@@ -570,8 +571,9 @@ namespace dmAutomationBridge
         return true;
     }
 
-    bool ValidateSpecialKeyInput(const char* keys, const char** error)
+    bool ValidateSpecialKeyInput(const char* keys, const char** error, uint32_t* out_special_key_count)
     {
+        if (out_special_key_count) *out_special_key_count = 0;
         if (IsEmpty(keys))
         {
             *error = "special key input is empty";
@@ -598,6 +600,7 @@ namespace dmAutomationBridge
                 *error = "unsupported special key; accepted names include KEY_A-KEY_Z, KEY_0-KEY_9, KEY_F1-KEY_F12, KEY_SPACE, KEY_ESCAPE, arrows, modifiers, navigation keys, punctuation/symbol keys (e.g. KEY_EQUALS, KEY_MINUS, KEY_COMMA), keypad keys (KEY_KP_0-KEY_KP_9 etc.), and lock/system keys";
                 return false;
             }
+            if (out_special_key_count) ++(*out_special_key_count);
             index = next_index;
         }
         return true;
@@ -778,7 +781,7 @@ namespace dmAutomationBridge
         return true;
     }
 
-    static bool UpdateKeyEvent(InputEvent* event)
+    static bool UpdateKeyEvent(float dt, InputEvent* event)
     {
         dmHID::HKeyboard keyboard = dmHID::GetKeyboard(g_AutomationBridge.m_HidContext, 0);
         if (keyboard == dmHID::INVALID_KEYBOARD_HANDLE)
@@ -796,6 +799,18 @@ namespace dmAutomationBridge
         if (event->m_Receipt.m_State == INPUT_STATE_ACCEPTED) StartReceipt(&event->m_Receipt);
         if (event->m_ActiveKey != dmHID::MAX_KEY_COUNT)
         {
+            // Hold phase: the engine's own HID update re-polls the OS keyboard right before
+            // extension updates each frame, wiping injected key state -- so a held key must
+            // be re-asserted every update until its hold duration elapses. A side effect of
+            // that same wipe is that a hold can never leave a key stuck down: simply not
+            // re-asserting is already a release.
+            event->m_Elapsed += dt;
+            if (event->m_Elapsed < event->m_HoldAfter)
+            {
+                dmHID::SetKey(keyboard, event->m_ActiveKey, true);
+                return false;
+            }
+            event->m_Elapsed = 0.0f;
             dmHID::SetKey(keyboard, event->m_ActiveKey, false);
             event->m_ActiveKey = dmHID::MAX_KEY_COUNT;
             if (event->m_KeyIndex >= strlen(event->m_Keys))
@@ -880,7 +895,7 @@ namespace dmAutomationBridge
             event->m_ReleaseOnCancel = true;
             ReceiptSetReason(&event->m_Receipt, "pointer_lease_expired");
         }
-        bool done = event->m_Type == INPUT_EVENT_KEYS ? UpdateKeyEvent(event) : UpdateMouseEvent(dt, event);
+        bool done = event->m_Type == INPUT_EVENT_KEYS ? UpdateKeyEvent(dt, event) : UpdateMouseEvent(dt, event);
         if (done) RemoveFinishedEvent(0);
     }
 }
