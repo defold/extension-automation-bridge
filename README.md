@@ -38,6 +38,7 @@ application_api = 1
 
 - Native extension endpoint reference: [`automation_bridge/`](automation_bridge/README.md)
 - Dependency-free Python helpers for editor bootstrap, element queries, input gestures, race-free events/state/commands, semantic annotations, timeline markers, waits, screenshots, Metal GPU traces, and diagnostics: [`automation_bridge/automation-bridge-python/`](automation_bridge/automation-bridge-python/README.md)
+- Development constraints and regression-prevention rationale: [`DEVELOPMENT.md`](DEVELOPMENT.md)
 
 ## Examples
 

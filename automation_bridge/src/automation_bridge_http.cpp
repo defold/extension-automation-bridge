@@ -29,10 +29,29 @@ namespace dmAutomationBridge
         const char*  m_Method;
         RouteHandler m_Handler;
     };
+
+    static int WebServerTransportStatus(int status_code)
+    {
+        // Defold's embedded DLIB HTTP server only has reason phrases for these
+        // status codes. Passing any other code works but emits a warning. Keep
+        // unsupported failures non-2xx for old and generic clients; the precise
+        // logical status remains in the JSON error envelope. See DEVELOPMENT.md.
+        switch (status_code)
+        {
+            case 200:
+            case 302:
+            case 404:
+            case 500:
+                return status_code;
+            default:
+                return status_code >= 400 ? 500 : 200;
+        }
+    }
+
     static void SendResponse(dmWebServer::Request* request, int status_code, const char* content_type, const StringBuffer* response, const char* allow = 0)
     {
         const char* data = response->m_Data ? response->m_Data : "";
-        dmWebServer::SetStatusCode(request, status_code);
+        dmWebServer::SetStatusCode(request, WebServerTransportStatus(status_code));
         dmWebServer::SendAttribute(request, "Content-Type", content_type);
         dmWebServer::SendAttribute(request, "Cache-Control", "no-store");
         if (!IsEmpty(allow))
@@ -52,7 +71,9 @@ namespace dmAutomationBridge
     {
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"code\":");
+        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"status\":");
+        AppendNumber(&response, (double)status_code);
+        StringBufferAppend(&response, ",\"code\":");
         AppendJsonString(&response, code);
         StringBufferAppend(&response, ",\"message\":");
         AppendJsonString(&response, message);
@@ -751,7 +772,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "input.drag");
             AppendCapability(&names, &versions, &first, "input.drag_path");
             AppendCapability(&names, &versions, &first, "input.pointer");
-            AppendCapability(&names, &versions, &first, "input.key");
+            AppendCapability(&names, &versions, &first, "input.key", "2");
             AppendCapability(&names, &versions, &first, "input.receipts");
             AppendCapability(&names, &versions, &first, "input.queue");
             AppendCapability(&names, &versions, &first, "input.controller");
@@ -2678,7 +2699,7 @@ namespace dmAutomationBridge
     {
         StringBuffer response;
         StringBufferInit(&response);
-        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"code\":");
+        StringBufferAppend(&response, "{\"ok\":false,\"error\":{\"status\":405,\"code\":");
         AppendJsonString(&response, "method_not_allowed");
         StringBufferAppend(&response, ",\"message\":");
         StringBuffer message;

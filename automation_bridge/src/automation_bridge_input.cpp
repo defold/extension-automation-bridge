@@ -164,15 +164,18 @@ namespace dmAutomationBridge
                SetString(&receipt->m_RequestId, NormalizedId(request_id, ""));
     }
 
-    static void RefreshKeyHoldCompletionDeadline(InputEvent* event, uint64_t now)
+    static void RefreshKeyCompletionDeadline(InputEvent* event, uint64_t now)
     {
-        if (!event || event->m_Type != INPUT_EVENT_KEYS || event->m_Receipt.m_RequestedDuration <= 0.0f)
+        if (!event || event->m_Type != INPUT_EVENT_KEYS)
         {
             return;
         }
         // The finite operation, not the caller's heartbeat lease, owns the controller
-        // through release. Grace lets the release update run at the exact 60s boundary.
-        float protected_seconds = event->m_Receipt.m_RequestedDuration + INPUT_COMPLETION_GRACE_SECONDS;
+        // through release. Refreshing this deadline only when the event makes structural
+        // progress protects long text/key sequences without keeping a stalled event alive.
+        // The per-token hold covers work until the next structural progress point; grace
+        // covers frame overhead and lets the release update run at the exact 60s boundary.
+        float protected_seconds = event->m_HoldAfter + INPUT_COMPLETION_GRACE_SECONDS;
         event->m_CompletionDeadline = now + (uint64_t)(protected_seconds * 1000000.0f);
     }
 
@@ -202,7 +205,7 @@ namespace dmAutomationBridge
         ArrayErase(&g_AutomationBridge.m_InputEvents, index);
         if (index == 0 && g_AutomationBridge.m_InputEvents.m_Count > 0)
         {
-            RefreshKeyHoldCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], dmTime::GetTime());
+            RefreshKeyCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], dmTime::GetTime());
         }
     }
 
@@ -220,7 +223,7 @@ namespace dmAutomationBridge
             return deadline;
         }
         const InputEvent* event = &g_AutomationBridge.m_InputEvents.m_Data[0];
-        if (event->m_Type == INPUT_EVENT_KEYS && event->m_Receipt.m_RequestedDuration > 0.0f &&
+        if (event->m_Type == INPUT_EVENT_KEYS &&
             IsInputController(event->m_Receipt.m_ClientId, event->m_Receipt.m_SessionId) &&
             event->m_CompletionDeadline > deadline)
         {
@@ -350,7 +353,7 @@ namespace dmAutomationBridge
             return false;
         }
         event.m_Receipt.m_RequestedDuration = requested_duration;
-        RefreshKeyHoldCompletionDeadline(&event, dmTime::GetTime());
+        RefreshKeyCompletionDeadline(&event, dmTime::GetTime());
         if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
             FreeInputEvent(&event);
@@ -703,6 +706,9 @@ namespace dmAutomationBridge
             visualization->m_X[i] = x;
             visualization->m_Y[i] = y;
             visualization->m_Drag = visualization->m_PointCount > 1;
+            // Keep the complete trail visible for its configured duration after the
+            // latest injected point, including for drags longer than that duration.
+            visualization->m_Age = 0.0f;
         }
     }
 
@@ -924,7 +930,7 @@ namespace dmAutomationBridge
         if (g_AutomationBridge.m_InputEvents.m_Count > 0 &&
             g_AutomationBridge.m_InputEvents.m_Data[0].m_Receipt.m_State == INPUT_STATE_ACCEPTED)
         {
-            RefreshKeyHoldCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], now);
+            RefreshKeyCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], now);
         }
         if (!IsEmpty(g_AutomationBridge.m_ControllerClientId) && EffectiveControllerLeaseDeadline() <= now)
         {
@@ -940,7 +946,14 @@ namespace dmAutomationBridge
             event->m_ReleaseOnCancel = true;
             ReceiptSetReason(&event->m_Receipt, "pointer_lease_expired");
         }
+        uint32_t previous_key_index = event->m_KeyIndex;
+        dmHID::Key previous_active_key = event->m_ActiveKey;
         bool done = event->m_Type == INPUT_EVENT_KEYS ? UpdateKeyEvent(dt, event) : UpdateMouseEvent(dt, event);
+        if (!done && event->m_Type == INPUT_EVENT_KEYS &&
+            (event->m_KeyIndex != previous_key_index || event->m_ActiveKey != previous_active_key))
+        {
+            RefreshKeyCompletionDeadline(event, dmTime::GetTime());
+        }
         if (done) RemoveFinishedEvent(0);
     }
 }

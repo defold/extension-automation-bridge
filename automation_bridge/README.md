@@ -50,11 +50,19 @@ Success responses use this envelope:
 { "ok": true, "data": {} }
 ```
 
-Error responses use this envelope and an appropriate HTTP status:
+Error responses use this envelope:
 
 ```json
-{ "ok": false, "error": { "code": "not_found", "message": "..." } }
+{ "ok": false, "error": { "status": 409, "code": "stale_scene", "message": "..." } }
 ```
+
+`error.status` is the logical API status. Defold's embedded DLIB HTTP server only
+supports reason phrases for `200`, `302`, `404`, and `500`; other logical
+error statuses are therefore transported as HTTP `500` to avoid an engine
+warning without turning a failure into a successful response. Existing `404`
+and `500` statuses remain unchanged. Clients should use `ok` and `error.status`
+for the precise result; older and generic clients still receive a non-2xx
+failure. See the repository-root `DEVELOPMENT.md` before changing this mapping.
 
 Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `unsupported_media_type`, `not_found`, `method_not_allowed`, `body_not_supported`,
@@ -211,7 +219,7 @@ curl -fsS "$BASE/lifecycle" | python3 -m json.tool
 
 Health and lifecycle are independent of scene, graphics, screenshots, windows, and
 HID. Capabilities are advertised only when their backing context exists. Calling an
-omitted route returns `501 unsupported_capability`, so CI can distinguish an unsupported
+omitted route returns logical status `501 unsupported_capability`, so CI can distinguish an unsupported
 backend from a transient runtime failure. True `DM_HEADLESS` registration still needs
 the public Defold debug transport proposed in the specification linked above.
 
@@ -328,7 +336,7 @@ All click, drag, path, pointer, and key actions share one FIFO. Only the first a
 Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch.
 
 When resolving an element id, pass `expected_scene_sequence` to reject a changed
-snapshot with HTTP 409 `stale_scene`. Input receipts include the scene sequence
+snapshot with logical status 409 `stale_scene`. Input receipts include the scene sequence
 and engine frame used for resolution.
 
 ```sh
@@ -368,12 +376,12 @@ Lifecycle terms are exact: `accepted` means queued, `started` means the first do
 
 Use `GET /input/status?input_id=42` for current/bounded-history status and `GET /input/pending` for the FIFO. `POST /input/cancel?input_id=42&release=1&client_id=...&session_id=...` cancels one action. `POST /input/flush?release=1&client_id=...&session_id=...` cancels the owning session's active and later actions. `release=1` releases mouse/key state or emits a cancelled touch contact. A pointer or controller lease expiry performs the same safe cleanup.
 
-Element-targeted input accepts `expected_scene_sequence`. A mismatch returns HTTP 409 with `stale_scene` before resolving a snapshot/path element id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
+Element-targeted input accepts `expected_scene_sequence`. A mismatch returns logical status 409 with `stale_scene` before resolving a snapshot/path element id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
 
 For protection that survives ordinary frame/snapshot advancement, element-targeted
 clicks also accept `expected_logical_id`; element-targeted drags accept
 `expected_from_logical_id` and `expected_to_logical_id`. If a path-derived element id
-now belongs to a different runtime instance, the request returns HTTP 409 with
+now belongs to a different runtime instance, the request returns logical status 409 with
 `stale_element` before input is queued.
 
 ### `POST /automation-bridge/v2/input/click`
@@ -408,7 +416,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ### `POST /automation-bridge/v2/input/key`
 
-Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names cover every named key in the engine's `dmHID::Key` enum: arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, `KEY_0`–`KEY_9`, punctuation and symbol keys (`KEY_EQUALS`, `KEY_MINUS`, `KEY_COMMA`, `KEY_PERIOD`, `KEY_SLASH`, brackets, and the rest), keypad keys (`KEY_KP_0`–`KEY_KP_9`, `KEY_KP_ADD`, ...), and lock/system keys (`KEY_CAPS_LOCK`, `KEY_PAUSE`, `KEY_LSUPER`, ...). Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. `hold` keeps each special key pressed for that many seconds (`0..60`, default `0` -- a single-update tap) before releasing it; it applies per `{KEY_...}` token, the combined hold across all tokens must stay within 60 seconds, and it requires at least one special key (literal text cannot be held). While held, the key is re-asserted every engine update, so bindings receive the same continuous per-frame actions a physically held key produces; the native event keeps controller ownership through its bounded release, and the receipt's `requested_duration` reports the total requested hold. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
+Use `text` for literal UTF-8 or `keys` for one or more brace-wrapped special keys such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names cover every named key in the engine's `dmHID::Key` enum: arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, `KEY_0`–`KEY_9`, punctuation and symbol keys (`KEY_EQUALS`, `KEY_MINUS`, `KEY_COMMA`, `KEY_PERIOD`, `KEY_SLASH`, brackets, and the rest), keypad keys (`KEY_KP_0`–`KEY_KP_9`, `KEY_KP_ADD`, ...), and lock/system keys (`KEY_CAPS_LOCK`, `KEY_PAUSE`, `KEY_LSUPER`, ...). Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. `hold` keeps each special key pressed for that many seconds (`0..60`, default `0` -- a single-update tap) before releasing it; it applies per `{KEY_...}` token, the combined hold across all tokens must stay within 60 seconds, and it requires at least one special key (literal text cannot be held). While held, the key is re-asserted every engine update, so bindings receive the same continuous per-frame actions a physically held key produces; progressing key events keep controller ownership through their bounded release without an indefinitely renewable hold, and the receipt's `requested_duration` reports the total requested hold. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key. `GET /health` advertises `input.key` capability version `2` for full named-key and hold support; clients must negotiate `input.key>=2` before sending `hold`.
 
 ### `GET /automation-bridge/v2/screenshot`
 
@@ -537,7 +545,7 @@ response contains a command id. Poll `GET /commands?id=<id>` for `pending`,
 `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON
 result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua
 callbacks run on the engine update thread and cannot be safely preempted; a
-running cancellation returns `409 command_not_cancellable`.
+running cancellation returns logical status `409 command_not_cancellable`.
 
 ### Native delivery and application acknowledgement
 
