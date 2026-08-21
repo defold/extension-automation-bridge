@@ -17,7 +17,8 @@ namespace dmAutomationBridge
         dmWebServer::Request*    m_Request;
         char*                    m_Path;
         char*                    m_Route;
-        Array<QueryParam>      m_Query;
+        Array<QueryParam>        m_Query;
+        Array<QueryParam>        m_JsonFields;
     };
 
     typedef void (*RouteHandler)(RequestContext* ctx);
@@ -399,7 +400,7 @@ namespace dmAutomationBridge
         return false;
     }
 
-    static bool JsonParseRootObject(const char* body, Array<QueryParam>* params)
+    static bool JsonParseRootObject(const char* body, Array<QueryParam>* params, Array<QueryParam>* fields)
     {
         const char* cursor = body;
         JsonSkipWhitespace(&cursor);
@@ -412,6 +413,11 @@ namespace dmAutomationBridge
             QueryParam param;
             memset(&param, 0, sizeof(param));
             if (!JsonParseString(&cursor, &param.m_Key)) return false;
+            if (!JsonPushParam(fields, param.m_Key, DuplicateString("1")))
+            {
+                FreeString(&param.m_Key);
+                return false;
+            }
             JsonSkipWhitespace(&cursor);
             if (*cursor != ':') { FreeString(&param.m_Key); return false; }
             ++cursor;
@@ -483,6 +489,7 @@ namespace dmAutomationBridge
         FreeString(&ctx->m_Path);
         FreeString(&ctx->m_Route);
         FreeQueryParams(&ctx->m_Query);
+        FreeQueryParams(&ctx->m_JsonFields);
     }
 
     static bool RequestHasApiPrefix(const RequestContext* ctx)
@@ -498,6 +505,11 @@ namespace dmAutomationBridge
     static bool RequestGetFloatParam(const RequestContext* ctx, const char* key, float* value)
     {
         return GetFloatParam(&ctx->m_Query, key, value);
+    }
+
+    static bool RequestHasParam(const RequestContext* ctx, const char* key)
+    {
+        return GetParam(&ctx->m_Query, key) != 0 || GetParam(&ctx->m_JsonFields, key) != 0;
     }
 
     static bool RequestGetBoolParam(const RequestContext* ctx, const char* key, bool* value)
@@ -1682,11 +1694,10 @@ namespace dmAutomationBridge
             return;
         }
         float key_hold = 0.0f;
-        const char* hold_text = RequestGetParam(ctx, "hold");
-        if (!IsEmpty(hold_text) && !RequestGetFloatParam(ctx, "hold", &key_hold))
+        if (RequestHasParam(ctx, "hold") && !RequestGetFloatParam(ctx, "hold", &key_hold))
         {
-            // Supplied but unparseable (e.g. hold=abc) must fail loudly, not degrade to a
-            // tap -- distinguish it from the parameter simply being absent.
+            // Supplied but unparseable values, including null, objects, and arrays in a
+            // JSON body, must fail loudly instead of degrading to a tap.
             RequestSendError(ctx, 400, "bad_request", "hold must be finite and between 0 and 60 seconds");
             return;
         }
@@ -2765,7 +2776,7 @@ namespace dmAutomationBridge
                 return;
             }
             char* body = ReadRequestBody(request);
-            bool parsed = body && JsonParseRootObject(body, &ctx.m_Query);
+            bool parsed = body && JsonParseRootObject(body, &ctx.m_Query, &ctx.m_JsonFields);
             free(body);
             if (!parsed)
             {

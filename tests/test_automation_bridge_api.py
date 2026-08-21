@@ -3401,6 +3401,31 @@ class AutomationBridgeApiTest(unittest.TestCase):
             })
         self.assertEqual("bad_request", unheld_text.exception.code)
 
+        input_identity = {
+            "keys": "{KEY_ENTER}",
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        }
+        for invalid_hold in ("", "abc", "nan"):
+            with self.subTest(invalid_query_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_query:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        params={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_query.exception.code)
+
+        for invalid_hold in ("", "abc", None, {}, [], True):
+            with self.subTest(invalid_json_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_json:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        json_body={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_json.exception.code)
+
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(
             type="gui_node",
