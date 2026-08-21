@@ -247,6 +247,7 @@ namespace dmAutomationBridge
         bool               m_ReleaseOnCancel;
         bool               m_PointerOpen;
         uint64_t           m_LeaseDeadline;
+        uint64_t           m_CompletionDeadline;
         dmHID::MouseButton m_MouseButton;
         bool               m_Visualize;
 
@@ -584,7 +585,7 @@ namespace dmAutomationBridge
     bool ValidateSpecialKeyInput(const char* keys, const char** error, uint32_t* out_special_key_count);
     bool ParseModifierList(const char* text, dmHID::Key* out_modifiers, uint32_t max_modifiers,
                            uint32_t* out_count, const char** error);
-    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold,
+    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold, float requested_duration,
                      const dmHID::Key* modifiers, uint32_t modifier_count,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt);

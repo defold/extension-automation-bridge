@@ -1013,6 +1013,18 @@ class Client:
         """Return whether the endpoint satisfies one capability declaration."""
         return self._capability_satisfies(capability, self._capability_versions(self.health()))
 
+    def _require_cached_capability(self, capability: str) -> None:
+        """Require one feature, reusing bootstrap health when it is available."""
+        health = self._last_health if isinstance(self._last_health, Mapping) else self.health()
+        versions = self._capability_versions(health)
+        if self._capability_satisfies(capability, versions):
+            return
+        backend = health.get("backend", {})
+        raise UnsupportedCapabilityError(
+            f"required Automation Bridge capability is unavailable or too old: {capability}; "
+            f"available={', '.join(sorted(versions)) or 'none'}; backend={backend!r}"
+        )
+
     def trace_metadata(self) -> JsonDict:
         """Return stable metadata to embed in trace bundles and CI artifacts."""
         health = self.health()
@@ -1183,6 +1195,7 @@ class Client:
             json_body["pointer_id"] = pointer_id
         normalized_modifiers = self._normalize_modifiers(modifiers)
         if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/click", json_body=json_body))
         return self._wait_input_compat(
@@ -1241,6 +1254,7 @@ class Client:
             json_body["pointer_id"] = pointer_id
         normalized_modifiers = self._normalize_modifiers(modifiers)
         if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/drag", json_body=json_body))
         return self._wait_input_compat(
@@ -1312,6 +1326,7 @@ class Client:
         )
         normalized_modifiers = self._normalize_modifiers(modifiers)
         if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=json_body))
         return self._wait_input_compat(
@@ -1355,6 +1370,7 @@ class Client:
         )
         normalized_modifiers = self._normalize_modifiers(modifiers)
         if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=json_body))
         return PointerSession(self, receipt, lease)
@@ -1395,19 +1411,20 @@ class Client:
 
         ``hold`` keeps the key pressed for that many seconds (``0..60``, default
         ``0`` -- a single-update tap) before releasing it, producing the same
-        continuous per-frame actions a physically held key generates. The
-        controller lease is sized to cover the hold plus queue margin (same
-        formula as the drag helpers), clamped to the 60-second lease ceiling.
-        When waiting on a long hold, raise ``timeout`` above the hold duration.
+        continuous per-frame actions a physically held key generates. When
+        waiting on a long hold, raise ``timeout`` above the hold duration.
         """
         hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
-        json_body = self._input_json_body(lease=min(60.0, max(5.0, hold + 2.0)))
+        if hold > 0.0:
+            self._require_cached_capability("input.key>=2")
+        json_body = self._input_json_body()
         json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         if hold > 0.0:
             json_body["hold"] = hold
         normalized_modifiers = self._normalize_modifiers(modifiers)
         if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
@@ -2193,6 +2210,18 @@ class Client:
             message=f"element did not disappear: {element_id}",
         )
 
+    @staticmethod
+    def _api_error_status(error: Mapping[str, Any], transport_status: int) -> int:
+        """Prefer a valid logical error status over its compatible transport fallback."""
+        logical_status = error.get("status")
+        if (
+            isinstance(logical_status, int)
+            and not isinstance(logical_status, bool)
+            and 400 <= logical_status <= 599
+        ):
+            return logical_status
+        return transport_status
+
     def _request(
         self,
         method: str,
@@ -2218,6 +2247,7 @@ class Client:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
+            status = self._api_error_status(error, status)
             request_trace.update({"status": status, "error": response})
             self._trace_record("action" if path.startswith("/input/") else "request_error", request_trace)
             error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
@@ -2243,6 +2273,7 @@ class Client:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
+            status = self._api_error_status(error, status)
             error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
             raise error_type(code, message, status, response)
         data = response.get("data", {})

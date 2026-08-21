@@ -352,12 +352,17 @@ game.click(480, 320)
 game.drag(first, second, duration=0.2, easing="ease_in_out")
 game.type_text("Hello")
 game.key("SPACE")
+game.key("SPACE", hold=1.5, wait="released", timeout=3)
 ```
 
-`key()` accepts case-insensitive letters, digits, function keys, and common names
-such as `SPACE`, `ESCAPE`, and `ENTER`, with or without the `KEY_` prefix. Unknown
-names are rejected before input is queued. `type_text()` always treats braces and
-other characters as literal UTF-8 text.
+`key()` accepts case-insensitive letters, digits, and every named key in Defold's
+`dmHID::Key` enum, with or without the `KEY_` prefix. This includes function,
+punctuation, keypad, lock, modifier, navigation, and system keys such as
+`EQUALS`, `KP_0`, and `CAPS_LOCK`. Unknown names are rejected before input is
+queued. `hold` keeps the key pressed for `0..60` seconds; held input requires a
+native endpoint advertising `input.key>=2`. When waiting for release, set
+`timeout` above the requested hold. `type_text()` always treats braces and other
+characters as literal UTF-8 text.
 
 `click()`, `drag()`, and `drag_path()` wait for native release by default.
 `type_text()` and `key()` return after the request is accepted unless a `wait`
