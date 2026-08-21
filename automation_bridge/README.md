@@ -408,7 +408,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ### `POST /automation-bridge/v2/input/key`
 
-Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names include arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, and `KEY_0`–`KEY_9`. Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
+Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names include arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, and `KEY_0`–`KEY_9`. Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. `hold` keeps each special key pressed for that many seconds (`0..60`, default `0` -- a single-update tap) before releasing it; it applies per `{KEY_...}` token, the combined hold across all tokens must stay within 60 seconds, and it requires at least one special key (literal text cannot be held). While held, the key is re-asserted every engine update, so bindings receive the same continuous per-frame actions a physically held key produces; the receipt's `requested_duration` reports the total requested hold. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
 
 ### `GET /automation-bridge/v2/screenshot`
 
