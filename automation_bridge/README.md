@@ -408,7 +408,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ### `POST /automation-bridge/v2/input/key`
 
-Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names include arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, and `KEY_0`–`KEY_9`. Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
+Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names cover every named key in the engine's `dmHID::Key` enum: arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, `KEY_0`–`KEY_9`, punctuation and symbol keys (`KEY_EQUALS`, `KEY_MINUS`, `KEY_COMMA`, `KEY_PERIOD`, `KEY_SLASH`, brackets, and the rest), keypad keys (`KEY_KP_0`–`KEY_KP_9`, `KEY_KP_ADD`, ...), and lock/system keys (`KEY_CAPS_LOCK`, `KEY_PAUSE`, `KEY_LSUPER`, ...). Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
 
 ### `GET /automation-bridge/v2/screenshot`
 

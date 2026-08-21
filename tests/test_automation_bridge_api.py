@@ -1510,11 +1510,14 @@ class EngineClientUnitTest(unittest.TestCase):
     def test_key_normalizes_common_names_and_optional_prefixes(self):
         bridge = FakeInputClient()
 
-        for key in ("M", "space", "KEY_ESCAPE", "{key_f12}", "7"):
+        for key in ("M", "space", "KEY_ESCAPE", "{key_f12}", "7", "EQUALS", "minus", "kp_0", "{KEY_CAPS_LOCK}"):
             bridge.key(key, wait=False)
 
         self.assertEqual(
-            ["{KEY_M}", "{KEY_SPACE}", "{KEY_ESCAPE}", "{KEY_F12}", "{KEY_7}"],
+            [
+                "{KEY_M}", "{KEY_SPACE}", "{KEY_ESCAPE}", "{KEY_F12}", "{KEY_7}",
+                "{KEY_EQUALS}", "{KEY_MINUS}", "{KEY_KP_0}", "{KEY_CAPS_LOCK}",
+            ],
             [request[2]["keys"] for request in bridge.api_requests],
         )
 
