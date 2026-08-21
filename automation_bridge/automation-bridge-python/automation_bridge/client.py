@@ -1335,11 +1335,21 @@ class Client:
         timeout: float = 10.0,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        hold: float = 0.0,
     ) -> InputReceipt:
-        """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``."""
+        """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``.
+
+        ``hold`` keeps the key pressed for that many seconds (``0..60``, default
+        ``0`` -- a single-update tap) before releasing it, producing the same
+        continuous per-frame actions a physically held key generates. When
+        waiting on a long hold, raise ``timeout`` above the hold duration.
+        """
+        hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
         json_body = self._input_json_body()
         json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
+        if hold > 0.0:
+            json_body["hold"] = hold
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
