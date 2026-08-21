@@ -1,3 +1,11 @@
+local HOLD_ACTION = hash("hold_timer")
+local MAX_HOLD_SECONDS = 60
+
+local function set_hold_timer_text(self, prefix)
+	local elapsed = math.min(self.hold_elapsed, MAX_HOLD_SECONDS)
+	gui.set_text(gui.get_node("hold_timer"), string.format("%s: %.2fs / %ds", prefix, elapsed, MAX_HOLD_SECONDS))
+end
+
 local function set_popup_enabled(enabled)
 	gui.set_enabled(gui.get_node("overlay"), enabled)
 	gui.set_enabled(gui.get_node("panel"), enabled)
@@ -8,7 +16,19 @@ end
 
 function init(self)
 	msg.post(".", "acquire_input_focus")
+	self.hold_elapsed = 0
+	self.hold_active = false
+	set_hold_timer_text(self, "Hold SPACE")
 	set_popup_enabled(false)
+end
+
+function update(self, dt)
+	if not self.hold_active then
+		return
+	end
+
+	self.hold_elapsed = math.min(self.hold_elapsed + dt, MAX_HOLD_SECONDS)
+	set_hold_timer_text(self, "Holding SPACE")
 end
 
 function final(self)
@@ -24,6 +44,18 @@ function on_message(self, message_id)
 end
 
 function on_input(self, action_id, action)
+	if action_id == HOLD_ACTION then
+		if action.pressed then
+			self.hold_elapsed = 0
+			self.hold_active = true
+			set_hold_timer_text(self, "Holding SPACE")
+		elseif action.released then
+			self.hold_active = false
+			set_hold_timer_text(self, "Last SPACE hold")
+		end
+		return true
+	end
+
 	if action_id ~= hash("touch") or not action.released then
 		return false
 	end

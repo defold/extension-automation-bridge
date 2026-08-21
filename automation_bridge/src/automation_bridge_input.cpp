@@ -11,6 +11,7 @@ namespace dmAutomationBridge
 {
     static const float INPUT_VISUALIZATION_SECONDS = 1.0f;
     static const float DEFAULT_CONTROLLER_LEASE_SECONDS = 5.0f;
+    static const float INPUT_COMPLETION_GRACE_SECONDS = DEFAULT_CONTROLLER_LEASE_SECONDS;
 
     static dmHID::Key KeyFromName(const char* name);
     static bool ParseSpecialKey(const char* keys, uint32_t index, char* name, uint32_t name_size, uint32_t* next_index);
@@ -163,6 +164,18 @@ namespace dmAutomationBridge
                SetString(&receipt->m_RequestId, NormalizedId(request_id, ""));
     }
 
+    static void RefreshKeyHoldCompletionDeadline(InputEvent* event, uint64_t now)
+    {
+        if (!event || event->m_Type != INPUT_EVENT_KEYS || event->m_Receipt.m_RequestedDuration <= 0.0f)
+        {
+            return;
+        }
+        // The finite operation, not the caller's heartbeat lease, owns the controller
+        // through release. Grace lets the release update run at the exact 60s boundary.
+        float protected_seconds = event->m_Receipt.m_RequestedDuration + INPUT_COMPLETION_GRACE_SECONDS;
+        event->m_CompletionDeadline = now + (uint64_t)(protected_seconds * 1000000.0f);
+    }
+
     static bool CanQueueInputEvent()
     {
         return g_AutomationBridge.m_InputEvents.m_Count < MAX_INPUT_EVENTS;
@@ -187,6 +200,10 @@ namespace dmAutomationBridge
         MoveReceiptToHistory(event);
         FreeInputEvent(event);
         ArrayErase(&g_AutomationBridge.m_InputEvents, index);
+        if (index == 0 && g_AutomationBridge.m_InputEvents.m_Count > 0)
+        {
+            RefreshKeyHoldCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], dmTime::GetTime());
+        }
     }
 
     bool IsInputController(const char* client_id, const char* session_id)
@@ -195,12 +212,29 @@ namespace dmAutomationBridge
                StringsEqual(g_AutomationBridge.m_ControllerSessionId, NormalizedId(session_id, "default"));
     }
 
+    static uint64_t EffectiveControllerLeaseDeadline()
+    {
+        uint64_t deadline = g_AutomationBridge.m_ControllerLeaseDeadline;
+        if (g_AutomationBridge.m_InputEvents.m_Count == 0)
+        {
+            return deadline;
+        }
+        const InputEvent* event = &g_AutomationBridge.m_InputEvents.m_Data[0];
+        if (event->m_Type == INPUT_EVENT_KEYS && event->m_Receipt.m_RequestedDuration > 0.0f &&
+            IsInputController(event->m_Receipt.m_ClientId, event->m_Receipt.m_SessionId) &&
+            event->m_CompletionDeadline > deadline)
+        {
+            deadline = event->m_CompletionDeadline;
+        }
+        return deadline;
+    }
+
     bool AcquireInputController(const char* client_id, const char* session_id, float lease, const char** error)
     {
         uint64_t now = dmTime::GetTime();
         const char* normalized_client = NormalizedId(client_id, "anonymous");
         const char* normalized_session = NormalizedId(session_id, "default");
-        if (!IsEmpty(g_AutomationBridge.m_ControllerClientId) && g_AutomationBridge.m_ControllerLeaseDeadline <= now)
+        if (!IsEmpty(g_AutomationBridge.m_ControllerClientId) && EffectiveControllerLeaseDeadline() <= now)
         {
             FlushInput(g_AutomationBridge.m_ControllerClientId, g_AutomationBridge.m_ControllerSessionId, true, "controller_lease_expired");
             FreeString(&g_AutomationBridge.m_ControllerClientId);
@@ -294,7 +328,7 @@ namespace dmAutomationBridge
         return true;
     }
 
-    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold,
+    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold, float requested_duration,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt)
     {
@@ -310,8 +344,14 @@ namespace dmAutomationBridge
         event.m_ParseSpecialKeys = parse_special_keys;
         event.m_HoldAfter = key_hold; // per special-key hold in seconds; 0 = single-update tap
         if (!event.m_Keys || !InitReceipt(&event.m_Receipt, "key", client_id, session_id, request_id,
-                                          scene_sequence, INPUT_DEVICE_AUTO, 0) ||
-            !ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
+                                          scene_sequence, INPUT_DEVICE_AUTO, 0))
+        {
+            FreeInputEvent(&event);
+            return false;
+        }
+        event.m_Receipt.m_RequestedDuration = requested_duration;
+        RefreshKeyHoldCompletionDeadline(&event, dmTime::GetTime());
+        if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
             FreeInputEvent(&event);
             return false;
@@ -881,7 +921,12 @@ namespace dmAutomationBridge
     {
         if (!g_AutomationBridge.m_HidContext) return;
         uint64_t now = dmTime::GetTime();
-        if (!IsEmpty(g_AutomationBridge.m_ControllerClientId) && g_AutomationBridge.m_ControllerLeaseDeadline <= now)
+        if (g_AutomationBridge.m_InputEvents.m_Count > 0 &&
+            g_AutomationBridge.m_InputEvents.m_Data[0].m_Receipt.m_State == INPUT_STATE_ACCEPTED)
+        {
+            RefreshKeyHoldCompletionDeadline(&g_AutomationBridge.m_InputEvents.m_Data[0], now);
+        }
+        if (!IsEmpty(g_AutomationBridge.m_ControllerClientId) && EffectiveControllerLeaseDeadline() <= now)
         {
             FlushInput(g_AutomationBridge.m_ControllerClientId, g_AutomationBridge.m_ControllerSessionId, true, "controller_lease_expired");
             ReleaseInputController(g_AutomationBridge.m_ControllerClientId, g_AutomationBridge.m_ControllerSessionId);

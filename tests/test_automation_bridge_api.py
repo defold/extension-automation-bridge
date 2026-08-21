@@ -1536,18 +1536,17 @@ class EngineClientUnitTest(unittest.TestCase):
 
         bridge.key("KEY_UP", wait=False, hold=1.5)
         bridge.key("KEY_UP", wait=False, hold=6)
-        bridge.key("KEY_UP", wait=False, hold=59)
+        bridge.key("KEY_UP", wait=False, hold=60)
         bridge.key("KEY_UP", wait=False)
 
-        short_hold, long_hold, capped_hold, tapped = (request[2] for request in bridge.api_requests)
+        short_hold, long_hold, maximum_hold, tapped = (request[2] for request in bridge.api_requests)
         self.assertEqual("{KEY_UP}", short_hold["keys"])
         self.assertEqual(1.5, short_hold["hold"])
-        # A 1.5s hold fits inside the default 5s controller lease, so none is sent.
-        self.assertNotIn("lease", short_hold)
-        # Longer holds size the controller lease to cover the hold plus queue margin
-        # (the drag helpers' formula) so native lease expiry can't cancel them mid-hold.
-        self.assertEqual(8.0, long_hold["lease"])
-        self.assertEqual(60.0, capped_hold["lease"])
+        self.assertEqual(6.0, long_hold["hold"])
+        self.assertEqual(60.0, maximum_hold["hold"])
+        # Finite key holds reserve their controller lifetime in the native bridge.
+        # The public wrapper should not duplicate that lease policy.
+        self.assertTrue(all("lease" not in request for request in (short_hold, long_hold, maximum_hold)))
         self.assertNotIn("hold", tapped)
 
     def test_key_hold_rejects_invalid_durations_before_queueing(self):
@@ -3355,12 +3354,35 @@ class AutomationBridgeApiTest(unittest.TestCase):
         special_key = self.bridge.key("KEY_ENTER")
         self.assertEqual("key", special_key["kind"])
 
-        held_key = self.bridge.key("KEY_ENTER", hold=0.3, wait="released")
+        hold_timer = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True)
+        self.assertEqual("Hold SPACE: 0.00s / 60s", hold_timer.text)
+
+        held_key = self.bridge.key("KEY_SPACE", hold=0.3, wait="released")
         self.assertEqual("released", held_key["state"])
         self.assertAlmostEqual(0.3, held_key["requested_duration"], places=5)
         # actual_duration is release minus start: a tap measures ~one frame, so a
         # value near the requested hold proves the key genuinely stayed pressed.
         self.assertGreaterEqual(held_key["actual_duration"], 0.25)
+
+        def released_hold_timer_text():
+            text = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True).text
+            return text if text.startswith("Last SPACE hold: ") else None
+
+        timer_text = wait_until(released_hold_timer_text, timeout=2, message="hold timer did not stop")
+        displayed_duration = float(timer_text.split(": ", 1)[1].split("s", 1)[0])
+        self.assertGreaterEqual(displayed_duration, 0.2)
+        self.assertLess(displayed_duration, 0.6)
+
+        short_lease_hold = self.bridge.request("POST", "/input/key", json_body={
+            "keys": "{KEY_ENTER}",
+            "hold": 0.3,
+            "lease": 0.1,
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        })
+        short_lease_hold = self.bridge.input.wait(short_lease_hold, state="released", timeout=2)
+        self.assertEqual("released", short_lease_hold["state"])
+        self.assertGreaterEqual(short_lease_hold["actual_duration"], 0.25)
 
         with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
             self.bridge.request("POST", "/input/key", json_body={

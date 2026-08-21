@@ -1355,14 +1355,12 @@ class Client:
 
         ``hold`` keeps the key pressed for that many seconds (``0..60``, default
         ``0`` -- a single-update tap) before releasing it, producing the same
-        continuous per-frame actions a physically held key generates. The
-        controller lease is sized to cover the hold plus queue margin (same
-        formula as the drag helpers), clamped to the 60-second lease ceiling.
-        When waiting on a long hold, raise ``timeout`` above the hold duration.
+        continuous per-frame actions a physically held key generates. When
+        waiting on a long hold, raise ``timeout`` above the hold duration.
         """
         hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
-        json_body = self._input_json_body(lease=min(60.0, max(5.0, hold + 2.0)))
+        json_body = self._input_json_body()
         json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         if hold > 0.0:
             json_body["hold"] = hold

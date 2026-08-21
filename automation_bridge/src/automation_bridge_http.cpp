@@ -1696,7 +1696,8 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 400, "bad_request", "hold requires at least one {KEY_...} special key via the keys parameter; literal text cannot be held");
             return;
         }
-        if (key_hold * (float)special_key_count > MAX_INPUT_DURATION)
+        float requested_duration = key_hold * (float)special_key_count;
+        if (requested_duration > MAX_INPUT_DURATION)
         {
             RequestSendError(ctx, 400, "bad_request", "total key hold duration exceeds 60 seconds");
             return;
@@ -1707,13 +1708,12 @@ namespace dmAutomationBridge
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
         InputReceipt* receipt = 0;
-        if (!AddKeyInput(value, parse_special_keys, key_hold, client_id, session_id, request_id,
+        if (!AddKeyInput(value, parse_special_keys, key_hold, requested_duration, client_id, session_id, request_id,
                          g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
         }
-        receipt->m_RequestedDuration = key_hold * (float)special_key_count;
         SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
     }
 
