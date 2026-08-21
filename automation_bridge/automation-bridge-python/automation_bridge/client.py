@@ -33,11 +33,25 @@ _NAMED_KEYS = {
     "BACKSPACE", "INSERT", "DEL", "DELETE", "PAGEUP", "PAGEDOWN", "HOME", "END",
     "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT",
     *(f"F{number}" for number in range(1, 13)),
+    # Punctuation and symbol keys -- every remaining named key in dmHID's Key enum.
+    "EXCLAIM", "QUOTEDBL", "HASH", "DOLLAR", "AMPERSAND", "QUOTE", "LPAREN",
+    "RPAREN", "ASTERISK", "PLUS", "COMMA", "MINUS", "PERIOD", "SLASH", "COLON",
+    "SEMICOLON", "LESS", "EQUALS", "GREATER", "QUESTION", "AT", "LBRACKET",
+    "BACKSLASH", "RBRACKET", "CARET", "UNDERSCORE", "BACKQUOTE", "LBRACE",
+    "PIPE", "RBRACE", "TILDE",
+    # Keypad
+    *(f"KP_{number}" for number in range(10)),
+    "KP_DIVIDE", "KP_MULTIPLY", "KP_SUBTRACT", "KP_ADD", "KP_DECIMAL",
+    "KP_EQUAL", "KP_ENTER", "KP_NUM_LOCK",
+    # Lock/system keys
+    "CAPS_LOCK", "SCROLL_LOCK", "PAUSE", "LSUPER", "RSUPER", "MENU", "BACK",
 }
 _KEY_ERROR = (
-    "key must be A-Z, 0-9, F1-F12, or one of SPACE, ESCAPE, UP, DOWN, LEFT, "
-    "RIGHT, TAB, ENTER, BACKSPACE, INSERT, DELETE, PAGEUP, PAGEDOWN, HOME, END, "
-    "LSHIFT, RSHIFT, LCTRL, RCTRL, LALT, or RALT; an optional KEY_ prefix is accepted"
+    "key must be A-Z, 0-9, F1-F12, a named key from the engine's dmHID Key enum "
+    "(SPACE, ESCAPE, arrows, TAB, ENTER, BACKSPACE, navigation keys, modifiers, "
+    "punctuation/symbol keys such as EQUALS, MINUS, COMMA, PERIOD, SLASH, "
+    "keypad keys such as KP_0-KP_9 and KP_ADD, or lock/system keys such as "
+    "CAPS_LOCK, PAUSE, LSUPER); an optional KEY_ prefix is accepted"
 )
 PYTHON_PACKAGE_VERSION = "3.0.0"
 SUPPORTED_API_VERSION_MIN = 2
