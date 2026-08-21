@@ -251,8 +251,21 @@ namespace dmAutomationBridge
         return total;
     }
 
+    // Copy validated chord modifiers into a freshly-initialized event (see the
+    // InputEvent field comment; parse/validation happens in ParseModifierList).
+    static void SetEventModifiers(InputEvent* event, const dmHID::Key* modifiers, uint32_t modifier_count)
+    {
+        uint32_t count = modifier_count > MAX_INPUT_MODIFIERS ? MAX_INPUT_MODIFIERS : modifier_count;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            event->m_Modifiers[i] = modifiers[i];
+        }
+        event->m_ModifierCount = (uint8_t)count;
+    }
+
     bool AddMouseInput(const Array<InputPoint>* points, InputPathMode path_mode, float hold_before, float hold_after,
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
+                       const dmHID::Key* modifiers, uint32_t modifier_count,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt)
     {
@@ -275,6 +288,7 @@ namespace dmAutomationBridge
         event.m_MouseButton = dmHID::MOUSE_BUTTON_LEFT;
         event.m_Visualize = visualize;
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
+        SetEventModifiers(&event, modifiers, modifier_count);
         event.m_PointerOpen = pointer_open;
         event.m_LeaseDeadline = pointer_open ? dmTime::GetTime() + (uint64_t)(ClampFloat(lease, 0.1f, MAX_INPUT_DURATION) * 1000000.0f) : 0;
         if (!InitReceipt(&event.m_Receipt, kind, client_id, session_id, request_id, scene_sequence, resolved, pointer_id) ||
@@ -285,6 +299,7 @@ namespace dmAutomationBridge
         }
         memcpy(event.m_Points.m_Data, points->m_Data, sizeof(InputPoint) * points->m_Count);
         event.m_Receipt.m_RequestedDuration = event.m_HoldBefore + RequestedPathDuration(points, path_mode) + event.m_HoldAfter;
+        event.m_Receipt.m_ModifierCount = event.m_ModifierCount; // echoed in receipts so callers can detect a bridge without modifier support
         if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
             FreeInputEvent(&event);
@@ -295,6 +310,7 @@ namespace dmAutomationBridge
     }
 
     bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold,
+                     const dmHID::Key* modifiers, uint32_t modifier_count,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt)
     {
@@ -307,6 +323,7 @@ namespace dmAutomationBridge
         event.m_Type = INPUT_EVENT_KEYS;
         event.m_Keys = DuplicateString(keys);
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
+        SetEventModifiers(&event, modifiers, modifier_count);
         event.m_ParseSpecialKeys = parse_special_keys;
         event.m_HoldAfter = key_hold; // per special-key hold in seconds; 0 = single-update tap
         if (!event.m_Keys || !InitReceipt(&event.m_Receipt, "key", client_id, session_id, request_id,
@@ -317,6 +334,7 @@ namespace dmAutomationBridge
             return false;
         }
         *receipt = &g_AutomationBridge.m_InputEvents.m_Data[g_AutomationBridge.m_InputEvents.m_Count - 1].m_Receipt;
+        (*receipt)->m_ModifierCount = event.m_ModifierCount; // echoed in receipts so callers can detect a bridge without modifier support
         return true;
     }
 
@@ -475,6 +493,8 @@ namespace dmAutomationBridge
         AppendJsonString(out, InputDeviceName(receipt->m_Device));
         StringBufferAppend(out, ",\"pointer_id\":");
         AppendNumber(out, (double)receipt->m_PointerId);
+        StringBufferAppend(out, ",\"modifier_count\":");
+        AppendNumber(out, (double)receipt->m_ModifierCount);
         StringBufferAppendChar(out, '}');
     }
 
@@ -568,6 +588,57 @@ namespace dmAutomationBridge
         memcpy(name, start, length);
         name[length] = 0;
         *next_index = (uint32_t)(end - keys) + 1;
+        return true;
+    }
+
+    // Parse a comma-separated list of key names (e.g. "KEY_LSHIFT,KEY_LCTRL") into
+    // validated dmHID keys for use as chord modifiers. Deliberately loud: an empty
+    // list, an unknown name, or too many entries is an error, never silently ignored --
+    // a supplied-but-invalid modifier degrading to an unmodified gesture is exactly the
+    // kind of silent no-op the input API's validation contract exists to prevent.
+    bool ParseModifierList(const char* text, dmHID::Key* out_modifiers, uint32_t max_modifiers,
+                           uint32_t* out_count, const char** error)
+    {
+        *out_count = 0;
+        if (IsEmpty(text))
+        {
+            *error = "modifiers is empty; provide comma-separated key names such as KEY_LSHIFT,KEY_LCTRL";
+            return false;
+        }
+        const char* cursor = text;
+        while (*cursor)
+        {
+            while (*cursor == ' ' || *cursor == ',') ++cursor;
+            if (!*cursor) break;
+            const char* start = cursor;
+            while (*cursor && *cursor != ',' && *cursor != ' ') ++cursor;
+            char name[64];
+            uint32_t length = (uint32_t)(cursor - start);
+            if (length == 0 || length >= sizeof(name))
+            {
+                *error = "unsupported modifier key; use names accepted by the keys parameter, such as KEY_LSHIFT, KEY_LCTRL, or KEY_LALT";
+                return false;
+            }
+            memcpy(name, start, length);
+            name[length] = 0;
+            dmHID::Key key = KeyFromName(name);
+            if (key == dmHID::MAX_KEY_COUNT)
+            {
+                *error = "unsupported modifier key; use names accepted by the keys parameter, such as KEY_LSHIFT, KEY_LCTRL, or KEY_LALT";
+                return false;
+            }
+            if (*out_count >= max_modifiers)
+            {
+                *error = "too many modifiers; at most 4 are supported";
+                return false;
+            }
+            out_modifiers[(*out_count)++] = key;
+        }
+        if (*out_count == 0)
+        {
+            *error = "modifiers is empty; provide comma-separated key names such as KEY_LSHIFT,KEY_LCTRL";
+            return false;
+        }
         return true;
     }
 
@@ -705,6 +776,25 @@ namespace dmAutomationBridge
         ReceiptSetReason(receipt, reason);
     }
 
+    // Re-assert an event's chord modifiers for this update. The engine's HID update
+    // re-polls the OS keyboard right before extension updates each frame, wiping injected
+    // key state -- so held modifiers must be asserted every update, and simply stopping
+    // is already a clean release (one update after the primary's release, giving games
+    // that track a modifier's own key_trigger the ordering a human chord produces).
+    static bool AssertModifiers(InputEvent* event)
+    {
+        dmHID::HKeyboard keyboard = dmHID::GetKeyboard(g_AutomationBridge.m_HidContext, 0);
+        if (keyboard == dmHID::INVALID_KEYBOARD_HANDLE)
+        {
+            return false;
+        }
+        for (uint8_t i = 0; i < event->m_ModifierCount; ++i)
+        {
+            dmHID::SetKey(keyboard, event->m_Modifiers[i], true);
+        }
+        return true;
+    }
+
     static bool UpdateMouseEvent(float dt, InputEvent* event)
     {
         InputPoint* first = &event->m_Points.m_Data[0];
@@ -712,6 +802,24 @@ namespace dmAutomationBridge
         {
             FinishReceipt(&event->m_Receipt, INPUT_STATE_CANCELLED, event->m_Receipt.m_Reason);
             return true;
+        }
+        if (event->m_ModifierCount > 0)
+        {
+            if (!AssertModifiers(event))
+            {
+                FinishReceipt(&event->m_Receipt, INPUT_STATE_FAILED, "keyboard_unavailable");
+                return true;
+            }
+            if (!event->m_Pressed && !event->m_ModifierLeadDone)
+            {
+                // Modifiers lead the pointer by one update: Defold actions carry no
+                // modifier flags, so games track the modifier's own key_trigger
+                // pressed/released into a flag -- its press must reach on_input before
+                // the pointer action does, exactly as a human chord arrives.
+                event->m_ModifierLeadDone = true;
+                if (event->m_Receipt.m_State == INPUT_STATE_ACCEPTED) StartReceipt(&event->m_Receipt);
+                return false;
+            }
         }
         if (!event->m_Pressed)
         {
@@ -797,6 +905,17 @@ namespace dmAutomationBridge
             return true;
         }
         if (event->m_Receipt.m_State == INPUT_STATE_ACCEPTED) StartReceipt(&event->m_Receipt);
+        if (event->m_ModifierCount > 0)
+        {
+            AssertModifiers(event); // keyboard handle already validated above
+            if (!event->m_ModifierLeadDone)
+            {
+                // Modifiers lead the first tap by one update -- see UpdateMouseEvent's
+                // matching comment for why the ordering matters.
+                event->m_ModifierLeadDone = true;
+                return false;
+            }
+        }
         if (event->m_ActiveKey != dmHID::MAX_KEY_COUNT)
         {
             // Hold phase: the engine's own HID update re-polls the OS keyboard right before

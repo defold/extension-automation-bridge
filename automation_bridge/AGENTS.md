@@ -20,7 +20,9 @@
   viewport, display, or GUI transforms.
 - Input is FIFO and receipt-based. Wait for the required phase. `text` is literal
   UTF-8; `keys` contains one validated brace-wrapped special key, optionally kept
-  pressed for `hold` seconds (`0..60`) before its release.
+  pressed for `hold` seconds (`0..60`) before its release. `modifiers` holds up to
+  four named keys as a chord across a click, drag, pointer session, or key press
+  (pressed one update before the primary action, released one update after).
 - Screenshot and Metal captures are asynchronous; poll their status receipts.
   Metal capture requires macOS, the Metal adapter, and
   `METAL_CAPTURE_ENABLED=1`; inspect completed traces with `gpudebug` when

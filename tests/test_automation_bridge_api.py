@@ -1560,6 +1560,34 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual([], bridge.api_requests)
 
+    def test_modifiers_are_normalized_and_forwarded(self):
+        bridge = FakeInputClient()
+
+        bridge.click((10, 10), modifiers="lshift", wait=False)
+        bridge.drag((0, 0), (10, 10), duration=0.1, modifiers=["KEY_LCTRL", "{key_lalt}"], wait=False)
+        bridge.key("Z", modifiers="LCTRL", hold=1.0, wait=False)
+        bridge.click((10, 10), wait=False)
+
+        clicked, dragged, chorded, plain = (request[2] for request in bridge.api_requests)
+        self.assertEqual("KEY_LSHIFT", clicked["modifiers"])
+        self.assertEqual("KEY_LCTRL,KEY_LALT", dragged["modifiers"])
+        self.assertEqual("KEY_LCTRL", chorded["modifiers"])
+        self.assertEqual("{KEY_Z}", chorded["keys"])
+        self.assertEqual(1.0, chorded["hold"])
+        self.assertNotIn("modifiers", plain)
+
+    def test_modifiers_reject_invalid_before_queueing(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(ValueError, "A-Z, 0-9"):
+            bridge.click((10, 10), modifiers="COMMAND", wait=False)
+        with self.assertRaisesRegex(ValueError, "at most 4"):
+            bridge.key("Z", modifiers=["LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT"], wait=False)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            bridge.drag((0, 0), (10, 10), duration=0.1, modifiers=[], wait=False)
+
+        self.assertEqual([], bridge.api_requests)
+
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
 
@@ -3378,6 +3406,37 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 "session_id": self.bridge.session_id,
             })
         self.assertEqual("bad_request", unheld_text.exception.code)
+
+        # Chord modifiers ride inside one FIFO event (pressed one update before the
+        # primary action, released one update after), so a modified gesture completes
+        # its normal lifecycle. Clicked at a neutral coordinate so no game element
+        # reacts and later label-count assertions stay undisturbed.
+        chorded_click = self.bridge.click((1, 1), modifiers="LSHIFT", wait="released")
+        self.assertEqual("released", chorded_click["state"])
+        # modifier_count is echoed so callers can detect a bridge that silently ignored
+        # an unknown modifiers parameter (same contract as hold's requested_duration).
+        self.assertEqual(1, chorded_click["modifier_count"])
+        chorded_key = self.bridge.key("KEY_ENTER", modifiers="LCTRL", wait="released")
+        self.assertEqual("released", chorded_key["state"])
+        self.assertEqual(1, chorded_key["modifier_count"])
+
+        with self.assertRaises(AutomationBridgeApiError) as unknown_modifier:
+            self.bridge.request("POST", "/input/click", json_body={
+                "x": 1, "y": 1,
+                "modifiers": "KEY_BOGUS",
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("unsupported_key", unknown_modifier.exception.code)
+
+        with self.assertRaises(AutomationBridgeApiError) as chorded_text:
+            self.bridge.request("POST", "/input/key", json_body={
+                "text": "hello",
+                "modifiers": "KEY_LSHIFT",
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("bad_request", chorded_text.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(
