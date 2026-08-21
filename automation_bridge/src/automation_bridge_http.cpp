@@ -1682,7 +1682,14 @@ namespace dmAutomationBridge
             return;
         }
         float key_hold = 0.0f;
-        RequestGetFloatParam(ctx, "hold", &key_hold);
+        const char* hold_text = RequestGetParam(ctx, "hold");
+        if (!IsEmpty(hold_text) && !RequestGetFloatParam(ctx, "hold", &key_hold))
+        {
+            // Supplied but unparseable (e.g. hold=abc) must fail loudly, not degrade to a
+            // tap -- distinguish it from the parameter simply being absent.
+            RequestSendError(ctx, 400, "bad_request", "hold must be finite and between 0 and 60 seconds");
+            return;
+        }
         if (!ValidateDuration(ctx, key_hold, "hold")) return;
         if (key_hold > 0.0f && special_key_count == 0)
         {

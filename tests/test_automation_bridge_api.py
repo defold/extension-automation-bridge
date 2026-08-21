@@ -1532,11 +1532,19 @@ class EngineClientUnitTest(unittest.TestCase):
         bridge = FakeInputClient()
 
         bridge.key("KEY_UP", wait=False, hold=1.5)
+        bridge.key("KEY_UP", wait=False, hold=6)
+        bridge.key("KEY_UP", wait=False, hold=59)
         bridge.key("KEY_UP", wait=False)
 
-        held, tapped = (request[2] for request in bridge.api_requests)
-        self.assertEqual("{KEY_UP}", held["keys"])
-        self.assertEqual(1.5, held["hold"])
+        short_hold, long_hold, capped_hold, tapped = (request[2] for request in bridge.api_requests)
+        self.assertEqual("{KEY_UP}", short_hold["keys"])
+        self.assertEqual(1.5, short_hold["hold"])
+        # A 1.5s hold fits inside the default 5s controller lease, so none is sent.
+        self.assertNotIn("lease", short_hold)
+        # Longer holds size the controller lease to cover the hold plus queue margin
+        # (the drag helpers' formula) so native lease expiry can't cancel them mid-hold.
+        self.assertEqual(8.0, long_hold["lease"])
+        self.assertEqual(60.0, capped_hold["lease"])
         self.assertNotIn("hold", tapped)
 
     def test_key_hold_rejects_invalid_durations_before_queueing(self):
