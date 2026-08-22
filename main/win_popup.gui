@@ -172,6 +172,34 @@ nodes {
   shadow_alpha: 0.8
   size_mode: SIZE_MODE_MANUAL
 }
+nodes {
+  position {
+    x: 480.0
+    y: 568.0
+    z: 0.2
+  }
+  size {
+    x: 600.0
+    y: 36.0
+  }
+  color {
+    x: 1.0
+    y: 1.0
+    z: 1.0
+    w: 1.0
+  }
+  type: TYPE_TEXT
+  text: "Send H + SHIFT + ALT"
+  font: "default"
+  id: "modifier_chord"
+  pivot: PIVOT_CENTER
+  adjust_mode: ADJUST_MODE_FIT
+  inherit_alpha: true
+  alpha: 1.0
+  outline_alpha: 0.8
+  shadow_alpha: 0.8
+  size_mode: SIZE_MODE_MANUAL
+}
 material: "/builtins/materials/gui.material"
 adjust_reference: ADJUST_REFERENCE_PARENT
 max_nodes: 64

@@ -6,3 +6,15 @@ key_trigger {
   input: KEY_SPACE
   action: "hold_timer"
 }
+key_trigger {
+  input: KEY_H
+  action: "modifier_chord_h"
+}
+key_trigger {
+  input: KEY_LSHIFT
+  action: "modifier_chord_shift"
+}
+key_trigger {
+  input: KEY_LALT
+  action: "modifier_chord_alt"
+}

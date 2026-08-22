@@ -3561,9 +3561,33 @@ class AutomationBridgeApiTest(unittest.TestCase):
         # modifier_count is echoed so callers can detect a bridge that silently ignored
         # an unknown modifiers parameter (same contract as hold's requested_duration).
         self.assertEqual(1, chorded_click["modifier_count"])
-        chorded_key = self.bridge.key("KEY_ENTER", modifiers="LCTRL", wait="released")
+        # Exercise the chord in the game, not only in receipt metadata. The GUI tracks
+        # modifier key_trigger state before handling H and keeps visible evidence of
+        # the exact chord it observed.
+        chorded_key = self.bridge.key(
+            "KEY_H",
+            modifiers=("LSHIFT", "LALT"),
+            wait="released",
+        )
         self.assertEqual("released", chorded_key["state"])
-        self.assertEqual(1, chorded_key["modifier_count"])
+        self.assertEqual(2, chorded_key["modifier_count"])
+
+        def received_modifier_chord():
+            text = self.bridge.element(
+                type="gui_node_text",
+                name_exact="modifier_chord",
+                visible=True,
+            ).text
+            return text if text == "Received H + SHIFT + ALT" else None
+
+        self.assertEqual(
+            "Received H + SHIFT + ALT",
+            wait_until(
+                received_modifier_chord,
+                timeout=2,
+                message="game did not observe H with SHIFT and ALT held",
+            ),
+        )
 
         with self.assertRaises(AutomationBridgeApiError) as unknown_modifier:
             self.bridge.request("POST", "/input/click", json_body={

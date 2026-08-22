@@ -1,9 +1,16 @@
 local HOLD_ACTION = hash("hold_timer")
+local CHORD_H_ACTION = hash("modifier_chord_h")
+local CHORD_SHIFT_ACTION = hash("modifier_chord_shift")
+local CHORD_ALT_ACTION = hash("modifier_chord_alt")
 local MAX_HOLD_SECONDS = 60
 
 local function set_hold_timer_text(self, prefix)
 	local elapsed = math.min(self.hold_elapsed, MAX_HOLD_SECONDS)
 	gui.set_text(gui.get_node("hold_timer"), string.format("%s: %.2fs / %ds", prefix, elapsed, MAX_HOLD_SECONDS))
+end
+
+local function set_modifier_chord_text(text)
+	gui.set_text(gui.get_node("modifier_chord"), text)
 end
 
 local function set_popup_enabled(enabled)
@@ -18,7 +25,10 @@ function init(self)
 	msg.post(".", "acquire_input_focus")
 	self.hold_elapsed = 0
 	self.hold_active = false
+	self.chord_shift_active = false
+	self.chord_alt_active = false
 	set_hold_timer_text(self, "Hold SPACE")
+	set_modifier_chord_text("Send H + SHIFT + ALT")
 	set_popup_enabled(false)
 end
 
@@ -52,6 +62,37 @@ function on_input(self, action_id, action)
 		elseif action.released then
 			self.hold_active = false
 			set_hold_timer_text(self, "Last SPACE hold")
+		end
+		return true
+	end
+
+	if action_id == CHORD_SHIFT_ACTION then
+		if action.pressed then
+			self.chord_shift_active = true
+		elseif action.released then
+			self.chord_shift_active = false
+		end
+		return true
+	end
+
+	if action_id == CHORD_ALT_ACTION then
+		if action.pressed then
+			self.chord_alt_active = true
+		elseif action.released then
+			self.chord_alt_active = false
+		end
+		return true
+	end
+
+	if action_id == CHORD_H_ACTION then
+		if action.pressed and self.chord_shift_active and self.chord_alt_active then
+			set_modifier_chord_text("Received H + SHIFT + ALT")
+		elseif action.pressed then
+			set_modifier_chord_text(string.format(
+				"Received H (SHIFT %s, ALT %s)",
+				self.chord_shift_active and "down" or "up",
+				self.chord_alt_active and "down" or "up"
+			))
 		end
 		return true
 	end
