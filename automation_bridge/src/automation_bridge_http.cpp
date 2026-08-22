@@ -773,6 +773,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "input.drag_path");
             AppendCapability(&names, &versions, &first, "input.pointer");
             AppendCapability(&names, &versions, &first, "input.key", "2");
+            AppendCapability(&names, &versions, &first, "input.modifiers");
             AppendCapability(&names, &versions, &first, "input.receipts");
             AppendCapability(&names, &versions, &first, "input.queue");
             AppendCapability(&names, &versions, &first, "input.controller");
@@ -1509,6 +1510,24 @@ namespace dmAutomationBridge
         return true;
     }
 
+    // Parse the optional "modifiers" parameter (comma-separated key names held as a chord
+    // for the whole event). Absent is fine; supplied-but-invalid (empty, unknown name,
+    // too many) sends the error response and fails the request rather than silently
+    // degrading to an unmodified gesture.
+    static bool GetModifiersParam(RequestContext* ctx, dmHID::Key* modifiers, uint32_t* modifier_count)
+    {
+        *modifier_count = 0;
+        const char* text = RequestGetParam(ctx, "modifiers");
+        if (text == 0) return true;
+        const char* error = 0;
+        if (!ParseModifierList(text, modifiers, MAX_INPUT_MODIFIERS, modifier_count, &error))
+        {
+            RequestSendError(ctx, 400, "unsupported_key", error);
+            return false;
+        }
+        return true;
+    }
+
     static bool QueuePointerPath(RequestContext* ctx, Array<InputPoint>* points, InputPathMode mode,
                                  float hold_before, float hold_after, const char* kind, bool pointer_open, float pointer_lease)
     {
@@ -1516,6 +1535,9 @@ namespace dmAutomationBridge
         uint32_t pointer_id = 0;
         bool visualize = true;
         if (!GetInputOptions(ctx, &device, &pointer_id, &visualize)) return false;
+        dmHID::Key modifiers[MAX_INPUT_MODIFIERS];
+        uint32_t modifier_count = 0;
+        if (!GetModifiersParam(ctx, modifiers, &modifier_count)) return false;
         const char* client_id = 0;
         const char* session_id = 0;
         const char* request_id = 0;
@@ -1524,6 +1546,7 @@ namespace dmAutomationBridge
             !AcquireControllerForRequest(ctx, client_id, session_id, controller_lease)) return false;
         InputReceipt* receipt = 0;
         if (!AddMouseInput(points, mode, hold_before, hold_after, device, pointer_id, visualize, kind,
+                           modifiers, modifier_count,
                            client_id, session_id, request_id, g_AutomationBridge.m_Snapshot.m_Sequence,
                            pointer_lease, pointer_open, &receipt))
         {
@@ -1734,13 +1757,22 @@ namespace dmAutomationBridge
             RequestSendError(ctx, 400, "bad_request", "total key hold duration exceeds 60 seconds");
             return;
         }
+        dmHID::Key modifiers[MAX_INPUT_MODIFIERS];
+        uint32_t modifier_count = 0;
+        if (!GetModifiersParam(ctx, modifiers, &modifier_count)) return;
+        if (modifier_count > 0 && special_key_count == 0)
+        {
+            RequestSendError(ctx, 400, "bad_request", "modifiers require at least one {KEY_...} special key via the keys parameter; literal text cannot be chorded");
+            return;
+        }
         const char* client_id = 0;
         const char* session_id = 0;
         const char* request_id = 0;
         float lease = 5.0f;
         if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
         InputReceipt* receipt = 0;
-        if (!AddKeyInput(value, parse_special_keys, key_hold, requested_duration, client_id, session_id, request_id,
+        if (!AddKeyInput(value, parse_special_keys, key_hold, requested_duration,
+                         modifiers, modifier_count, client_id, session_id, request_id,
                          g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");

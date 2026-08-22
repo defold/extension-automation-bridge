@@ -1170,8 +1170,15 @@ class Client:
         timeout: float = 5.0,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Queue one FIFO click and optionally wait for the native release receipt."""
+        """Queue one FIFO click and optionally wait for the native release receipt.
+
+        ``modifiers`` holds up to four keys as a chord for the whole click (e.g.
+        ``"LSHIFT"`` for shift-click): pressed one update before the pointer goes
+        down and released one update after it comes up, so bindings that track the
+        modifier's own key trigger observe the same ordering a human chord produces.
+        """
         if isinstance(target, Element):
             json_body: Dict[str, Any] = {"id": target.id}
             if target.logical_id:
@@ -1186,6 +1193,10 @@ class Client:
         json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if pointer_id:
             json_body["pointer_id"] = pointer_id
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/click", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
@@ -1207,8 +1218,14 @@ class Client:
         timeout: Optional[float] = None,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
+        """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing.
+
+        ``modifiers`` holds up to four keys as a chord for the whole drag (e.g.
+        ``"LCTRL"`` for ctrl-drag), pressed one update before the pointer goes down
+        and released one update after the final up.
+        """
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
             json_body: Dict[str, Any] = {
                 "from_id": self._element_id(from_target),
@@ -1235,6 +1252,10 @@ class Client:
             json_body["hold_after"] = hold_after
         if pointer_id:
             json_body["pointer_id"] = pointer_id
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/drag", json_body=json_body))
         return self._wait_input_compat(
             receipt,
@@ -1260,8 +1281,13 @@ class Client:
         timeout: Optional[float] = None,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Run one down/path/up gesture with native segment timing, easing, holds, and curves."""
+        """Run one down/path/up gesture with native segment timing, easing, holds, and curves.
+
+        ``modifiers`` holds up to four keys as a chord for the whole gesture, pressed
+        one update before the pointer goes down and released one update after the up.
+        """
         normalized_points = [self._point(point) for point in points]
         if path not in {"sampled", "linear", "quadratic", "cubic"}:
             raise ValueError("path must be sampled, linear, quadratic, or cubic")
@@ -1298,6 +1324,10 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=json_body))
         return self._wait_input_compat(
             receipt,
@@ -1315,8 +1345,13 @@ class Client:
         device: Optional[str] = None,
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> PointerSession:
-        """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup."""
+        """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup.
+
+        ``modifiers`` holds up to four keys as a chord for the whole session, pressed
+        one update before the pointer goes down and released one update after the up.
+        """
         lease = self._input_duration(lease, "lease")
         if lease <= 0:
             raise ValueError("lease must be greater than zero")
@@ -1333,6 +1368,10 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=json_body))
         return PointerSession(self, receipt, lease)
 
@@ -1362,8 +1401,13 @@ class Client:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
         hold: float = 0.0,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
         """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``.
+
+        ``modifiers`` holds up to four keys as a chord across the press (e.g.
+        ``key("Z", modifiers="LCTRL")`` for ctrl-Z), pressed one update before the
+        key and released one update after it; composes with ``hold``.
 
         ``hold`` keeps the key pressed for that many seconds (``0..60``, default
         ``0`` -- a single-update tap) before releasing it, producing the same
@@ -1378,6 +1422,10 @@ class Client:
         json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
         if hold > 0.0:
             json_body["hold"] = hold
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
@@ -2293,6 +2341,18 @@ class Client:
         if (len(name) == 1 and name in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") or name in _NAMED_KEYS:
             return f"KEY_{name}"
         raise ValueError(_KEY_ERROR)
+
+    @classmethod
+    def _normalize_modifiers(cls, modifiers: Optional[Union[str, Sequence[str]]]) -> Optional[str]:
+        """Normalize chord modifiers into the wire format (comma-separated ``KEY_`` names)."""
+        if modifiers is None:
+            return None
+        names = [modifiers] if isinstance(modifiers, str) else list(modifiers)
+        if len(names) == 0:
+            raise ValueError("modifiers must name at least one key")
+        if len(names) > 4:
+            raise ValueError("at most 4 modifiers are supported")
+        return ",".join(cls._normalize_key(name) for name in names)
 
     def _trace_record(self, kind: str, payload: Any) -> None:
         for trace in tuple(self._active_traces):
