@@ -236,6 +236,71 @@ class GenericArgumentValidationTest(unittest.TestCase):
         command.assert_called_once_with(name=token, data=payload)
 
 
+class ExistenceWaitTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = BridgeRuntime(ROOT)
+        self.addCleanup(self.runtime.cleanup)
+        self.game = engine.Client(54321)
+        self.addCleanup(self.game.close)
+        self.wire = serialize(self.game, self.runtime.handles)
+
+    def test_exists_retries_missing_paths_and_null_until_a_value_appears(self):
+        cases = (
+            ('value.ready', [{}, {'value': {}}, {'value': {'ready': None}}, {'value': {'ready': False}}]),
+            ('value.items.0.ready', [
+                {'value': {'items': []}}, {'value': {'items': [{}]}}, {'value': {'items': [{'ready': 0}]}},
+            ]),
+        )
+        for tool in ('automation_bridge_wait', 'automation_bridge_call'):
+            for path, observations in cases:
+                with self.subTest(tool=tool, path=path), mock.patch.object(self.game, 'state', side_effect=observations) as state:
+                    arguments = {
+                        'operation': 'automation_bridge.engine.Client.state', 'target': self.wire,
+                        'arguments': {'name': 'fixture'}, 'path': path,
+                        'predicate': {'operator': 'exists'}, 'timeout': 1, 'interval': 0,
+                    }
+                    if tool == 'automation_bridge_call':
+                        arguments = {'operation': 'automation_bridge.engine.wait_until', 'arguments': arguments}
+                    result = self.runtime.call_tool(tool, arguments)
+                    self.assertEqual({'ok': True, 'data': observations[-1]}, result)
+                    self.assertEqual(len(observations), state.call_count)
+
+    def test_exists_times_out_with_the_last_observation_when_path_stays_absent(self):
+        with mock.patch.object(self.game, 'state', return_value={'value': {}}) as state:
+            result = self.runtime.call_tool('automation_bridge_wait', {
+                'operation': 'automation_bridge.engine.Client.state', 'target': self.wire,
+                'arguments': {'name': 'fixture'}, 'path': 'value.ready',
+                'predicate': {'operator': 'exists'}, 'timeout': 0,
+            })
+        self.assertEqual('wait_timeout', result['error']['code'])
+        self.assertTrue(result['error']['retryable'])
+        self.assertEqual({'value': {}}, result['error']['data']['last_value'])
+        self.assertEqual(1, result['error']['data']['attempts'])
+        state.assert_called_once_with(name='fixture')
+
+    def test_other_predicates_still_report_missing_paths(self):
+        for operator in ('truthy', 'equals', 'not_equals'):
+            with self.subTest(operator=operator), mock.patch.object(self.game, 'state', return_value={}) as state:
+                result = self.runtime.call_tool('automation_bridge_wait', {
+                    'operation': 'automation_bridge.engine.Client.state', 'target': self.wire,
+                    'arguments': {'name': 'fixture'}, 'path': 'value.ready',
+                    'predicate': {'operator': operator, 'value': True}, 'timeout': 0,
+                })
+                self.assertEqual('missing_predicate_path', result['error']['code'])
+                state.assert_called_once_with(name='fixture')
+
+    def test_exists_preserves_observation_failures(self):
+        with mock.patch.object(self.game, 'state', side_effect=engine.Error('fixture unavailable')) as state:
+            result = self.runtime.call_tool('automation_bridge_wait', {
+                'operation': 'automation_bridge.engine.Client.state', 'target': self.wire,
+                'arguments': {'name': 'fixture'}, 'path': 'value.ready',
+                'predicate': {'operator': 'exists'}, 'timeout': 0,
+            })
+        self.assertEqual(engine.Error.__name__, result['error']['type'])
+        self.assertEqual('fixture unavailable', result['error']['message'])
+        state.assert_called_once_with(name='fixture')
+
+
 class PreferenceReadSafetyTest(unittest.TestCase):
     def setUp(self):
         self.runtime = BridgeRuntime(ROOT)
@@ -664,6 +729,73 @@ class VisualToolsTest(unittest.TestCase):
         self.assertEqual(['text'], [content['type'] for content in result['content']])
         self.assertEqual('pending', result['structuredContent']['data']['state'])
         screenshot.assert_called_once_with(wait=False)
+
+    def test_screenshot_receipts_round_trip_into_visual_operations(self):
+        from tests.test_automation_bridge_api import _rgba_png
+        with tempfile.TemporaryDirectory() as directory:
+            before_path = Path(directory) / 'before.png'
+            after_path = Path(directory) / 'after.png'
+            before_png = _rgba_png(1, 1, bytes([0, 0, 0, 255]))
+            before_path.write_bytes(before_png)
+            after_path.write_bytes(_rgba_png(1, 1, bytes([255, 255, 255, 255])))
+            before = engine.ScreenshotReceipt({
+                'state': 'complete', 'path': str(before_path), 'capture_id': 17,
+                'engine_frame': 12, 'scene_sequence': 4, 'engine_instance_id': 'engine:fixture',
+            })
+            after = engine.ScreenshotReceipt({'state': 'complete', 'path': str(after_path), 'capture_id': 18})
+            with mock.patch.object(self.game, 'screenshot', return_value=before):
+                screenshot = self.call('defold_screenshot', {'engine': self.wire})
+            before_wire = json.loads(json.dumps(screenshot['structuredContent']['data']))
+            visual_wire = self.call('automation_bridge_get', {
+                'operation': 'automation_bridge.engine.Client.visual', 'target': self.wire,
+            })['structuredContent']['data']
+            visual = self.runtime.handles.get(visual_wire['$handle'])
+            with mock.patch.object(visual, 'difference', wraps=visual.difference) as difference:
+                result = self.call('automation_bridge_call', {
+                    'operation': 'automation_bridge.visual.VisualClient.difference', 'target': visual_wire,
+                    'arguments': {'before': before_wire, 'after': before_wire},
+                })
+            self.assertEqual({'ok': True, 'data': 0.0}, result['structuredContent'])
+            self.assertIsInstance(difference.call_args.kwargs['before'], engine.ScreenshotReceipt)
+            self.assertEqual(before.raw, difference.call_args.kwargs['before'].raw)
+            for value in (before_wire, str(before_path), serialize(before_png, self.runtime.handles)):
+                with self.subTest(value_type=type(value).__name__):
+                    result = self.call('automation_bridge_call', {
+                        'operation': 'automation_bridge.visual.VisualClient.assert_matches', 'target': visual_wire,
+                        'arguments': {'expected': value, 'actual': before_wire},
+                    })
+                    self.assertEqual({'ok': True, 'data': 0.0}, result['structuredContent'])
+            with mock.patch.object(self.game, 'screenshot', return_value=after):
+                result = self.call('automation_bridge_call', {
+                    'operation': 'automation_bridge.visual.VisualClient.wait_for_region_change', 'target': visual_wire,
+                    'arguments': {'before': before_wire, 'tolerance': 0.5, 'timeout': 1},
+                })
+            self.assertFalse(result['isError'], result)
+            self.assertEqual(1.0, result['structuredContent']['data']['difference'])
+            self.assertEqual(after.raw, result['structuredContent']['data']['screenshot']['raw'])
+
+    def test_malformed_visual_receipts_are_rejected_before_comparison(self):
+        visual = self.game.visual
+        wire = serialize(visual, self.runtime.handles)
+        for value in ({'raw': None}, {'raw': {}}, {'raw': {'path': []}}, {'raw': {'path': 'capture.png'}, 'frame': 'later'}):
+            with self.subTest(value=value), mock.patch.object(visual, 'difference') as difference:
+                result = self.call('automation_bridge_call', {
+                    'operation': 'automation_bridge.visual.VisualClient.difference', 'target': wire,
+                    'arguments': {'before': value, 'after': 'capture.png'},
+                })
+                self.assertEqual('invalid_arguments', result['structuredContent']['error']['code'])
+                difference.assert_not_called()
+
+    def test_receipt_shaped_application_payloads_remain_json(self):
+        receipt = engine.ScreenshotReceipt({'path': str(ROOT / 'capture.png'), 'state': 'complete'})
+        payload = serialize(receipt, self.runtime.handles)
+        with mock.patch.object(self.game, 'command', return_value=payload) as command:
+            result = self.call('automation_bridge_call', {
+                'operation': 'automation_bridge.engine.Client.command', 'target': self.wire,
+                'arguments': {'name': 'fixture', 'data': payload},
+            })
+        self.assertEqual({'ok': True, 'data': payload}, result['structuredContent'])
+        command.assert_called_once_with(name='fixture', data=payload)
 
     def test_editor_preview_is_an_image_in_focused_and_generic_calls(self):
         project = editor.Client(ROOT, port=51336)

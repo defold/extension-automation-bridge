@@ -28,6 +28,16 @@ ELEMENT = object_schema({'$automation_bridge': {'const': 'element'},
                          '$type': {'const': 'automation_bridge.elements.Element'},
                          'raw': {'type': 'object'}, 'value': {'type': 'object'}},
                         ('$automation_bridge', '$type', 'raw'))
+SCREENSHOT_RECEIPT = object_schema({
+    'raw': object_schema({'path': STRING}, ('path',), additional=True),
+    'capture_id': INTEGER, 'state': STRING, 'path': STRING, 'frame': INTEGER,
+    'scene_sequence': INTEGER, 'width': INTEGER, 'height': INTEGER,
+    'sha256': {'anyOf': [STRING, {'type': 'null'}]},
+    'failure_reason': {'anyOf': [STRING, {'type': 'null'}]},
+}, ('raw',))
+BYTES = object_schema({'$automation_bridge': {'const': 'bytes'}, '$type': {'const': 'bytes'},
+                       'encoding': {'const': 'base64'}, 'data': STRING},
+                      ('$automation_bridge', '$type', 'encoding', 'data'))
 SELECTOR = object_schema({
     **{key: STRING for key in (
         'id', 'instance_id', 'logical_id', 'type', 'type_exact', 'name', 'name_exact',
@@ -104,6 +114,8 @@ def annotation_schema(annotation):
         return {'type': 'null'}
     if annotation in (str, Path):
         return STRING
+    if annotation is bytes:
+        return BYTES
     if annotation in (bool, int, float):
         return {bool: BOOLEAN, int: INTEGER, float: NUMBER}[annotation]
     origin, args = typing.get_origin(annotation), typing.get_args(annotation)
@@ -120,6 +132,8 @@ def annotation_schema(annotation):
         return {'type': 'object', 'additionalProperties': annotation_schema(args[1]) if len(args) == 2 else True}
     if getattr(annotation, '__name__', None) == 'Element':
         return ELEMENT
+    if getattr(annotation, '__name__', None) == 'ScreenshotReceipt':
+        return SCREENSHOT_RECEIPT
     if inspect.isclass(annotation) and annotation.__module__.startswith('automation_bridge'):
         return HANDLE
     return {}

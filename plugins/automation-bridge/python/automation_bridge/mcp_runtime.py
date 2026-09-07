@@ -479,7 +479,7 @@ def serialize(
 
 
 def deserialize(value: Any, registry: HandleRegistry, schema: Optional[Mapping[str, Any]] = None) -> Any:
-    """Resolve wire values, interpreting bare handle strings only where declared."""
+    """Resolve wire values, interpreting bare handles and receipts only where declared."""
     schema = schema if isinstance(schema, Mapping) else {}
     if isinstance(value, str) and schema.get("anyOf") == mcp_schema.HANDLE["anyOf"]:
         return registry.get(value)
@@ -493,6 +493,10 @@ def deserialize(value: Any, registry: HandleRegistry, schema: Optional[Mapping[s
         return [deserialize(item, registry, schema.get("items")) for item in value]
     if not isinstance(value, dict):
         return value
+    if schema == mcp_schema.SCREENSHOT_RECEIPT:
+        # Receipt metadata also occurs in application JSON. Reconstruct it only
+        # for receipt-typed arguments, retaining the existing screenshot output.
+        return engine.ScreenshotReceipt(dict(value["raw"]))
     marker = value.get("$automation_bridge")
     handle = value.get("$handle")
     if marker == "handle" and isinstance(handle, str):
@@ -872,10 +876,20 @@ _OPEN_OBJECT: JsonObject = {"type": "object", "additionalProperties": True}
 
 
 def _wait_schema() -> JsonObject:
-    return _object_schema({"operation": _STRING, "target": _HANDLE_VALUE, "arguments": _OPEN_OBJECT,
-                           "path": _STRING, "predicate": _object_schema({"operator": {"type": "string", "enum": ["truthy", "equals", "not_equals", "exists"]}, "value": {}}),
-                           "timeout": {"type": "number", "minimum": 0, "maximum": 300},
-                           "interval": {"type": "number", "minimum": 0, "maximum": 60}}, ("operation",))
+    predicate = _object_schema({
+        "operator": {
+            "type": "string",
+            "enum": ["truthy", "equals", "not_equals", "exists"],
+            "description": "exists waits for a present, non-null value, including when the path is initially absent.",
+        },
+        "value": {},
+    })
+    return _object_schema({
+        "operation": _STRING, "target": _HANDLE_VALUE, "arguments": _OPEN_OBJECT,
+        "path": _STRING, "predicate": predicate,
+        "timeout": {"type": "number", "minimum": 0, "maximum": 300},
+        "interval": {"type": "number", "minimum": 0, "maximum": 60},
+    }, ("operation",))
 
 
 def _output_schema() -> JsonObject:
@@ -1626,7 +1640,12 @@ class BridgeRuntime:
             check_cancelled()
             attempts += 1
             last = self.operation_handlers[spec.qualified_name](arguments.get("target"), nested_arguments)
-            observed = self._extract_path(last, path)
+            try:
+                observed = self._extract_path(last, path)
+            except ToolFailure as error:
+                if error.code != "missing_predicate_path" or predicate.get("operator") != "exists":
+                    raise
+                observed = None
             if self._predicate_matches(observed, predicate):
                 return last
             remaining = deadline - time.monotonic()

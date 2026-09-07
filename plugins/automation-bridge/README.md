@@ -192,6 +192,9 @@ containing them are rejected before contacting the editor; read non-secret leaf
 preferences separately. Bare handle strings are resolved in handle arguments,
 while ordinary application strings remain literal.
 
+The `exists` wait predicate keeps polling while its selected path is absent or
+null, including paths through arrays that have not populated yet.
+
 `defold_find_elements` returns `elements`, match counts, `next_cursor`, and
 frame/scene evidence. Preserve the complete Element wire values when passing
 targets to click and drag. Cursors traverse live snapshots, so re-query after
@@ -205,6 +208,11 @@ Pending captures return their receipt without an image. The focused screenshot,
 preview, and observation workflows default to half resolution. Images are limited
 to 8 MiB; use a smaller resolution if needed. Missing or replaced capture files
 produce an error retaining the original receipt.
+
+Pass the complete screenshot receipt to `game.visual.difference()`,
+`assert_matches()`, or `wait_for_region_change()` through the generic MCP tools.
+Their argument schemas accept screenshot receipts, paths, and base64 byte
+envelopes. Receipt metadata is reconstructed only in receipt-typed arguments.
 
 `defold_observe` returns at most 50 elements (20 by default), up to 50 recent error
 lines (10 by default, 2,000 characters each), and an optional screenshot. Element,
