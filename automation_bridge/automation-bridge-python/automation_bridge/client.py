@@ -813,12 +813,21 @@ class Client:
         if self._closed:
             raise AutomationBridgeError("engine client is closed; reconnect to continue")
 
+    def _flush_owned_input(self) -> None:
+        """Request cleanup only when native receipts belong to this session."""
+        # Flushing acquires a controller lease, even when the queue is empty.
+        # An idle observer must not take control merely because it is cancelled.
+        if any(receipt.get("client_id") == self.client_id and receipt.get("session_id") == self.session_id
+               for receipt in self.input.pending()):
+            self.input.flush(release=True)
+
     @contextmanager
     def cancellation_scope(self, token: CancellationToken):
         """Cancel waits and request release of this session's input on cancellation.
 
         One token belongs to one operation. Use separate clients/identities for
         independent operations; cleanup only targets this client's native lease.
+        Idle observers do not acquire control during cancellation cleanup.
         A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
         """
         entered = False
@@ -829,7 +838,7 @@ class Client:
         except OperationCancelled as exc:
             if entered:
                 try:
-                    self.input.flush(release=True)
+                    self._flush_owned_input()
                 except Exception as cleanup_error:
                     if exc.cleanup_error is None:
                         exc.cleanup_error = cleanup_error

@@ -327,7 +327,8 @@ class EngineClientUnitTest(unittest.TestCase):
     def test_client_scope_releases_its_input_when_scene_wait_is_cancelled(self):
         bridge = FakeInputClient()
         token = engine.CancellationToken()
-        with self.assertRaises(engine.OperationCancelled):
+        pending = [{'input_id': 42, 'client_id': bridge.client_id, 'session_id': bridge.session_id}]
+        with mock.patch.object(bridge.input, 'pending', return_value=pending), self.assertRaises(engine.OperationCancelled):
             with bridge.cancellation_scope(token):
                 bridge.key("SPACE", hold=1, wait=False)
                 wait_until(lambda: token.cancel())
@@ -336,6 +337,46 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual(bridge.client_id, values["client_id"])
         self.assertEqual(bridge.session_id, values["session_id"])
         self.assertTrue(values["release"])
+
+    def test_cancelled_observer_does_not_acquire_input_control(self):
+        bridge = engine.Client(54321)
+        self.addCleanup(bridge.close)
+        for receipts in ([], [{'client_id': 'other', 'session_id': bridge.session_id}],
+                         [{'client_id': bridge.client_id, 'session_id': 'other'}]):
+            token = engine.CancellationToken()
+            with self.subTest(receipts=receipts), \
+                 mock.patch.object(bridge.input, 'pending', return_value=receipts) as pending, \
+                 mock.patch.object(bridge.input, 'flush') as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.cancellation_scope(token):
+                        token.cancel('observer stopped')
+                self.assertEqual('observer stopped', str(error.exception))
+                self.assertIsNone(error.exception.cleanup_error)
+                pending.assert_called_once_with()
+                flush.assert_not_called()
+
+    def test_client_cancellation_retains_receipt_and_cleanup_failures(self):
+        bridge = engine.Client(54321)
+        self.addCleanup(bridge.close)
+        receipts = [engine.InputReceipt({'input_id': 42, 'client_id': bridge.client_id,
+                                         'session_id': bridge.session_id})]
+        for failed_operation in ('pending', 'flush'):
+            token = engine.CancellationToken()
+            refusal = RuntimeError('native cleanup unavailable')
+            with self.subTest(failed_operation=failed_operation), \
+                 mock.patch.object(bridge.input, 'pending', return_value=receipts,
+                                   side_effect=refusal if failed_operation == 'pending' else None), \
+                 mock.patch.object(bridge.input, 'flush',
+                                   side_effect=refusal if failed_operation == 'flush' else None) as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.cancellation_scope(token):
+                        token.cancel('caller stopped')
+                self.assertEqual('caller stopped', str(error.exception))
+                self.assertIs(refusal, error.exception.cleanup_error)
+                if failed_operation == 'pending':
+                    flush.assert_not_called()
+                else:
+                    flush.assert_called_once_with(release=True)
 
     def test_command_cancellation_preserves_native_refusal(self):
         bridge = FakeInputClient()
