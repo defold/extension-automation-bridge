@@ -1455,6 +1455,63 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("/main/main.script", actual.resource)
         self.assertEqual((7, 3), (actual.range.start.line, actual.range.start.character))
         self.assertEqual((7, 8), (actual.range.end.line, actual.range.end.character))
+        self.assertIs(project.last_command_result, raised.exception.result)
+        self.assertFalse(raised.exception.result.success)
+
+    def test_editor_legacy_acknowledgements_do_not_claim_completion(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, body in ((202, b""), (202, b"202 Accepted\n"), (200, b"200 OK\n")):
+            with self.subTest(body=body), mock.patch("automation_bridge.editor.request_raw", return_value=(status, body)):
+                self.assertIsNone(project.commands.hot_reload())
+            result = project.last_command_result
+            self.assertEqual(("hot-reload", status, False, None), (result.command, result.status, result.completed, result.success))
+
+    def test_editor_completion_retains_warnings_target_and_additional_fields(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payload = {"success": True, "issues": [{"severity": "warning", "message": "unused variable"}],
+                   "target": {"url": "http://localhost:3456"}, "future_metadata": "retained"}
+        for operation in (project.commands.hot_reload, project.debugger.start, project.build_and_run_html5):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                self.assertIsNone(operation())
+            result = project.last_command_result
+            self.assertTrue(result.completed)
+            self.assertTrue(result.success)
+            self.assertEqual("warning", result.issues[0].severity)
+            self.assertEqual("http://localhost:3456", result.target_url)
+            self.assertEqual("retained", result.raw["future_metadata"])
+        with mock.patch("automation_bridge.editor.request_raw", side_effect=editor.HttpError("POST", project.base_url, "unavailable")):
+            with self.assertRaises(editor.HttpError):
+                project.commands.hot_reload()
+        self.assertIsNone(project.last_command_result)
+
+    def test_editor_completion_surfaces_build_failure_and_missing_target(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, success in ((200, True), (422, False), (200, False)):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(status, json.dumps({"success": success, "issues": []}).encode())):
+                if success:
+                    project.commands.hot_reload()
+                else:
+                    with self.assertRaises(editor.BuildError) as error:
+                        project.commands.hot_reload()
+                    self.assertIs(project.last_command_result, error.exception.result)
+            self.assertIsNone(project.last_command_result.target_url)
+            self.assertEqual(success, project.last_command_result.success)
+
+    def test_editor_rejects_malformed_completion_evidence(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payloads = [[], {}, {"success": "false"}, {"success": True, "issues": None},
+                    {"success": True, "issues": [None]}, {"success": True, "target": {}},
+                    {"success": True, "target": {"url": 123}},
+                    {"success": True, "issues": [{"severity": "error", "message": "broken", "range": {"start": {"line": "7", "character": 0}, "end": {"line": 7, "character": 1}}}]}]
+        for payload in payloads:
+            with self.subTest(payload=payload), mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                with self.assertRaises(editor.HttpError):
+                    project.commands.hot_reload()
+            self.assertIsNone(project.last_command_result)
 
     def test_editor_build_workflows_delegate_with_explicit_command_names(self):
         project = EditorApiClient(".", port=12345)

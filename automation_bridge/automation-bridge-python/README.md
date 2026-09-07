@@ -338,6 +338,13 @@ to probe support. Pass `refresh=True` to `catalog()` after capabilities change.
 New-feature `editor.UnsupportedOperationError` messages identify Defold 1.13.2
 as the minimum version; their `minimum_version` attribute is available to hosts.
 
+`project.last_command_result` retains typed `editor.BuildResult` diagnostics after
+build/run, HTML5, hot reload, and debugger operations. It includes warnings,
+zero-based source ranges, completion status, and an optional `target_url`.
+`editor.BuildError.result` retains the same evidence on failure. Existing helpers
+keep their return values. On 1.13.1, HTML5, hot reload, and debugger acknowledgements
+have `completed=False` and `success=None`; 1.13.2 reports their build completion.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

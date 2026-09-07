@@ -99,10 +99,11 @@ class AutomationBridgeUpdateError(Error):
 
 
 class BuildError(CommandError):
-    """Raised when a build-and-run command reports compilation issues."""
+    """A build operation failed; ``issues`` and ``result`` retain diagnostics."""
 
-    def __init__(self, issues: Sequence["BuildIssue"]):
+    def __init__(self, issues: Sequence["BuildIssue"], *, result: Optional["BuildResult"] = None):
         self.issues = tuple(issues)
+        self.result = result
         super().__init__(f"Defold build failed: {list(self.issues)!r}")
 
 
@@ -365,6 +366,8 @@ class SourceRange:
 
 @dataclass(frozen=True)
 class BuildIssue:
+    """An editor diagnostic; source positions use zero-based LSP coordinates."""
+
     severity: str
     message: str
     resource: Optional[str] = None
@@ -372,22 +375,51 @@ class BuildIssue:
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any]) -> "BuildIssue":
+        for name in ("severity", "message"):
+            if not isinstance(raw.get(name), str):
+                raise ValueError(f"build issue {name} must be a string")
+        if "resource" in raw and not isinstance(raw["resource"], str):
+            raise ValueError("build issue resource must be a string")
         raw_range = raw.get("range")
         source_range = None
-        if isinstance(raw_range, Mapping):
-            start = raw_range.get("start")
-            end = raw_range.get("end")
-            if isinstance(start, Mapping) and isinstance(end, Mapping):
-                source_range = SourceRange(
-                    SourcePosition(int(start.get("line", 0)), int(start.get("character", 0))),
-                    SourcePosition(int(end.get("line", 0)), int(end.get("character", 0))),
-                )
+        if "range" in raw:
+            if not isinstance(raw_range, Mapping):
+                raise ValueError("build issue range must be an object")
+            positions = []
+            for name in ("start", "end"):
+                position = raw_range.get(name)
+                if not isinstance(position, Mapping) or any(
+                    type(position.get(key)) is not int or position[key] < 0
+                    for key in ("line", "character")
+                ):
+                    raise ValueError(f"build issue range.{name} requires non-negative integer line and character")
+                positions.append(SourcePosition(position["line"], position["character"]))
+            source_range = SourceRange(*positions)
         return cls(
-            severity=str(raw.get("severity", "error")),
-            message=str(raw.get("message", "")),
-            resource=str(raw["resource"]) if raw.get("resource") is not None else None,
+            severity=raw["severity"],
+            message=raw["message"],
+            resource=raw.get("resource"),
             range=source_range,
         )
+
+
+@dataclass(frozen=True)
+class BuildResult:
+    """Editor completion evidence for a build or command.
+
+    ``completed`` is true only when the editor returned a structured build
+    result. Legacy text/empty acknowledgements have ``completed=False`` and
+    ``success=None``. Warnings may accompany success. ``target_url`` is optional
+    even after a successful launch. ``raw`` preserves additional response fields.
+    """
+
+    command: str
+    status: int
+    completed: bool
+    success: Optional[bool]
+    issues: tuple[BuildIssue, ...]
+    target_url: Optional[str]
+    raw: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -534,6 +566,11 @@ class Commands:
         return result
 
     def hot_reload(self, timeout: float = 60.0) -> None:
+        """Hot reload; inspect ``project.last_command_result`` for completion.
+
+        Defold 1.13.2 waits and reports build issues. Defold 1.13.1 only
+        acknowledges the request; acknowledgement does not establish completion.
+        """
         self._client._empty_command("hot-reload", timeout)
 
     def rebundle(self, timeout: float = 60.0) -> None:
@@ -554,6 +591,7 @@ class Debugger:
         self._client._empty_command(f"debugger-{name}", timeout)
 
     def start(self, timeout: float = 60.0) -> None:
+        """Start debugging; Defold 1.13.2 reports completion in last_command_result."""
         self._run("start", timeout)
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -673,6 +711,7 @@ class Client:
         self._cached_engine_identity = self._read_cached_engine_identity()
         self._remotery_url: Optional[str] = self._read_cached_remotery_url()
         self._last_build_had_engine_service_port: Optional[bool] = None
+        self._last_command_result: Optional[BuildResult] = None
         self._lifecycle_events = []
         self._openapi_document: Optional[dict] = None
         self.commands = Commands(self)
@@ -681,6 +720,17 @@ class Client:
         self.reference = Reference(self)
         self.preview = Preview(self)
         self.preferences = Preferences(self)
+
+    @property
+    def last_command_result(self) -> Optional[BuildResult]:
+        """Latest build/command result, including failures; None before a response.
+
+        Build-and-run helpers still return an engine client. HTML5, hot reload,
+        and debugger helpers retain their existing None return. Read this
+        property immediately after those calls to inspect completion and issues.
+        It is cleared when the next command is sent, including transport failure.
+        """
+        return self._last_command_result
 
     @staticmethod
     def _read_editor_port(project_root: Path) -> int:
@@ -1038,12 +1088,47 @@ class Client:
         check_cancelled()
         self._require_command(command)
         url = f"{self.base_url}/command/{command}"
+        self._last_command_result = None
         status, body = request_raw(url, method="POST", timeout=timeout)
-        if status < 200 or status >= 300:
-            raise CommandError(f"{command} failed with HTTP {status}: {body.decode('utf-8', 'replace')}")
+        if body.strip() in (b"", b"200 OK", b"202 Accepted"):
+            if status < 200 or status >= 300:
+                raise CommandError(f"{command} failed with HTTP {status}")
+            self._last_command_result = BuildResult(command, status, False, None, (), None, {})
+            return
+        try:
+            response = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as exc:
+            if status < 200 or status >= 300:
+                raise CommandError(f"{command} failed with HTTP {status}: {body.decode('utf-8', 'replace')}") from exc
+            raise HttpError("POST", url, "invalid command result JSON", status=status) from exc
+        self._accept_build_result(command, url, status, response)
+
+    def _accept_build_result(self, command: str, url: str, status: int, response: Any) -> BuildResult:
+        try:
+            if not isinstance(response, Mapping) or type(response.get("success")) is not bool:
+                raise ValueError("build result requires a boolean success")
+            raw_issues = response.get("issues", [])
+            if not isinstance(raw_issues, list) or any(not isinstance(item, Mapping) for item in raw_issues):
+                raise ValueError("build result issues must be an array of objects")
+            issues = tuple(BuildIssue.from_raw(item) for item in raw_issues)
+            target_url = None
+            if "target" in response:
+                target = response["target"]
+                if not isinstance(target, Mapping) or not isinstance(target.get("url"), str) or not target["url"]:
+                    raise ValueError("build result target requires a non-empty URL string")
+                target_url = target["url"]
+        except ValueError as exc:
+            raise HttpError("POST", url, str(exc), status=status) from exc
+        result = BuildResult(command, status, True, response["success"], issues, target_url, dict(response))
+        self._last_command_result = result
+        if status < 200 or status >= 300 or not result.success:
+            raise BuildError(issues, result=result)
+        return result
 
     def _json_command(self, command: str, timeout: float) -> tuple[int, dict]:
+        check_cancelled()
         self._require_command(command)
+        self._last_command_result = None
         return request_json(f"{self.base_url}/command/{command}", method="POST", timeout=timeout)
 
     def connect_engine(
@@ -1125,9 +1210,14 @@ class Client:
 
 
     def build_and_run_html5(self, *, timeout: float = 60.0) -> None:
+        """Build and launch HTML5; inspect last_command_result for completion.
+
+        Defold 1.13.1 only acknowledges this request. Defold 1.13.2 waits for
+        completion and raises BuildError with source diagnostics on failure.
+        """
         self._empty_command("build-html5", timeout)
 
-    def _build_and_run_command(self, command: str, timeout: float = 60.0) -> None:
+    def _build_and_run_command(self, command: str, timeout: float = 60.0) -> BuildResult:
         """Execute a desktop build-and-run command and await endpoint registration."""
         check_cancelled()
         if command not in {"build", "clean-build"}:
@@ -1140,15 +1230,14 @@ class Client:
         previous_port = self._engine_service_port_value()
         if previous_port is not None:
             self._engine_service_port = previous_port
+        self._last_command_result = None
+        url = f"{self.base_url}/command/{command}"
         try:
-            status, response = request_json(f"{self.base_url}/command/{command}", method="POST", timeout=timeout)
+            status, response = request_json(url, method="POST", timeout=timeout)
+            result = self._accept_build_result(command, url, status, response)
         except Exception as exc:
             self._record_lifecycle("editor_build_failed", error=str(exc))
             raise
-        if status >= 400 or not response.get("success"):
-            issues = tuple(BuildIssue.from_raw(item) for item in response.get("issues", ()) if isinstance(item, Mapping))
-            self._record_lifecycle("editor_build_failed", issues=issues)
-            raise BuildError(issues)
         self._record_lifecycle("editor_build_completed")
 
         try:
@@ -1167,6 +1256,7 @@ class Client:
         self._record_lifecycle("new_engine_registered")
         self._last_build_had_engine_service_port = self._latest_registration_has_engine_service_port()
         cancellable_sleep(0.2)
+        return result
 
     def _console_lines(self) -> list:
         """Return current editor console lines."""
@@ -1582,6 +1672,7 @@ __all__ = [
     "AutomationBridgeUpdateResult",
     "BuildError",
     "BuildIssue",
+    "BuildResult",
     "Client",
     "CommandError",
     "CommandInfo",
