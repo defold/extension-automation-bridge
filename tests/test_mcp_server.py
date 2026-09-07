@@ -1444,7 +1444,7 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
         finally:
             runtime.cleanup()
 
-    def test_project_connect_rejects_direct_port_only_identity_parameters(self):
+    def test_project_connect_rejects_direct_port_only_profiler_url(self):
         class FakeProject(editor.Client):
             def __init__(self):
                 super().__init__(ROOT, port=51336)
@@ -1469,7 +1469,7 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
             self.assertFalse(result["ok"], result)
             self.assertEqual("invalid_arguments", result["error"]["code"])
             self.assertEqual(
-                {"profiler_url", "client_id", "session_id"},
+                {"profiler_url"},
                 set(result["error"].get("data", {}).get("fields", ())),
             )
             self.assertEqual(0, project.connect_calls)

@@ -217,3 +217,93 @@ class CancellationTest(unittest.TestCase):
         self.assertEqual('', output.getvalue())
         self.assertFalse(runtime._requests)
         server.close()
+
+
+class SessionTest(unittest.TestCase):
+    def test_logical_sessions_isolate_handles_and_report_cleanup_errors(self):
+        runtime = BridgeRuntime(ROOT)
+        session = runtime.call_tool('automation_bridge_session', {'action': 'open'})['data']['mcp_session']
+        project = editor.Client(ROOT, port=51336)
+        with mock.patch.object(editor, 'open_project', return_value=project):
+            opened = runtime.call_tool('defold_open_project', {'mcp_session': session, 'project_path': str(ROOT)})
+        wire = opened['data']
+        operation = 'automation_bridge.editor.Client.root'
+        rejected = runtime.call_tool('automation_bridge_get', {'operation': operation, 'target': wire})
+        self.assertEqual('wrong_session', rejected['error']['code'])
+        accepted = runtime.call_tool('automation_bridge_get', {'mcp_session': session, 'operation': operation, 'target': wire})
+        self.assertTrue(accepted['ok'], accepted)
+        closed = runtime.call_tool('automation_bridge_session', {'mcp_session': session, 'action': 'close'})
+        self.assertTrue(closed['data']['closed'])
+        self.assertEqual(0, closed['data']['handles'])
+        rejected = runtime.call_tool('automation_bridge_get', {'mcp_session': session, 'operation': operation, 'target': wire})
+        self.assertEqual('unknown_session', rejected['error']['code'])
+        runtime.cleanup()
+
+    def test_project_connections_forward_ids_and_reject_duplicate_native_identity(self):
+        runtime = BridgeRuntime(ROOT)
+        project = editor.Client(ROOT, port=51336)
+        wire = serialize(project, runtime.handles)
+        def connect(**kwargs):
+            return engine.Client(54321, client_id=kwargs['client_id'], session_id=kwargs['session_id'])
+        with mock.patch.object(project, 'connect_engine', side_effect=connect) as call:
+            args = {'project': wire, 'client_id': 'agent-a', 'session_id': 'work-a', 'wait_ready': False}
+            first = runtime.call_tool('defold_connect_engine', args)
+            self.assertTrue(first['ok'], first)
+            self.assertEqual('agent-a', call.call_args.kwargs['client_id'])
+            self.assertEqual('work-a', call.call_args.kwargs['session_id'])
+            duplicate = runtime.call_tool('defold_connect_engine', args)
+            self.assertEqual('identity_in_use', duplicate['error']['code'])
+            self.assertEqual(1, call.call_count)
+        runtime.cleanup()
+
+    def test_busy_client_cannot_be_released_and_shutdown_defers_its_close(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        started, release = threading.Event(), threading.Event()
+        def health():
+            started.set()
+            release.wait(2)
+            return {}
+        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', return_value={}):
+            worker = threading.Thread(target=lambda: runtime.call_tool_request('busy', 'defold_health', {'engine': wire}))
+            worker.start()
+            self.assertTrue(started.wait(1))
+            response = runtime.call_tool('automation_bridge_release', {'target': wire})
+            self.assertEqual('handle_busy', response['error']['code'])
+            self.assertFalse(game.closed)
+            runtime.cleanup()
+            self.assertFalse(game.closed)
+            release.set()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(game.closed)
+            self.assertEqual([], runtime.handles.snapshot())
+
+    def test_closing_borrowed_client_releases_input_and_invalidates_child_handles(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        child = runtime.call_tool('automation_bridge_get', {'operation': 'automation_bridge.engine.Client.input', 'target': wire})['data']
+        with mock.patch.object(game.input, 'flush', return_value={}) as flush, mock.patch.object(game, 'close_engine') as terminate:
+            response = runtime.call_tool('defold_close', {'engine': wire})
+            self.assertTrue(response['ok'], response)
+            self.assertTrue(response['data']['closed'])
+            flush.assert_called_once_with(release=True)
+            terminate.assert_not_called()
+        rejected = runtime.call_tool('automation_bridge_call', {'operation': 'automation_bridge.engine.InputController.pending', 'target': child})
+        self.assertEqual('unknown_handle', rejected['error']['code'])
+        runtime.cleanup()
+
+    def test_release_cleanup_error_is_visible_and_retains_handle_for_inspection(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        with mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native unavailable')):
+            response = runtime.call_tool('automation_bridge_release', {'target': wire})
+        self.assertEqual('cleanup_failed', response['error']['code'])
+        self.assertTrue(game.closed)
+        info = runtime.call_tool('automation_bridge_session', {})['data']
+        self.assertIn('native unavailable', info['cleanup_errors'][-1]['error']['message'])
+        self.assertEqual(1, info['handles'])
+        runtime.cleanup()

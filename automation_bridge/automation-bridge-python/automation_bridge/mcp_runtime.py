@@ -73,6 +73,8 @@ class RequestContext:
     request_id: Any
     token: engine.CancellationToken = field(default_factory=engine.CancellationToken)
     created: list = field(default_factory=list)
+    session: str = "default"
+    resources: dict = field(default_factory=dict)
     engines: set = field(default_factory=set)
     scopes: ExitStack = field(default_factory=ExitStack)
 
@@ -80,14 +82,41 @@ class RequestContext:
 _request_context: ContextVar[Optional[RequestContext]] = ContextVar("mcp_request", default=None)
 
 
+def _resource_owner(value: Any) -> Any:
+    seen = set()
+    while id(value) not in seen:
+        seen.add(id(value))
+        attributes = vars(value) if hasattr(value, "__dict__") else {}
+        parent = next((attributes[key] for key in ("_bridge", "bridge", "_client", "client", "_connection", "connection")
+                       if key in attributes), None)
+        if parent is None:
+            break
+        value = parent
+    return value
+
+
+def _resource_key(value: Any) -> Any:
+    # The editor's last_command_result and command stream belong to the project.
+    return ("editor", str(value.root)) if isinstance(value, editor.Client) else id(value)
+
+
 class HandleRegistry:
-    """Thread-safe opaque handles with stable identity and explicit release."""
+    """Session-owned handles, with exclusive use of each Python resource per request.
+
+    This coordinates access to local objects. Separate native client identities
+    still execute concurrently under the engine's authoritative lease policy.
+    """
 
     def __init__(self) -> None:
         self._values: Dict[str, Any] = {}
         self._identity: Dict[int, str] = {}
+        self._owners: Dict[str, str] = {}
+        self._resources: Dict[str, dict] = {}
+        self._busy: Dict[Any, RequestContext] = {}
+        self._retired: set = set()
         self._closed = False
         self._lock = threading.RLock()
+        self.on_use: Optional[Callable[[Any], None]] = None
 
     def put(self, value: Any) -> str:
         with self._lock:
@@ -96,25 +125,46 @@ class HandleRegistry:
             identity = id(value)
             existing = self._identity.get(identity)
             if existing is not None and self._values.get(existing) is value:
+                self._check_owner(existing)
                 return existing
+            context = _request_context.get()
             token = "h_" + uuid.uuid4().hex
             self._values[token] = value
             self._identity[identity] = token
-            context = _request_context.get()
+            self._owners[token] = context.session if context else "default"
+            root = _resource_owner(value)
+            if root is value and not isinstance(value, (engine.Client, editor.Client)) and context and context.resources:
+                self._resources[token] = dict(context.resources)
+            else:
+                self._resources[token] = {_resource_key(root): root}
             if context is not None:
                 context.created.append((token, value))
             return token
+
+    def _check_owner(self, token: str) -> None:
+        context = _request_context.get()
+        if context is not None and self._owners[token] != context.session:
+            raise ToolFailure("wrong_session", "handle belongs to another MCP session", {"handle": token})
 
     def get(self, token: str) -> Any:
         if not isinstance(token, str):
             raise ToolFailure("invalid_handle", "handle must be a string")
         with self._lock:
             if token not in self._values:
-                raise ToolFailure(
-                    "unknown_handle",
-                    "the handle is missing, expired, or already released",
-                    {"handle": token},
-                )
+                raise ToolFailure("unknown_handle", "the handle is missing, expired, or already released", {"handle": token})
+            self._check_owner(token)
+            context = _request_context.get()
+            if context is not None:
+                if token in self._retired:
+                    raise ToolFailure("handle_closing", "handle is being cleaned up")
+                resources = self._resources[token]
+                if any(key in self._busy and self._busy[key] is not context for key in resources):
+                    raise ToolFailure("handle_busy", "another request is using this client or resource; wait for it to finish or use a separate client", retryable=True)
+                for key, value in resources.items():
+                    self._busy[key] = context
+                    context.resources[key] = value
+                    if self.on_use:
+                        self.on_use(value)
             return self._values[token]
 
     def token_for(self, value: Any) -> Optional[str]:
@@ -125,25 +175,52 @@ class HandleRegistry:
     def release(self, token: str) -> Any:
         with self._lock:
             if token not in self._values:
-                raise ToolFailure(
-                    "unknown_handle",
-                    "the handle is missing, expired, or already released",
-                    {"handle": token},
-                )
+                raise ToolFailure("unknown_handle", "the handle is missing, expired, or already released", {"handle": token})
+            self._check_owner(token)
+            context = _request_context.get()
+            if any(key in self._busy and self._busy[key] is not context for key in self._resources[token]):
+                raise ToolFailure("handle_busy", "cannot release a resource while another request uses it", retryable=True)
             value = self._values.pop(token)
             if self._identity.get(id(value)) == token:
                 del self._identity[id(value)]
+            del self._owners[token]
+            del self._resources[token]
+            self._retired.discard(token)
             return value
 
-    def snapshot(self) -> List[Tuple[str, Any]]:
+    def related(self, token: str) -> List[Tuple[str, Any]]:
         with self._lock:
-            return list(self._values.items())
+            roots = set(self._resources[token])
+            return [(key, value) for key, value in self._values.items()
+                    if self._owners[key] == self._owners[token] and roots.intersection(self._resources[key])]
+
+    def snapshot(self, session: Optional[str] = None) -> List[Tuple[str, Any]]:
+        with self._lock:
+            return [(key, value) for key, value in self._values.items()
+                    if session is None or self._owners[key] == session]
+
+    def finish(self, context: RequestContext) -> None:
+        with self._lock:
+            for key in context.resources:
+                if self._busy.get(key) is context:
+                    del self._busy[key]
+
+    def retire(self, session: Optional[str] = None) -> None:
+        with self._lock:
+            if session is None:
+                self._closed = True
+            self._retired.update(key for key in self._values if session is None or self._owners[key] == session)
+
+    def idle_retired(self) -> List[Tuple[str, Any]]:
+        with self._lock:
+            return [(key, value) for key, value in self._values.items() if key in self._retired
+                    and not any(resource in self._busy for resource in self._resources[key])]
 
     def cleanup(self) -> None:
-        with self._lock:
-            self._closed = True
-            self._values.clear()
-            self._identity.clear()
+        """Clear an unused standalone registry; the runtime finalizes values first."""
+        self.retire()
+        for key, _ in self.idle_retired():
+            self.release(key)
 
 
 def _qualified_type(value: Any) -> str:
@@ -864,6 +941,9 @@ class BridgeRuntime:
         )
         self.handles = HandleRegistry()
         self.handle_registry = self.handles
+        self.handles.on_use = self._bind_engine
+        self._sessions = {"default": True}
+        self._identity_claims = {}
         self._operation_specs = {spec.id: spec for spec in OPERATION_SPECS}
         self.operation_handlers: Dict[str, Callable[..., Any]] = {
             spec.qualified_name: self._operation_handler(spec)
@@ -876,6 +956,7 @@ class BridgeRuntime:
         self._closed = False
         self.tool_handlers: Dict[str, Callable[[Mapping[str, Any]], Any]] = {
             "automation_bridge_call": self._tool_call,
+            "automation_bridge_session": self._tool_session,
             "automation_bridge_catalog": self._tool_catalog,
             "automation_bridge_destructive_call": self._tool_destructive_call,
             "automation_bridge_enter": self._tool_enter,
@@ -980,13 +1061,23 @@ class BridgeRuntime:
     def finish_request(self, request_id: Any) -> None:
         with self._lock:
             context = self._requests.pop(request_id, None)
-        if context is not None and (context.token.cancelled or self._closed):
+            self._identity_claims = {pair: owner for pair, owner in self._identity_claims.items() if owner != request_id}
+        if context is None:
+            return
+        self.handles.finish(context)
+        if context.token.cancelled or self._closed or not self._sessions.get(context.session):
             for token, value in reversed(context.created):
-                self._cleanup_value(token, value, failure=True)
-                try:
+                if self.handles.token_for(value) == token:
+                    self._cleanup_value(token, value, failure=True)
                     self.handles.release(token)
-                except ToolFailure:
-                    pass
+        self._cleanup_retired()
+
+    def _cleanup_retired(self) -> None:
+        # Snapshot and cleanup can run on shutdown and worker completion threads.
+        with self._lock:
+            for token, value in reversed(self.handles.idle_retired()):
+                self._cleanup_value(token, value, failure=True)
+                self.handles.release(token)
 
     def call_tool_request(self, request_id: Any, name: str, arguments: Mapping[str, Any]) -> JsonObject:
         with self._lock:
@@ -1000,6 +1091,11 @@ class BridgeRuntime:
                 raise ToolFailure("unknown_tool", "unknown Automation Bridge tool", {"name": name})
             if not isinstance(arguments, Mapping):
                 raise ToolFailure("invalid_arguments", "tool arguments must be an object")
+            arguments = dict(arguments)
+            session = arguments.pop("mcp_session", "default")
+            if not isinstance(session, str) or not self._sessions.get(session):
+                raise ToolFailure("unknown_session", "MCP session is missing or closed")
+            context.session = session
             if self._closed:
                 raise ToolFailure("runtime_closed", "the Automation Bridge MCP runtime is closed")
             with engine.cancellation_scope(context.token), context.scopes:
@@ -1035,9 +1131,10 @@ class BridgeRuntime:
             if context is not None:
                 context.token.cancel("MCP request cancelled")
 
-    def _record_cleanup_error(self, request_id: Any, error: Exception) -> None:
+    def _record_cleanup_error(self, request_id: Any, error: Exception, session: Optional[str] = None) -> None:
         with self._lock:
-            self.cleanup_errors.append({"request_id": request_id, "error": _exception_failure(error).as_dict()})
+            context = _request_context.get()
+            self.cleanup_errors.append({"request_id": request_id, "mcp_session": session if session is not None else (context.session if context else None), "error": _exception_failure(error).as_dict()})
 
     def _discard_unretained(self, value: Any) -> None:
         if isinstance(value, Mapping):
@@ -1112,6 +1209,11 @@ class BridgeRuntime:
         if spec.adapter == "mcp_request_cancellation":
             raise ToolFailure("request_cancellation", spec.reason, {"operation": spec.id})
         kwargs = deserialize(dict(arguments), self.handles)
+        if spec.qualified_name in {
+            "automation_bridge.engine.connect", "automation_bridge.editor.Client.connect_engine",
+            "automation_bridge.editor.Client.build_and_run", "automation_bridge.editor.Client.clean_build_and_run",
+        }:
+            kwargs = self._connection_identity(kwargs)
         if not isinstance(kwargs, dict):
             raise ToolFailure("invalid_arguments", "operation arguments must be an object")
         prohibited = sorted(set(kwargs) & set(spec.unsupported_parameters))
@@ -1253,8 +1355,10 @@ class BridgeRuntime:
         enter = getattr(target, "__enter__", None)
         if not callable(enter):
             raise ToolFailure("not_a_context", "target does not implement __enter__ and __exit__")
-        result = enter()
         token = self.handles.token_for(target) or self.handles.put(target)
+        if token in self._entered:
+            raise ToolFailure("context_entered", "context is already entered")
+        result = enter()
         with self._lock:
             self._entered.add(token)
         return result
@@ -1293,15 +1397,64 @@ class BridgeRuntime:
         except StopIteration:
             return {"done": True}
 
+    def _release_related(self, token: str, *, keep_client: bool = False) -> None:
+        value = self.handles.get(token)
+        related = self.handles.related(token) if isinstance(value, (engine.Client, editor.Client)) else [(token, value)]
+        for child_token, child in reversed(related):
+            self._cleanup_value(child_token, child, failure=False)
+            if child_token != token or not keep_client:
+                self.handles.release(child_token)
+
     def _tool_release(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("target",))
         token = _target_token(arguments["target"], self.handles)
         if token is None:
             raise ToolFailure("unknown_handle", "target does not contain a live handle")
-        value = self.handles.get(token)
-        self._cleanup_value(token, value, failure=False)
-        self.handles.release(token)
+        self._release_related(token)
         return {"released": True, "handle": token}
+
+    def _tool_session(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, optional=("action",))
+        action = arguments.get("action", "info")
+        context = _request_context.get()
+        session = context.session
+        if action == "open":
+            session = "s_" + uuid.uuid4().hex
+            with self._lock:
+                self._sessions[session] = True
+        elif action == "close":
+            with self._lock:
+                self._sessions[session] = False
+                for pending in self._requests.values():
+                    if pending is not context and pending.session == session:
+                        pending.token.cancel("MCP session closed")
+                self.handles.retire(session)
+            self._cleanup_retired()
+        elif action != "info":
+            raise ToolFailure("invalid_action", "action must be open, info or close")
+        return {"mcp_session": session, "closed": not self._sessions[session],
+                "handles": len(self.handles.snapshot(session)),
+                "cleanup_errors": [entry for entry in self.cleanup_errors if entry.get("mcp_session") == session]}
+
+    def _connection_identity(self, arguments: Mapping[str, Any]) -> dict:
+        kwargs = dict(arguments)
+        context = _request_context.get()
+        if kwargs.get("client_id") is None:
+            kwargs["client_id"] = "mcp-" + (context.session if context else "default")
+        if kwargs.get("session_id") is None:
+            kwargs["session_id"] = "mcp-" + uuid.uuid4().hex
+        if any(not isinstance(kwargs[key], str) or not kwargs[key] for key in ("client_id", "session_id")):
+            raise ToolFailure("invalid_identity", "client_id and session_id must be non-empty strings")
+        pair = (kwargs["client_id"], kwargs["session_id"])
+        with self._lock:
+            used = pair in self._identity_claims or any(
+                isinstance(value, engine.Client) and not value.closed and (value.client_id, value.session_id) == pair
+                for _, value in self.handles.snapshot())
+            if used:
+                raise ToolFailure("identity_in_use", "use distinct native client/session identities for independent MCP clients")
+            if context:
+                self._identity_claims[pair] = context.request_id
+        return kwargs
 
     def _extract_path(self, value: Any, path: Optional[str]) -> Any:
         if not path:
@@ -1475,7 +1628,7 @@ class BridgeRuntime:
         if not isinstance(clean, bool):
             raise ToolFailure("invalid_clean", "clean must be boolean")
         method = project.clean_build_and_run if clean else project.build_and_run
-        kwargs = {key: arguments[key] for key in ("client_id", "session_id", "focus") if key in arguments}
+        kwargs = self._connection_identity({key: arguments[key] for key in ("client_id", "session_id", "focus") if key in arguments})
         if clean and "focus" in kwargs:
             raise ToolFailure("unsupported_parameter", "clean builds use the editor's native focus behavior; omit focus or use a regular build")
         game = method(timeout=arguments.get("timeout", 60.0), required_capabilities=capabilities, **kwargs)
@@ -1496,21 +1649,22 @@ class BridgeRuntime:
         capabilities = arguments.get("required_capabilities", ())
         if not isinstance(capabilities, (list, tuple)) or not all(isinstance(item, str) for item in capabilities):
             raise ToolFailure("invalid_capabilities", "required_capabilities must be an array of strings")
+        identity = self._connection_identity({key: arguments[key] for key in ("client_id", "session_id") if key in arguments})
         timeout = arguments.get("timeout", 20.0 if has_project else 10.0)
         if has_project:
             direct_only = sorted(
-                set(arguments) & {"profiler_url", "client_id", "session_id"}
+                set(arguments) & {"profiler_url"}
             )
             if direct_only:
                 raise ToolFailure(
                     "invalid_arguments",
-                    "profiler_url, client_id, and session_id are only valid with port",
+                    "profiler_url is only valid with port",
                     {"fields": direct_only},
                 )
             project = self._resolve_target(arguments["project"])
             if not isinstance(project, editor.Client):
                 raise ToolFailure("wrong_target_type", "project must be an editor.Client handle")
-            game = project.connect_engine(timeout=timeout, required_capabilities=capabilities)
+            game = project.connect_engine(timeout=timeout, required_capabilities=capabilities, **identity)
         else:
             port = arguments["port"]
             if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
@@ -1518,8 +1672,7 @@ class BridgeRuntime:
             kwargs = {
                 "timeout": timeout,
                 "profiler_url": arguments.get("profiler_url"),
-                "client_id": arguments.get("client_id"),
-                "session_id": arguments.get("session_id"),
+                **identity,
                 "required_capabilities": capabilities,
             }
             game = engine.connect(port, **kwargs)
@@ -1562,7 +1715,8 @@ class BridgeRuntime:
     def _focused_close(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("engine",))
         game = self._engine_target(arguments)
-        game.close()
+        token = self.handles.token_for(game)
+        self._release_related(token, keep_client=True)
         return game.session_info()
 
     def _focused_health(self, arguments: Mapping[str, Any]) -> Any:
@@ -1723,6 +1877,10 @@ class BridgeRuntime:
         })
         modifiers_schema = {"anyOf": [_STRING, {"type": "array", "items": _STRING, "maxItems": 4}]}
         definitions = {
+            "automation_bridge_session": (
+                "Manage an MCP session", "Open an isolated logical session, inspect its handles and cleanup errors, or close it. Pass the returned mcp_session on subsequent tools. Closing releases local resources and input; engines stay running.",
+                _object_schema({"action": {"type": "string", "enum": ["open", "info", "close"]}}), False, False, False,
+            ),
             "defold_doctor": (
                 "Diagnose Defold automation", "Inspect project setup, editor, bridge versions and capabilities without launching or writing files.",
                 _object_schema({"project_path": _STRING, "required_capabilities": {"type": "array", "items": _STRING}}, ("project_path",)), True, False, True,
@@ -1879,6 +2037,7 @@ class BridgeRuntime:
         }
         descriptors = []
         for name, (title, description, schema, read_only, destructive, idempotent) in definitions.items():
+            schema["properties"]["mcp_session"] = {"type": "string", "description": "Logical session returned by automation_bridge_session; omitted uses the transport default."}
             descriptors.append(_tool_descriptor(
                 name, title, description, schema,
                 read_only=read_only, destructive=destructive, idempotent=idempotent,
@@ -1940,7 +2099,7 @@ class BridgeRuntime:
         try:
             with self._lock:
                 entered = token in self._entered
-            if entered and callable(getattr(value, "__exit__", None)):
+            if entered and not isinstance(value, engine.Client) and callable(getattr(value, "__exit__", None)):
                 self._exit_context(token, value, "MCP session ended" if failure else None)
                 return
             if isinstance(value, engine.PointerSession) and not value.closed:
@@ -1955,11 +2114,16 @@ class BridgeRuntime:
                 value.stop()
             elif isinstance(value, (editor.ConsoleStream, engine.EngineLogStream, engine.EventStream, engine.RuntimeLogs)):
                 value.close()
-            elif isinstance(value, engine.Client):
-                value.close()
+            elif isinstance(value, engine.Client) and not value.closed:
+                try:
+                    value.input.flush(release=True)
+                finally:
+                    value.close()
         except Exception as error:
             context = _request_context.get()
-            self._record_cleanup_error(context.request_id if context else None, error)
+            self._record_cleanup_error(context.request_id if context else None, error, self.handles._owners.get(token))
+            if not failure:
+                raise ToolFailure("cleanup_failed", "resource cleanup failed; inspect cleanup_errors before retrying", {"handle": token, "cause": _exception_failure(error).as_dict()}) from error
 
     def cleanup(self) -> None:
         with self._lock:
@@ -1968,9 +2132,8 @@ class BridgeRuntime:
             self._closed = True
             for context in self._requests.values():
                 context.token.cancel("MCP runtime closed")
-        for token, value in reversed(self.handles.snapshot()):
-            self._cleanup_value(token, value, failure=True)
-        self.handles.cleanup()
+        self.handles.retire()
+        self._cleanup_retired()
 
 
 __all__ = [
