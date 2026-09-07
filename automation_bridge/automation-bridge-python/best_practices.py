@@ -90,7 +90,7 @@ def inspect_editor_services(project: editor.Client) -> None:
 
 
 def build_owned_game(project: editor.Client) -> engine.Client:
-    """Build a fresh engine and declare the features required by the script."""
+    """Compile and launch directly; a separate compile call is unnecessary."""
     return project.build_and_run(
         required_capabilities=(
             "scene",
@@ -101,6 +101,11 @@ def build_owned_game(project: editor.Client) -> engine.Client:
             "screenshot",
         ),
     )
+
+
+def check_compilation(project: editor.Client) -> editor.BuildResult:
+    """Check resources and Lua without launching; requires Defold 1.13.2."""
+    return project.compile()
 
 
 def connect_to_existing_game(project: editor.Client) -> engine.Client:

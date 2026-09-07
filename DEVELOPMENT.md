@@ -70,7 +70,7 @@ with Python 3.10 and 3.14, independently of the native Bob build. For a local ru
 that never contacts an editor:
 
 ```sh
-PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api.EngineClientUnitTest tests.test_automation_bridge_api.EditorDiscoveryUnitTest tests.test_tooling
+PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api.EngineClientUnitTest tests.test_automation_bridge_api.EditorDiscoveryUnitTest tests.test_automation_bridge_api.EditorCompatibilityUnitTest tests.test_tooling
 ```
 
 Before merging changes to the shared protocol, open this sample project in
@@ -86,6 +86,12 @@ process is borrowed and remains running after teardown. Editor-specific tests
 still need the editor workflow. The ordinary command skips runtime tests when
 Defold is absent; `AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1` turns unavailable runtime
 setup into a failure. It never launches the editor implicitly.
+
+Editor compatibility tests serve the versioned fixtures in `tests/fixtures`
+through local HTTP servers. They cover 1.13.1 command enums and acknowledgements,
+1.13.2 command paths and focus, compile/run, structured completion and errors,
+Bob authentication, and target URLs with console fallback. Feature availability
+comes from advertised capabilities, including when an early alpha lacks an API.
 
 Runtime checks cover pagination metadata and malformed values, built/borrowed
 clients, cancellation release, competing client/session identities, native lease

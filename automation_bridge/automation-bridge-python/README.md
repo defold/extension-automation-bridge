@@ -331,6 +331,52 @@ for preference in project.preferences.list(prefix="code"):
 
 ## Capabilities
 
+Editor command discovery supports Defold 1.13.1's command enum and 1.13.2's
+individual OpenAPI paths. Use `project.commands.catalog()` for descriptions and
+parameter schemas, and `project.commands.supports("run", parameter="focus")`
+to probe support. Pass `refresh=True` to `catalog()` after capabilities change.
+New-feature `editor.UnsupportedOperationError` messages identify Defold 1.13.2
+as the minimum version; their `minimum_version` attribute is available to hosts.
+
+`project.last_command_result` retains typed `editor.BuildResult` diagnostics after
+build/run, HTML5, hot reload, and debugger operations. It includes warnings,
+zero-based source ranges, completion status, and an optional `target_url`.
+`editor.BuildError.result` retains the same evidence on failure. Existing helpers
+keep their return values. On 1.13.1, HTML5, hot reload, and debugger acknowledgements
+have `completed=False` and `success=None`; 1.13.2 reports their build completion.
+
+Use `project.compile()` on Defold 1.13.2 to validate resources and Lua without
+launching or bundling. It returns a `BuildResult`; compilation failures raise
+`BuildError`. When runtime testing is needed, call `project.build_and_run()`
+directly: it compiles and launches through `run` on 1.13.2 or `build` on 1.13.1.
+The default avoids taking focus where supported and preserves the legacy launch
+on 1.13.1. Explicit `focus=False` requires advertised focus control (1.13.2);
+`focus=True` works on either version. Unsupported requests fail before engine
+cleanup. `clean_build_and_run()` still uses the native focused launch on both.
+
+Defold 1.13.2 also supports Bob builds and bundles without launching:
+
+```python
+result = project.bob(
+    options={"platform": "wasm-web", "archive": True},
+    commands=("build", "bundle"),
+)
+```
+
+Bob option keys omit `--`; arrays supply repeatable options. Use
+`project.bob(options={"help": True})` and `project.console.read()` for Bob help
+and output. The wrapper reads `.internal/editor.token` for each call and sends
+it as a bearer token. Missing or rejected credentials raise `CommandError`.
+Bob requests are never automatically retried after an uncertain transport failure.
+
+When a 1.13.2 build result includes a target URL, bootstrap connects to that
+target and validates native health, capabilities, and identity before caching it.
+The current engine transport supports `http://127.0.0.1:PORT` and
+`http://localhost:PORT`. Other targets raise `UnsupportedOperationError`; select
+a local engine in Defold. A reported target never falls back to historical ports
+or triggers an automatic rebuild. Results without a URL continue to use console
+registration and existing recovery behavior, including on Defold 1.13.1.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

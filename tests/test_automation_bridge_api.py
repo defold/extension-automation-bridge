@@ -18,6 +18,8 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
+from tests.editor_http_fixture import EditorHttpFixture
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
@@ -61,7 +63,8 @@ from automation_bridge.remotery import (  # noqa: E402
 )
 
 
-EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi.json").read_text(encoding="utf-8"))
+EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi_1_13_1.json").read_text(encoding="utf-8"))
+EDITOR_OPENAPI_1_13_2 = json.loads((ROOT / "tests/fixtures/editor_openapi_1_13_2.json").read_text(encoding="utf-8"))
 
 
 def _read_automation_bridge_png(path):
@@ -168,6 +171,41 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_editor_discovery_accepts_individual_command_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {
+            "/command/run": {"post": {"summary": "Compile and launch", "parameters": [
+                {"name": "focus", "in": "query", "schema": {"type": "boolean", "default": True}},
+            ]}},
+            "/command/compile": {"post": {"summary": "Compile without launching"}},
+            "/command/documentation": {"post": {}},
+        }}
+        self.assertEqual(["compile", "run"], [item.name for item in project.commands.catalog()])
+        self.assertTrue(project.commands.supports("run", parameter="focus"))
+        self.assertFalse(project.commands.supports("compile", parameter="focus"))
+        self.assertFalse(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("documentation"))
+        self.assertEqual("Compile and launch", project._require_command("run").summary)
+        self.assertEqual("/command/compile", project._require_command("compile").path)
+
+    def test_editor_discovery_preserves_legacy_commands_and_version_guidance(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        self.assertTrue(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("build", parameter="focus"))
+        for name in ("compile", "run"):
+            with self.subTest(name=name), self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2") as error:
+                project._require_command(name)
+            self.assertEqual("1.13.2", error.exception.minimum_version)
+
+    def test_editor_discovery_refreshes_without_executing_commands(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"paths": {"/command/compile": {"post": {}}}})) as request:
+            self.assertFalse(project.commands.supports("compile"))
+            self.assertEqual(["compile"], [item.name for item in project.commands.catalog(refresh=True)])
+        request.assert_called_once_with(project.base_url + "/openapi.json", timeout=10.0)
+
     def test_required_runtime_does_not_silently_skip_missing_editor(self):
         with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "1"}):
             with self.assertRaisesRegex(RuntimeError, "missing editor"):
@@ -333,6 +371,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_editor_workflows_forward_explicit_session_identity(self):
         project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
         with mock.patch.object(EngineClient, "_from_editor") as connect:
             for method in (project.connect_engine, project.build_and_run, project.clean_build_and_run):
                 method(client_id="agent-a", session_id="task-1")
@@ -356,6 +395,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_invalid_session_identity_is_rejected_before_build(self):
         project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
         with mock.patch.object(project, "_build_and_run_command") as build:
             for value in (False, "", 1):
                 with self.subTest(value=value), self.assertRaises(ValueError):
@@ -1107,7 +1147,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
         parameters = EDITOR_OPENAPI["paths"]["/command/{command}"]["post"]["parameters"]
         advertised = set(parameters[0]["schema"]["enum"])
-        self.assertEqual(advertised, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
+        self.assertEqual(advertised | {"compile", "run"}, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
         self.assertFalse(editor._SUPPORTED_COMMANDS & editor._EXCLUDED_COMMANDS)
         self.assertEqual({("/eval", "post")}, editor._EXCLUDED_PATHS)
         advertised_paths = {
@@ -1115,7 +1155,7 @@ class EngineClientUnitTest(unittest.TestCase):
             for path, operations in EDITOR_OPENAPI["paths"].items()
             for method in operations
         }
-        self.assertEqual(advertised_paths, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
+        self.assertEqual(advertised_paths | {("/bob", "post")}, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
 
     def test_every_editor_command_wrapper_uses_its_advertised_command(self):
         project = EditorApiClient(".", port=12345)
@@ -1420,9 +1460,67 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("/main/main.script", actual.resource)
         self.assertEqual((7, 3), (actual.range.start.line, actual.range.start.character))
         self.assertEqual((7, 8), (actual.range.end.line, actual.range.end.character))
+        self.assertIs(project.last_command_result, raised.exception.result)
+        self.assertFalse(raised.exception.result.success)
+
+    def test_editor_legacy_acknowledgements_do_not_claim_completion(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, body in ((202, b""), (202, b"202 Accepted\n"), (200, b"200 OK\n")):
+            with self.subTest(body=body), mock.patch("automation_bridge.editor.request_raw", return_value=(status, body)):
+                self.assertIsNone(project.commands.hot_reload())
+            result = project.last_command_result
+            self.assertEqual(("hot-reload", status, False, None), (result.command, result.status, result.completed, result.success))
+
+    def test_editor_completion_retains_warnings_target_and_additional_fields(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payload = {"success": True, "issues": [{"severity": "warning", "message": "unused variable"}],
+                   "target": {"url": "http://localhost:3456"}, "future_metadata": "retained"}
+        for operation in (project.commands.hot_reload, project.debugger.start, project.build_and_run_html5):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                self.assertIsNone(operation())
+            result = project.last_command_result
+            self.assertTrue(result.completed)
+            self.assertTrue(result.success)
+            self.assertEqual("warning", result.issues[0].severity)
+            self.assertEqual("http://localhost:3456", result.target_url)
+            self.assertEqual("retained", result.raw["future_metadata"])
+        with mock.patch("automation_bridge.editor.request_raw", side_effect=editor.HttpError("POST", project.base_url, "unavailable")):
+            with self.assertRaises(editor.HttpError):
+                project.commands.hot_reload()
+        self.assertIsNone(project.last_command_result)
+
+    def test_editor_completion_surfaces_build_failure_and_missing_target(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, success in ((200, True), (422, False), (200, False)):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(status, json.dumps({"success": success, "issues": []}).encode())):
+                if success:
+                    project.commands.hot_reload()
+                else:
+                    with self.assertRaises(editor.BuildError) as error:
+                        project.commands.hot_reload()
+                    self.assertIs(project.last_command_result, error.exception.result)
+            self.assertIsNone(project.last_command_result.target_url)
+            self.assertEqual(success, project.last_command_result.success)
+
+    def test_editor_rejects_malformed_completion_evidence(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payloads = [[], {}, {"success": "false"}, {"success": True, "issues": None},
+                    {"success": True, "issues": [None]}, {"success": True, "target": {}},
+                    {"success": True, "target": {"url": 123}},
+                    {"success": True, "issues": [{"severity": "error", "message": "broken", "range": {"start": {"line": "7", "character": 0}, "end": {"line": 7, "character": 1}}}]}]
+        for payload in payloads:
+            with self.subTest(payload=payload), mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                with self.assertRaises(editor.HttpError):
+                    project.commands.hot_reload()
+            self.assertIsNone(project.last_command_result)
 
     def test_editor_build_workflows_delegate_with_explicit_command_names(self):
         project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
         sentinel = object()
         with mock.patch.object(EngineClient, "_from_editor", return_value=sentinel) as connect:
             self.assertIs(sentinel, project.build_and_run(timeout=12, required_capabilities=("scene",)))
@@ -1431,6 +1529,256 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("build", connect.call_args_list[0].kwargs["build_command"])
         self.assertEqual("clean-build", connect.call_args_list[1].kwargs["build_command"])
         self.assertIsNone(connect.call_args_list[2].kwargs["build_command"])
+
+    def test_editor_compile_never_enters_engine_lifecycle(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/compile": {"post": {}}}}
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+             mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch.object(project, "_console_lines") as console:
+            result = project.compile(timeout=12)
+        self.assertIs(project.last_command_result, result)
+        self.assertTrue(result.completed)
+        self.assertEqual("compile", result.command)
+        request.assert_called_once_with(project.base_url + "/command/compile", method="POST", timeout=12)
+        bootstrap.assert_not_called()
+        console.assert_not_called()
+
+    def test_editor_bob_sends_options_and_reads_each_session_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            token_path = root / ".internal/editor.token"
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+                 mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                for token in ("first-session", "second-session"):
+                    token_path.write_text(token + "\n", encoding="utf-8")
+                    result = project.bob(options={"platform": "wasm-web", "archive": True, "architectures": ["wasm-web", "js-web"]}, commands=("build", "bundle"), timeout=90)
+                    self.assertEqual("Bearer " + token, request.call_args.kwargs["headers"]["Authorization"])
+                    self.assertEqual("application/json", request.call_args.kwargs["headers"]["Content-Type"])
+                    self.assertEqual(90, request.call_args.kwargs["timeout"])
+                    self.assertEqual(project.base_url + "/bob", request.call_args.args[0])
+                    self.assertEqual(["build", "bundle"], json.loads(request.call_args.kwargs["data"])["commands"])
+                    self.assertEqual(["wasm-web", "js-web"], json.loads(request.call_args.kwargs["data"])["options"]["architectures"])
+                    self.assertIs(project.last_command_result, result)
+                    self.assertTrue(result.success)
+                    self.assertEqual("bob", result.command)
+            self.assertEqual(2, request.call_count)
+            bootstrap.assert_not_called()
+
+    def test_editor_bob_rejects_unsupported_and_malformed_input_before_request(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json") as request:
+            with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                project.bob()
+            for options in ([], "--help", {3: "value"}, {"value": float("nan")}, {"value": object()}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    project.bob(options=options)
+            for commands in (None, "build", b"build", [False], 1):
+                with self.subTest(commands=commands), self.assertRaises(ValueError):
+                    project.bob(commands=commands)
+        request.assert_not_called()
+
+    def test_editor_bob_missing_credentials_and_rejections_do_not_leak_token_or_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json") as request:
+                with self.assertRaisesRegex(editor.CommandError, "editor.token"):
+                    project.bob()
+            request.assert_not_called()
+            (root / ".internal").mkdir()
+            token = "private-test-token"
+            (root / ".internal/editor.token").write_text(token, encoding="utf-8")
+            failures = [(401, {"error": token}), (403, {"error": token}),
+                        editor.HttpError("POST", project.base_url + "/bob", token, status=401)]
+            for failure in failures:
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with mock.patch("automation_bridge.editor.request_json", **kwargs) as request:
+                    with self.assertRaisesRegex(editor.CommandError, "authentication was rejected") as error:
+                        project.bob()
+                self.assertNotIn(token, str(error.exception))
+                self.assertIsNone(error.exception.__cause__)
+                request.assert_called_once()
+                self.assertIsNone(project.last_command_result)
+
+    def test_editor_bob_preserves_build_diagnostics_without_retrying_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            (root / ".internal/editor.token").write_text("test-session", encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            payload = {"success": False, "issues": [{"severity": "error", "message": "invalid option"}]}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(422, payload)):
+                with self.assertRaises(editor.BuildError) as error:
+                    project.bob(options={"help": True})
+            self.assertIs(project.last_command_result, error.exception.result)
+            with mock.patch("automation_bridge.editor.request_json", side_effect=editor.HttpError("POST", project.base_url, "timed out")) as request:
+                with self.assertRaises(editor.HttpError):
+                    project.bob()
+            request.assert_called_once()
+            self.assertIsNone(project.last_command_result)
+
+    def test_editor_compile_and_focus_reject_legacy_before_mutation(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch("automation_bridge.editor.request_json") as request:
+            for operation in (project.compile, lambda: project.build_and_run(focus=False)):
+                with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                    operation()
+        request.assert_not_called()
+        bootstrap.assert_not_called()
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            project.build_and_run(focus=True)
+        self.assertEqual("build", bootstrap.call_args.kwargs["build_command"])
+        self.assertNotIn("focus", bootstrap.call_args.kwargs)
+
+    def test_editor_run_negotiates_focus_and_prefers_new_command(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/run": {"post": {"parameters": [
+            {"name": "focus", "in": "query", "schema": {"type": "boolean"}},
+        ]}}, "/command/build": {"post": {}}}}
+        for supplied, expected in ((None, False), (False, False), (True, True)):
+            with self.subTest(focus=supplied), mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                project.build_and_run(focus=supplied)
+            self.assertEqual("run", bootstrap.call_args.kwargs["build_command"])
+            self.assertIs(expected, bootstrap.call_args.kwargs["focus"])
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True), \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request:
+                project._build_and_run_command("run", focus=expected)
+            self.assertEqual(project.base_url + "/command/run?focus=" + str(expected).lower(), request.call_args.args[0])
+            self.assertEqual(1, request.call_count)
+
+    def test_editor_run_validates_focus_and_clean_build_before_bootstrap(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {}}
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            for focus in (0, 1, "false", [], {}):
+                with self.subTest(focus=focus), self.assertRaisesRegex(ValueError, "focus"):
+                    project.build_and_run(focus=focus)
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.clean_build_and_run()
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.build_and_run()
+        bootstrap.assert_not_called()
+
+    def test_editor_run_keeps_focus_during_stale_build_recovery(self):
+        project = EditorApiClient(".", port=12345)
+        sentinel = object()
+        with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+             mock.patch("automation_bridge.client.cancellable_sleep"), \
+             mock.patch.object(EngineClient, "_wait_for_bridge", return_value=sentinel), \
+             mock.patch.object(project, "_build_and_run_command") as build:
+            self.assertIs(sentinel, EngineClient._recover_after_stale_build(project, lambda: None, 5, "run", focus=False))
+        build.assert_called_once_with("run", timeout=5, focus=False)
+
+    def test_editor_target_urls_must_match_the_local_engine_transport(self):
+        for url in ("http://127.0.0.1:3456", "http://localhost:3456/", "http://LOCALHOST:3456"):
+            self.assertEqual(3456, EditorApiClient._local_target_port(url))
+        for url in ("https://localhost:3456", "http://example.test:3456", "http://127.0.0.2:3456",
+                    "http://[::1]:3456", "http://localhost", "http://localhost:0", "http://localhost:65536",
+                    "http://localhost:bad", "http://localhost:3456/other", "http://user:secret@localhost:3456",
+                    "http://localhost:3456?x=1", "http://localhost:3456#fragment", " http://localhost:3456"):
+            with self.subTest(url=url), self.assertRaisesRegex(editor.UnsupportedOperationError, "local engine client"):
+                EditorApiClient._local_target_port(url)
+
+    def test_editor_reported_target_skips_console_registration_wait_and_resets_on_next_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            payload = {"success": True, "issues": [], "target": {"url": "http://127.0.0.1:3456"}}
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True) as registration, \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, payload)):
+                result = project._build_and_run_command("run")
+                self.assertEqual("http://127.0.0.1:3456", result.target_url)
+                self.assertEqual(3456, project._last_build_target_port)
+                registration.assert_not_called()
+                del payload["target"]
+                project._build_and_run_command("run")
+                self.assertIsNone(project._last_build_target_port)
+                registration.assert_called_once()
+
+    def test_editor_bootstrap_prefers_reported_target_and_preserves_matching_profiler(self):
+        health = {"version": "2", "capabilities": ["runtime.health", "scene"],
+                  "identity": {"engine_instance_id": "engine:new", "project_identity": "project:test"}}
+        for console_port, expected_profiler in ((3456, "ws://127.0.0.1:5555/rmt"), (9876, None)):
+            with self.subTest(console_port=console_port), tempfile.TemporaryDirectory() as root:
+                project = EditorApiClient(root, port=12345)
+                project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+                lines = [f"INFO:ENGINE: Engine service started on port {console_port}",
+                         "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:5555/rmt)",
+                         "INFO:ENGINE: Automation Bridge endpoint registered"]
+                with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=lines), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.client.RuntimeLogs.start"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    bridge = project.build_and_run(required_capabilities=("scene",), client_id="agent-a", session_id="task-1")
+                self.assertEqual(3456, bridge.port)
+                self.assertTrue(bridge.owns_engine)
+                self.assertEqual(expected_profiler, bridge.profiler_url)
+                self.assertEqual("engine:new", bridge.engine_instance_id)
+                self.assertEqual("task-1", bridge.session_info()["session_id"])
+                self.assertEqual(3456, project._cached_engine_identity["port"])
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                build.assert_called_once()
+                bridge.close()
+
+    def test_editor_reported_target_never_falls_back_or_relaunches_after_health_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            project._cached_engine_identity = {"port": 3456, "project_identity": "project:expected"}
+            rejected = [
+                {"version": "2", "identity": {}},
+                {"version": "2", "identity": {"engine_instance_id": "engine:other", "project_identity": "project:other"}},
+            ]
+            for health in rejected:
+                with self.subTest(health=health), \
+                     mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=[]), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch.object(EngineClient, "_recover_after_stale_build") as recover, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    with self.assertRaisesRegex(WaitTimeoutError, "reported target"):
+                        project.build_and_run(timeout=0.002)
+                self.assertTrue(request.called)
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                recover.assert_not_called()
+                build.assert_called_once()
+                self.assertEqual("project:expected", project._cached_engine_identity["project_identity"])
+
+    def test_editor_reported_target_still_requires_native_capabilities(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(EngineClient, "_request", return_value={"version": "2", "capabilities": []}), \
+                 mock.patch("automation_bridge.client.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                with self.assertRaises(UnsupportedCapabilityError):
+                    project.build_and_run(required_capabilities=("scene",))
+            build.assert_called_once()
 
     def test_editor_preferences_catalog_and_custom_paths(self):
         project = EditorApiClient(".", port=12345)
@@ -2835,6 +3183,125 @@ class EngineClientUnitTest(unittest.TestCase):
             )
 
 
+class EditorCompatibilityUnitTest(unittest.TestCase):
+    def test_versioned_discovery_uses_paths_instead_of_api_info_version(self):
+        for document, has_new_commands in ((EDITOR_OPENAPI, False), (EDITOR_OPENAPI_1_13_2, True)):
+            with self.subTest(new_api=has_new_commands), tempfile.TemporaryDirectory() as root, \
+                 EditorHttpFixture(document, lambda request: (404, b"Not Found")) as server:
+                project = EditorApiClient(root, port=server.port)
+                self.assertEqual("1.0", document["info"]["version"])
+                self.assertEqual(has_new_commands, project.commands.supports("compile"))
+                self.assertEqual(has_new_commands, project.commands.supports("run", parameter="focus"))
+                self.assertEqual(not has_new_commands, project.commands.supports("build"))
+                catalog = {item.name: item for item in project.commands.catalog()}
+                self.assertNotIn("documentation", catalog)
+                self.assertIn("clean-build", catalog)
+                if has_new_commands:
+                    self.assertEqual("boolean", catalog["run"].parameters[0]["schema"]["type"])
+                    self.assertIn("without launching", catalog["compile"].summary)
+                self.assertEqual(["/openapi.json"], [request["path"] for request in server.requests])
+
+    def test_build_and_run_over_http_for_both_versions_and_optional_target(self):
+        for document, target_present, expected_command in (
+            (EDITOR_OPENAPI, False, "/command/build"),
+            (EDITOR_OPENAPI_1_13_2, False, "/command/run?focus=false"),
+            (EDITOR_OPENAPI_1_13_2, True, "/command/run?focus=false"),
+        ):
+            with self.subTest(command=expected_command, target=target_present), tempfile.TemporaryDirectory() as root:
+                health = {"ok": True, "data": {"version": "2", "capabilities": ["scene"],
+                          "identity": {"engine_instance_id": "engine:fixture", "project_identity": "project:fixture"}}}
+                with FakeHttpServer(json.dumps(health).encode()) as native:
+                    console = []
+
+                    def respond(request):
+                        if request["method"] == "GET" and request["path"] == "/console":
+                            return 200, {"lines": console}
+                        if request["method"] == "POST" and request["path"] == expected_command:
+                            console.extend([f"INFO:ENGINE: Engine service started on port {native.port}",
+                                            "INFO:ENGINE: Automation Bridge endpoint registered"])
+                            result = {"success": True, "issues": []}
+                            if target_present:
+                                result["target"] = {"url": f"http://127.0.0.1:{native.port}"}
+                            return 200, result
+                        return 404, b"Not Found"
+
+                    with EditorHttpFixture(document, respond) as server, \
+                         mock.patch("automation_bridge.client.RuntimeLogs.start"), \
+                         mock.patch("automation_bridge.client.cancellable_sleep"), \
+                         mock.patch("automation_bridge.editor.cancellable_sleep"):
+                        project = EditorApiClient(root, port=server.port)
+                        bridge = project.build_and_run(timeout=1, required_capabilities=("scene",))
+                        self.assertEqual(native.port, bridge.port)
+                        self.assertTrue(bridge.owns_engine)
+                        self.assertEqual("engine:fixture", bridge.engine_instance_id)
+                        self.assertTrue(project.last_command_result.completed)
+                        self.assertEqual(target_present, project.last_command_result.target_url is not None)
+                        self.assertEqual([expected_command], [request["path"] for request in server.requests if request["method"] == "POST"])
+                        bridge.close()
+                self.assertEqual("/automation-bridge/v2/health", urllib.parse.urlsplit(native.request_line.split()[1]).path)
+
+    def test_legacy_http_acknowledgements_and_unsupported_features(self):
+        with tempfile.TemporaryDirectory() as root, \
+             EditorHttpFixture(EDITOR_OPENAPI, lambda request: (202, b"202 Accepted\n")) as server:
+            project = EditorApiClient(root, port=server.port)
+            for operation in (project.build_and_run_html5, project.debugger.start, project.commands.hot_reload):
+                operation()
+                self.assertFalse(project.last_command_result.completed)
+                self.assertIsNone(project.last_command_result.success)
+            sent = len(server.requests)
+            for operation in (project.compile, project.bob, lambda: project.build_and_run(focus=False)):
+                with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                    operation()
+            self.assertEqual(sent, len(server.requests))
+
+    def test_modern_compile_and_completion_diagnostics_over_http(self):
+        result = {"success": True, "issues": [{"severity": "warning", "message": "unused variable",
+                  "resource": "/main/main.script", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 4}}}]}
+        with tempfile.TemporaryDirectory() as root, \
+             EditorHttpFixture(EDITOR_OPENAPI_1_13_2, lambda request: (200 if result["success"] else 422, result)) as server:
+            project = EditorApiClient(root, port=server.port)
+            for operation in (project.compile, project.build_and_run_html5, project.debugger.start, project.commands.hot_reload):
+                operation()
+                self.assertTrue(project.last_command_result.success)
+                self.assertTrue(project.last_command_result.completed)
+                issue = project.last_command_result.issues[0]
+                self.assertEqual("warning", issue.severity)
+                self.assertEqual(2, issue.range.start.line)
+            result["success"] = False
+            result["issues"][0]["severity"] = "error"
+            with self.assertRaises(editor.BuildError) as error:
+                project.compile()
+            self.assertEqual(422, error.exception.result.status)
+            self.assertEqual("/main/main.script", error.exception.issues[0].resource)
+            self.assertIs(project.last_command_result, error.exception.result)
+
+    def test_bob_authorization_json_and_plain_text_rejection_over_http(self):
+        authorized_calls = []
+
+        def respond(request):
+            if request["path"] != "/bob":
+                return 404, b"Not Found"
+            if request["headers"].get("Authorization") != "Bearer current-session":
+                return 401, b"401 Unauthorized\n"
+            authorized_calls.append(json.loads(request["body"]))
+            return 200, {"success": True, "issues": []}
+
+        with tempfile.TemporaryDirectory() as root, EditorHttpFixture(EDITOR_OPENAPI_1_13_2, respond) as server:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            token_path = internal / "editor.token"
+            project = EditorApiClient(root, port=server.port)
+            token_path.write_text("old-session", encoding="utf-8")
+            with self.assertRaisesRegex(editor.CommandError, "authentication was rejected"):
+                project.bob()
+            self.assertEqual([], authorized_calls)
+            token_path.write_text("current-session", encoding="utf-8")
+            result = project.bob(options={"platform": "wasm-web", "archive": True}, commands=("build", "bundle"))
+            self.assertTrue(result.success)
+            self.assertEqual([{"options": {"platform": "wasm-web", "archive": True}, "commands": ["build", "bundle"]}], authorized_calls)
+            self.assertEqual(2, sum(request["method"] == "POST" for request in server.requests))
+
+
 class EditorDiscoveryUnitTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -3741,7 +4208,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
         port = self.bridge.port
         before = self.bridge.health()["identity"]
 
-        status, response = self.editor._json_command("build", timeout=20)
+        command = "run" if self.editor.commands.supports("run") else "build"
+        status, response = self.editor._json_command(command, timeout=20)
         self.assertEqual(200, status)
         self.assertTrue(response["success"], response.get("issues"))
 
@@ -3767,6 +4235,25 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.__class__.bridge = attached
         self.assertEqual(port, attached.port)
         self.assertEqual(after["identity"]["engine_instance_id"], attached.health()["identity"]["engine_instance_id"])
+
+    def test_editor_compile_and_bob_preserve_running_engine(self):
+        if self.editor is None or not self.editor.commands.supports("compile"):
+            raise unittest.SkipTest("compile and Bob require Defold 1.13.2 editor capabilities")
+        self.ensure_running_bridge()
+        before = self.bridge.health()["identity"]["engine_instance_id"]
+        result = self.editor.compile(timeout=60)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.success)
+        self.assertIsNone(result.target_url)
+        self.assertEqual(before, self.bridge.health()["identity"]["engine_instance_id"])
+        result = self.editor.bob(options={"help": True}, timeout=60)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.success)
+        self.assertIsNone(result.target_url)
+        self.assertEqual(before, self.bridge.health()["identity"]["engine_instance_id"])
+        self.editor.commands.hot_reload(timeout=60)
+        self.assertTrue(self.editor.last_command_result.completed)
+        self.assertTrue(self.editor.last_command_result.success)
 
     def test_drag_item_along_cubic_curve_and_closed_circle(self):
         self.ensure_running_bridge()

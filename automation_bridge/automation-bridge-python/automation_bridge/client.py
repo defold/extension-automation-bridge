@@ -864,6 +864,7 @@ class Client:
         required_capabilities: Sequence[str] = (),
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        focus: Optional[bool] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
         check_cancelled()
@@ -875,7 +876,7 @@ class Client:
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
             cancellable_sleep(0.5)
-            editor._build_and_run_command(build_command, timeout=timeout)
+            editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
 
         def connect_candidate(
             service_port: int,
@@ -883,6 +884,7 @@ class Client:
             *,
             registration_is_authoritative: bool,
             require_cached_identity_match: bool = False,
+            require_target_identity: bool = False,
         ) -> Optional["Client"]:
             try:
                 bridge = cls(
@@ -892,11 +894,20 @@ class Client:
                     **session_identity,
                 )
                 health = bridge.health()
+                if require_target_identity:
+                    identity = health.get("identity", {})
+                    if not isinstance(identity, Mapping) or any(
+                        not isinstance(identity.get(key), str) or not identity[key]
+                        for key in ("engine_instance_id", "project_identity")
+                    ):
+                        raise AutomationBridgeError("reported build target did not provide an engine and project identity")
                 if not editor._validate_cached_engine_health(
                     service_port,
                     health,
                     fresh_build=fresh_build or registration_is_authoritative,
                 ):
+                    if require_target_identity:
+                        raise AutomationBridgeError("reported build target identity does not match the cached project")
                     return None
                 if require_cached_identity_match and not editor._cached_engine_health_matches(
                     service_port,
@@ -906,6 +917,8 @@ class Client:
             except (IncompatibleApiVersionError, UnsupportedCapabilityError):
                 raise
             except AutomationBridgeError:
+                if require_target_identity:
+                    raise
                 return None
             identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
             editor._remember_engine_service_port(
@@ -938,6 +951,25 @@ class Client:
                     return cached_bridge
 
         def bridge_after_build() -> Optional["Client"]:
+            target_port = editor._last_build_target_port if fresh_build else None
+            if target_port is not None:
+                bridge = connect_candidate(
+                    target_port, None,
+                    registration_is_authoritative=True,
+                    require_target_identity=True,
+                )
+                if bridge is not None:
+                    # The engine URL is authoritative; console metadata is optional.
+                    try:
+                        console_lines = editor._console_lines()
+                        if target_port in editor._current_registration_engine_service_ports(console_lines):
+                            profiler_url = cls._editor_profiler_url(editor, fresh_build=True, console_lines=console_lines)
+                            if profiler_url:
+                                bridge._remotery_url = profiler_url
+                                editor._remember_remotery_url(profiler_url)
+                    except AutomationBridgeError:
+                        pass
+                return bridge
             console_lines = editor._console_lines()
             service_ports = editor._engine_service_ports(console_lines)
             registration_ports = editor._current_registration_engine_service_ports(console_lines)
@@ -956,8 +988,17 @@ class Client:
                     return bridge
             return None
 
+        if fresh_build and editor._last_build_target_port is not None:
+            # Do not try historical ports or relaunch after an explicit target.
+            return cls._wait_for_bridge(
+                bridge_after_build,
+                timeout=timeout,
+                message="Automation Bridge did not become healthy at the editor's reported target",
+                retry_exceptions=(AutomationBridgeError,),
+            )
+
         if fresh_build and cls._last_build_missing_engine_service_port(editor):
-            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
         try:
             return cls._wait_for_bridge(
@@ -970,7 +1011,7 @@ class Client:
             if not fresh_build:
                 raise
 
-        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
     @classmethod
     def _recover_after_stale_build(
@@ -979,12 +1020,14 @@ class Client:
         bridge_after_build: Any,
         timeout: float,
         build_command: Optional[str],
+        *,
+        focus: Optional[bool] = None,
     ) -> "Client":
         if build_command is None:
             raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
         cancellable_sleep(0.5)
-        editor._build_and_run_command(build_command, timeout=timeout)
+        editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
         return cls._wait_for_bridge(
             bridge_after_build,
             timeout=timeout,
