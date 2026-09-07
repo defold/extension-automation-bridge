@@ -1215,12 +1215,20 @@ namespace dmAutomationBridge
 
         IncludeOptions include = ParseInclude(ctx, false, false);
         uint32_t limit = 50;
-        RequestGetUIntParamAllowZero(ctx, "limit", &limit, 500);
-        uint32_t offset = 0;
-        if (!RequestGetUIntParamAllowZero(ctx, "cursor", &offset))
+        if (RequestGetParam(ctx, "limit") && !RequestGetUIntParamAllowZero(ctx, "limit", &limit, 500))
         {
-            RequestGetUIntParamAllowZero(ctx, "offset", &offset);
+            RequestSendError(ctx, 400, "bad_request", "limit must be an integer between 0 and 500");
+            return;
         }
+        uint32_t offset = 0;
+        uint32_t cursor = 0;
+        if ((RequestGetParam(ctx, "offset") && !RequestGetUIntParamAllowZero(ctx, "offset", &offset)) ||
+            (RequestGetParam(ctx, "cursor") && !RequestGetUIntParamAllowZero(ctx, "cursor", &cursor)))
+        {
+            RequestSendError(ctx, 400, "bad_request", "offset and cursor must be unsigned integers");
+            return;
+        }
+        if (RequestGetParam(ctx, "cursor")) offset = cursor;
 
         const Snapshot* snapshot = &g_AutomationBridge.m_Snapshot;
         uint32_t matched = 0;

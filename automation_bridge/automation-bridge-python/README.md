@@ -93,6 +93,27 @@ Use `game.close_engine()` only when the script intentionally owns engine cleanup
 
 ## Public API
 
+Use `engine.ElementSelector` as a typed dictionary of supported query keywords.
+Its docstring specifies substring versus exact matching, boolean filters, and
+pagination limits. Selectors reject malformed supplied values before a request.
+
+`game.elements()` still returns a list. Use `game.elements_page()` when the next
+cursor or complete match count matters:
+
+```python
+from automation_bridge import engine
+
+selector: engine.ElementSelector = {"type": "goc", "visible": True, "limit": 20}
+page = game.elements_page(**selector)
+print(page.count, page.matched, page.scene_sequence, page.engine_frame)
+if page.next_cursor is not None:
+    next_page = game.elements_page(**selector, cursor=page.next_cursor)
+```
+
+Pagination requires `scene.pagination`. Each page is a live snapshot; a cursor
+does not freeze the scene. `element()` and `maybe_element()` reject ambiguous
+selectors even when `limit=1` would hide additional matches.
+
 The package root exposes only `editor` and `engine`.
 
 - Bootstrap: `editor.open_project(...)`, `project.build_and_run()`,

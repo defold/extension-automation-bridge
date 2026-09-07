@@ -288,6 +288,11 @@ curl -fsS "$BASE/scene?visible=1&include=bounds,properties" | python3 -m json.to
 
 Searches elements with simple filters. This is the main discovery endpoint for automation clients.
 
+Pagination values are validated: `limit` must be an integer from 0 through 500;
+`offset` and `cursor` must be unsigned 32-bit integers. Malformed supplied values
+return `bad_request`. A valid cursor takes precedence over a valid offset. Pages
+are independent live snapshots; compare their frame and scene metadata.
+
 Query parameters:
 
 - `id`: exact element id.

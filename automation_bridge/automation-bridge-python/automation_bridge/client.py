@@ -18,7 +18,7 @@ from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .elements import Element
+from .elements import Element, ElementPage, ElementSelector
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
@@ -1107,27 +1107,55 @@ class Client:
         return self._request("GET", "/scene", params)
 
     def elements(self, **selector: Any) -> List[Element]:
-        """Return one server-filtered page of inspectable scene elements."""
+        """Return one page of elements; see ``engine.ElementSelector`` for filters.
+
+        The default limit is 50. Use ``elements_page()`` to retain the native
+        match count, continuation cursor and snapshot metadata, or ``count()``
+        when only the complete match count is required.
+        """
         elements, _, _ = self._select_elements(selector)
         return elements
 
+
+    def elements_page(self, **selector: Any) -> ElementPage:
+        """Return elements and their native pagination and snapshot metadata.
+
+        Accepts the same ``engine.ElementSelector`` keywords as ``elements()``.
+        Keep filters unchanged when passing ``page.next_cursor`` as ``cursor``.
+        A later page can describe a newer frame; it is not an atomic scene dump.
+        """
+        self._validate_selector(selector)
+        self._require_cached_capability("scene.pagination")
+        data = self._request("GET", "/elements", self._server_params(selector, selector.get("limit", 50)))
+        return ElementPage.from_raw(data)
+
+
     def element(self, **selector: Any) -> Element:
-        """Return exactly one matching element or raise `SelectorError`."""
+        """Return exactly one matching element or raise ``SelectorError``.
+
+        Uses ``engine.ElementSelector`` filters. Pagination options cannot make
+        an ambiguous selector unique; use exact names or automation IDs.
+        """
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) == 1:
+        if len(elements) == 1 and metadata.get("matched", len(elements)) == 1:
             return elements[0]
         error = SelectorError(self._selector_error("expected exactly one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
 
+
     def maybe_element(self, **selector: Any) -> Optional[Element]:
         """Return zero or one matching element, raising if multiple elements match."""
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) <= 1:
-            return elements[0] if elements else None
+        matched = metadata.get("matched", len(elements))
+        if matched == 0:
+            return None
+        if len(elements) == 1 and matched == 1:
+            return elements[0]
         error = SelectorError(self._selector_error("expected zero or one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
+
 
     def element_by_id(
         self,
@@ -2448,6 +2476,22 @@ class Client:
         unknown = set(selector) - self._SELECTOR_KEYS
         if unknown:
             raise TypeError(f"unknown element selector keys: {', '.join(sorted(unknown))}")
+        boolean_keys = {"enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive"}
+        for key, value in selector.items():
+            if value is None:
+                continue
+            if key in boolean_keys:
+                if not isinstance(value, bool):
+                    raise TypeError(f"{key} must be a bool")
+            elif key in {"limit", "offset"}:
+                maximum = 500 if key == "limit" else 0xFFFFFFFF
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                    raise ValueError(f"{key} must be an integer from 0 through {maximum}")
+            elif key == "cursor":
+                if not isinstance(value, str) or not value.isascii() or not value.isdigit() or int(value) > 0xFFFFFFFF:
+                    raise ValueError("cursor must be an unsigned decimal continuation string")
+            elif key != "include" and not isinstance(value, str):
+                raise TypeError(f"{key} must be a string")
 
     def _has_client_filters(self, selector: Mapping[str, Any]) -> bool:
         return any(selector.get(key) is not None for key in self._CLIENT_FILTERS)

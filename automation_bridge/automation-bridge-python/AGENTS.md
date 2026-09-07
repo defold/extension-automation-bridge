@@ -23,6 +23,8 @@
   exposes the required native feature.
 - `elements()` is paginated; use `count()` when the complete match count is
   required.
+- Use `elements_page()` for continuation cursors, match counts and snapshot
+  evidence; see `engine.ElementSelector` for typed filters and their semantics.
 - `Element` objects are snapshots. Re-query after state or scene changes. Pass
   `Element` objects to `click()` and both ends of `drag()` for stale-identity
   protection; handle `engine.StaleElementError` by re-querying.

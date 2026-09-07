@@ -1,7 +1,87 @@
 """Typed snapshot wrappers for Automation Bridge scene elements."""
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, TypedDict, Union
+
+
+class ElementSelector(TypedDict, total=False):
+    """Supported keyword filters for element queries and waits.
+
+    ``type``, ``name``, ``text`` and ``url`` match substrings, ignoring case
+    unless ``case_sensitive=True``. Their ``*_exact`` variants, identity fields,
+    paths and application annotations use case-sensitive exact matching.
+    ``limit`` is 0..500 (default 50); zero requests only counts. ``cursor`` is
+    the opaque string returned by a page and takes precedence over ``offset``.
+    Pages are live snapshots, not a frozen traversal across multiple requests.
+    """
+
+    id: str
+    instance_id: str
+    logical_id: str
+    type: str
+    type_exact: str
+    name: str
+    name_exact: str
+    text: str
+    text_exact: str
+    url: str
+    url_exact: str
+    path: str
+    kind: str
+    automation_id: str
+    localization_key: str
+    role: str
+    enabled: bool
+    has_bounds: bool
+    visible_and_enabled: bool
+    visible: bool
+    case_sensitive: bool
+    include: Union[str, Iterable[str]]
+    limit: int
+    offset: int
+    cursor: str
+
+
+@dataclass(frozen=True)
+class ElementPage:
+    """One native query result, including pagination and snapshot evidence.
+
+    Pass ``next_cursor`` into the next query with the same filters. Re-query
+    after scene changes; cursors do not pin a snapshot. ``raw`` retains native
+    diagnostics such as active collections and excluded matches.
+    """
+
+    elements: Tuple["Element", ...]
+    matched: int
+    total: int
+    offset: int
+    next_cursor: Optional[str]
+    truncated: bool
+    scene_sequence: int
+    engine_frame: int
+    raw: Mapping[str, Any]
+
+    @classmethod
+    def from_raw(cls, data: Mapping[str, Any]) -> "ElementPage":
+        """Wrap a native /elements data object without dropping its metadata."""
+        elements = tuple(Element(item) for item in data.get("elements", ()) if isinstance(item, dict))
+        cursor = data.get("next_cursor")
+        return cls(
+            elements=elements,
+            matched=int(data.get("matched", len(elements))),
+            total=int(data.get("total", len(elements))),
+            offset=int(data.get("offset", 0)),
+            next_cursor=str(cursor) if cursor is not None else None,
+            truncated=bool(data.get("truncated", False)),
+            scene_sequence=int(data.get("scene_sequence", 0)),
+            engine_frame=int(data.get("engine_frame", 0)),
+            raw=dict(data),
+        )
+
+    @property
+    def count(self) -> int:
+        """Return the number of elements in this page, not the total matches."""
+        return len(self.elements)
 
 
 @dataclass(frozen=True)

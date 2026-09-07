@@ -18,7 +18,7 @@ from .client import (
     UnsupportedCapabilityError,
 )
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
-from .elements import Bounds, Element
+from .elements import Bounds, Element, ElementPage, ElementSelector
 from .profiler import *  # Re-export the focused profiler result and control types.
 from .recording import (
     VideoRecordingCapabilities,

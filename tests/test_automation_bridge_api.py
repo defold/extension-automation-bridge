@@ -168,6 +168,54 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_element_page_retains_cursor_counts_and_snapshot_metadata(self):
+        bridge = EngineClient(1234)
+        bridge._last_health = {"version": "2", "capabilities": ["scene.pagination"]}
+        payload = {"elements": [{"id": "e:1", "logical_id": "i:g1"}], "matched": 8, "total": 12,
+                   "offset": 3, "next_cursor": "4", "truncated": True, "scene_sequence": 7,
+                   "engine_frame": 90, "excluded": {"visibility": 2}}
+        with mock.patch.object(bridge, "_request", return_value=payload) as request:
+            page = bridge.elements_page(type="goc", cursor="3", limit=1)
+        self.assertIsInstance(page, engine.ElementPage)
+        self.assertEqual((1, 8, 12, 3, "4", 7, 90),
+                         (page.count, page.matched, page.total, page.offset, page.next_cursor, page.scene_sequence, page.engine_frame))
+        self.assertEqual("i:g1", page.elements[0].logical_id)
+        self.assertEqual({"visibility": 2}, page.raw["excluded"])
+        self.assertEqual("3", request.call_args.args[2]["cursor"])
+
+    def test_element_page_supports_zero_matches_and_count_only(self):
+        for matched in (0, 20):
+            page = engine.ElementPage.from_raw({"elements": [], "matched": matched, "next_cursor": None})
+            self.assertEqual(matched, page.matched)
+            self.assertEqual(0, page.count)
+            self.assertIsNone(page.next_cursor)
+
+    def test_pagination_cannot_hide_ambiguous_single_element_selector(self):
+        bridge = EngineClient(1234)
+        data = {"elements": [{"id": "e:1"}], "matched": 2, "truncated": True, "next_cursor": "1"}
+        with mock.patch.object(bridge, "_request", return_value=data):
+            for method in (bridge.element, bridge.maybe_element):
+                with self.assertRaises(engine.SelectorError):
+                    method(limit=1)
+        with mock.patch.object(bridge, "_request", return_value={"elements": [], "matched": 1}):
+            with self.assertRaises(engine.SelectorError):
+                bridge.maybe_element(limit=0)
+
+    def test_selector_values_are_validated_before_requesting(self):
+        bridge = EngineClient(1234)
+        with mock.patch.object(bridge, "_request") as request:
+            for selector in ({"limit": -1}, {"limit": 501}, {"limit": True}, {"offset": 0.5},
+                             {"cursor": "bad"}, {"cursor": "4294967296"}, {"visible": "false"}, {"type": 42}):
+                with self.subTest(selector=selector), self.assertRaises((ValueError, TypeError)):
+                    bridge.elements(**selector)
+        request.assert_not_called()
+
+    def test_page_requires_pagination_capability(self):
+        bridge = EngineClient(1234)
+        bridge._last_health = {"version": "2", "capabilities": ["elements"]}
+        with self.assertRaises(engine.UnsupportedCapabilityError):
+            bridge.elements_page()
+
     def test_doctor_reports_invalid_project_without_launching(self):
         with tempfile.TemporaryDirectory() as root, mock.patch.object(editor, "open_project") as open_project:
             report = editor.doctor(root)
@@ -3332,6 +3380,20 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def setUp(self):
         if self.bridge:
             self.reset_if_popup_is_visible()
+
+    def test_pagination_preserves_metadata_and_rejects_invalid_native_values(self):
+        self.ensure_running_bridge()
+        first = self.bridge.elements_page(type="goc", limit=1)
+        self.assertGreater(first.matched, 1)
+        self.assertEqual(1, first.count)
+        second = self.bridge.elements_page(type="goc", limit=1, cursor=first.next_cursor)
+        self.assertEqual(1, second.offset)
+        self.assertNotEqual(first.elements[0].logical_id, second.elements[0].logical_id)
+        self.assertGreaterEqual(second.engine_frame, first.engine_frame)
+        for params in ({"limit": "invalid"}, {"limit": 501}, {"cursor": "invalid"}, {"offset": -1}):
+            with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
+                self.bridge.request("GET", "/elements", params=params)
+            self.assertEqual(400, error.exception.status)
 
     def test_automation_bridge_api_end_to_end(self):
         previous_port = None
