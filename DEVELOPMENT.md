@@ -105,3 +105,49 @@ selecting targets. It separates and stops existing items outside the spawn
 button's hit area; random placement can otherwise turn a drag into another spawn
 or place targets on top of each other. Input delivery still uses native receipts
 and the normal gameplay merge path.
+
+## MCP plugin validation
+
+Edit the canonical wrapper and MCP modules, then regenerate the bundled copy:
+
+```sh
+python3 plugins/automation-bridge/scripts/sync_python.py
+python3 plugins/automation-bridge/scripts/validate_plugin.py --check-sync
+PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_mcp_server tests.test_mcp_improvements
+```
+
+CI runs both MCP suites on the same Python/OS matrix as the shared wrapper.
+Coverage includes operation inventory, JSON schemas, image content, independent
+logical sessions, busy handles, cancellation effects, cleanup errors, and an
+installed layout with spaces launched from an unrelated working directory.
+
+For live independent-client coverage, install the official TypeScript MCP SDK in
+a temporary directory and point `MCP_SDK_ROOT` at that package directory:
+
+```sh
+MCP_SDK_ROOT=/absolute/path/to/node_modules/@modelcontextprotocol/sdk \
+  node tests/mcp_sdk_smoke.mjs /absolute/path/to/plugin /absolute/path/to/sample /tmp/mcp-screenshot.png
+```
+
+Run against open 1.13.1 and 1.13.2 editors separately. The test builds and owns a
+sample engine, checks editor negotiation, structured output with the SDK's schema
+validator, screenshot/preview image blocks, pagination, borrowed-client cleanup,
+competing sessions, cancellation followed by an empty native input queue, and
+reconnection after restarting the MCP server. It closes its engine.
+The native lease remains authoritative; cleanup of an idle observer must not
+acquire one. Native controller contention is distinct from MCP `handle_busy`.
+
+Validate the installed Codex cache as well as the source launcher. Codex 0.153
+only reads the first `tools/list` page, so return the complete focused-tool list;
+use paginated summaries for the much larger Python operation catalog.
+
+After installing the plugin, check discovery through Codex's actual MCP client:
+
+```sh
+PYTHONPATH=automation_bridge/automation-bridge-python python3 -m tests.mcp_codex_smoke
+```
+
+This starts a temporary Codex app-server without creating a task or invoking a
+model. Visible rendering inside a host still needs a fresh task with the plugin
+loaded. See `tests/MCP_VALIDATION.md` for recorded host/version coverage and
+remaining release checks.

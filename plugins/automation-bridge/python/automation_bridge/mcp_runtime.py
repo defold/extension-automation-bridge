@@ -1987,7 +1987,16 @@ class BridgeRuntime:
         if arguments.get("confirm") is not True:
             raise ToolFailure("confirmation_required", "closing the engine requires confirm=true")
         game = self._engine_target(arguments)
-        game.close_engine(timeout=arguments.get("timeout", 2.0))
+        token = self.handles.token_for(game)
+        for child_token, child in reversed(self.handles.related(token)):
+            if child is not game:
+                self._cleanup_value(child_token, child, failure=False)
+                self.handles.release(child_token)
+        self._flush_owned_input(game)
+        try:
+            game.close_engine(timeout=arguments.get("timeout", 2.0))
+        finally:
+            game.close()
         return {"closed": True}
 
     def _build_tool_descriptors(self) -> List[JsonObject]:
@@ -2251,6 +2260,14 @@ class BridgeRuntime:
             text = path.read_text(encoding="utf-8") if path.is_file() else "Plugin guide is unavailable in this source layout."
         return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
 
+    @staticmethod
+    def _flush_owned_input(game: engine.Client) -> None:
+        # A flush itself acquires a native controller lease. Read receipts first
+        # so closing an idle observer does not take input ownership from workers.
+        if any(receipt.get("client_id") == game.client_id and receipt.get("session_id") == game.session_id
+               for receipt in game.input.pending()):
+            game.input.flush(release=True)
+
     def _cleanup_value(self, token: str, value: Any, *, failure: bool) -> None:
         try:
             with self._lock:
@@ -2272,7 +2289,7 @@ class BridgeRuntime:
                 value.close()
             elif isinstance(value, engine.Client) and not value.closed:
                 try:
-                    value.input.flush(release=True)
+                    self._flush_owned_input(value)
                 finally:
                     value.close()
         except Exception as error:

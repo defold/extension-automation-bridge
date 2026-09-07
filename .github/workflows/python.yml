@@ -27,5 +27,7 @@ jobs:
           tests.test_automation_bridge_api.EditorDiscoveryUnitTest
           tests.test_automation_bridge_api.EditorCompatibilityUnitTest
           tests.test_tooling
+          tests.test_mcp_server
+          tests.test_mcp_improvements
       - name: Validate plugin and bundled Python source parity
         run: python plugins/automation-bridge/scripts/validate_plugin.py --check-sync

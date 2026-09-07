@@ -1,6 +1,6 @@
 {
   "name": "automation-bridge",
-  "version": "0.1.0+codex.20260907195543",
+  "version": "0.1.0+codex.20260907202354",
   "description": "Inspect and control Defold Editor projects and debug games through Automation Bridge.",
   "author": {
     "name": "Defold",

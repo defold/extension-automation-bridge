@@ -19,4 +19,4 @@
 - Run tests from the repository root:
   `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling`.
 - When changing the MCP server or plugin bundle, also run
-  `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_mcp_server`.
+  `PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_mcp_server tests.test_mcp_improvements`.

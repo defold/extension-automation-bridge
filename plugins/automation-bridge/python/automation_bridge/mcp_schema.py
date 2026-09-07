@@ -41,7 +41,8 @@ SELECTOR = object_schema({
 POINT = {'anyOf': [object_schema({'x': NUMBER, 'y': NUMBER}, ('x', 'y')),
                    {'type': 'array', 'items': NUMBER, 'minItems': 2, 'maxItems': 2}]}
 TARGET = {'anyOf': [STRING, NUMBER, ELEMENT, POINT]}
-WAIT = {'anyOf': [BOOLEAN, {'type': 'string', 'enum': ['accepted', 'started', 'completed']}]}
+WAIT = {'anyOf': [BOOLEAN, {'type': 'string', 'enum': ['accepted', 'started', 'released']},
+                  {'type': 'number', 'minimum': 0}, {'type': 'null'}]}
 
 
 def validate(value, schema, path='$'):

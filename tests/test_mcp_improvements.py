@@ -218,6 +218,43 @@ class CancellationTest(unittest.TestCase):
         self.assertFalse(runtime._requests)
         server.close()
 
+    def test_stdio_finishes_resource_use_before_publishing_response(self):
+        from automation_bridge.mcp_protocol import McpProtocol, StdioServer
+        runtime = BridgeRuntime(ROOT)
+        protocol = McpProtocol(runtime)
+        protocol.handle({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-11-25', 'clientInfo': {'name': 'test', 'version': '1'}, 'capabilities': {}}})
+        output = io.StringIO()
+        server = StdioServer(protocol, stdout=output, stderr=io.StringIO())
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        finishing, release = threading.Event(), threading.Event()
+        original_finish = runtime.finish_request
+        def finish(request_id):
+            finishing.set()
+            release.wait(2)
+            original_finish(request_id)
+        message = {'jsonrpc': '2.0', 'id': 'reused', 'method': 'tools/call', 'params': {
+            'name': 'defold_health', 'arguments': {'engine': wire}}}
+        try:
+            with mock.patch.object(game, 'health', return_value={'ready': True}) as health, mock.patch.object(runtime, 'finish_request', side_effect=finish):
+                server._accept(message)
+                try:
+                    self.assertTrue(finishing.wait(1))
+                    self.assertEqual('', output.getvalue())
+                finally:
+                    release.set()
+                    server._drain_workers()
+                server._accept(message)
+                server._drain_workers()
+                self.assertEqual(2, health.call_count)
+            replies = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(2, len(replies))
+            self.assertTrue(all(reply['result']['structuredContent']['ok'] for reply in replies), replies)
+            self.assertFalse(runtime._requests)
+        finally:
+            server.close()
+
 
 class SessionTest(unittest.TestCase):
     def test_logical_sessions_isolate_handles_and_report_cleanup_errors(self):
@@ -285,7 +322,7 @@ class SessionTest(unittest.TestCase):
         game = engine.Client(54321)
         wire = serialize(game, runtime.handles)
         child = runtime.call_tool('automation_bridge_get', {'operation': 'automation_bridge.engine.Client.input', 'target': wire})['data']
-        with mock.patch.object(game.input, 'flush', return_value={}) as flush, mock.patch.object(game, 'close_engine') as terminate:
+        with mock.patch.object(game.input, 'pending', return_value=[{'client_id': game.client_id, 'session_id': game.session_id}]), mock.patch.object(game.input, 'flush', return_value={}) as flush, mock.patch.object(game, 'close_engine') as terminate:
             response = runtime.call_tool('defold_close', {'engine': wire})
             self.assertTrue(response['ok'], response)
             self.assertTrue(response['data']['closed'])
@@ -299,7 +336,7 @@ class SessionTest(unittest.TestCase):
         runtime = BridgeRuntime(ROOT)
         game = engine.Client(54321)
         wire = serialize(game, runtime.handles)
-        with mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native unavailable')):
+        with mock.patch.object(game.input, 'pending', return_value=[{'client_id': game.client_id, 'session_id': game.session_id}]), mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native unavailable')):
             response = runtime.call_tool('automation_bridge_release', {'target': wire})
         self.assertEqual('cleanup_failed', response['error']['code'])
         self.assertTrue(game.closed)
@@ -410,7 +447,7 @@ class DiscoveryTest(unittest.TestCase):
         names, cursor = [], None
         while True:
             page = protocol._list_tools({} if cursor is None else {'cursor': cursor})
-            self.assertLessEqual(len(page['tools']), 20)
+            self.assertEqual(len(runtime.tool_descriptors()), len(page['tools']))
             names.extend(item['name'] for item in page['tools'])
             cursor = page.get('nextCursor')
             if cursor is None:
@@ -428,6 +465,8 @@ class DiscoveryTest(unittest.TestCase):
         for tool, method, arguments in (
             ('defold_key', 'key', {'key': 'M', 'hold': True}),
             ('defold_key', 'key', {'key': 'M', 'wait': 'typo'}),
+            ('defold_key', 'key', {'key': 'M', 'wait': 'completed'}),
+            ('defold_key', 'key', {'key': 'M', 'wait': -0.1}),
             ('defold_click', 'click', {'target': [1, 2, 3]}),
             ('defold_screenshot', 'screenshot', {'wait': 'false'}),
         ):
@@ -438,6 +477,19 @@ class DiscoveryTest(unittest.TestCase):
         result = runtime.call_tool('automation_bridge_call', {'operation': {'bad': 'shape'}})
         self.assertEqual('invalid_arguments', result['error']['code'])
         runtime.cleanup()
+
+    def test_focused_input_accepts_documented_wait_forms(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        try:
+            for wait in (True, False, None, 'accepted', 'started', 'released', 0, 0.25):
+                with self.subTest(wait=wait), mock.patch.object(game, 'key', return_value={}) as call:
+                    result = runtime.call_tool('defold_key', {'engine': wire, 'key': 'M', 'wait': wait})
+                    self.assertTrue(result['ok'], result)
+                    self.assertEqual(wait, call.call_args.kwargs['wait'])
+        finally:
+            runtime.cleanup()
 
     def test_adapted_operation_descriptions_explain_json_arguments(self):
         runtime = BridgeRuntime(ROOT)
@@ -478,3 +530,15 @@ class InstalledLayoutTest(unittest.TestCase):
             self.assertEqual(0, client.process.returncode)
             subprocess.run([sys.executable, str(plugin / 'scripts/validate_plugin.py')], cwd=cwd,
                            check=True, capture_output=True, text=True)
+
+
+class IdleObserverCleanupTest(unittest.TestCase):
+    def test_closing_idle_observer_never_acquires_a_native_input_lease(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        with mock.patch.object(game.input, 'pending', return_value=[{'client_id': 'another-client', 'session_id': 'work'}]), mock.patch.object(game.input, 'flush') as flush:
+            result = runtime.call_tool('defold_close', {'engine': wire})
+            self.assertTrue(result['ok'], result)
+            flush.assert_not_called()
+        runtime.cleanup()

@@ -176,7 +176,7 @@ and are not marked automatically retryable.
 `automation_bridge_catalog` returns searchable summary pages (20 by default,
 maximum 100). Follow `next_cursor`; use `automation_bridge_describe` for one
 operation's full docstring, signature, argument schema, and restrictions. The
-catalog resource contains the first page. MCP `tools/list` also supports cursors.
+catalog resource contains the first page. MCP `tools/list` returns the complete focused-tool inventory for hosts that do not follow tool cursors.
 Use `defold_editor_capabilities` for the connected editor's commands and
 `defold_application_catalog` for the game's commands, states, and events.
 

@@ -430,10 +430,12 @@ class McpProtocol:
         if "cursor" in params and not isinstance(params["cursor"], str):
             raise ProtocolError(INVALID_PARAMS, "Invalid params")
         tools = self._runtime_descriptors("tool_descriptors", "tools")
-        return {**self._page(tools, params.get("cursor"), "tools"), "ttlMs": 300_000, "cacheScope": "public"}
+        # Codex 0.153 does not follow tools/list nextCursor. Keep the focused
+        # inventory complete; the larger operation catalog is paginated.
+        return {**self._page(tools, params.get("cursor"), "tools", page_size=max(1, len(tools))), "ttlMs": 300_000, "cacheScope": "public"}
 
     @staticmethod
-    def _page(items: list, cursor: Optional[str], kind: str) -> dict:
+    def _page(items: list, cursor: Optional[str], kind: str, page_size: int = 20) -> dict:
         start = 0
         if cursor is not None:
             prefix = kind + ":"
@@ -442,7 +444,7 @@ class McpProtocol:
             start = int(cursor[len(prefix):])
             if start > len(items):
                 raise ProtocolError(INVALID_PARAMS, "Invalid pagination cursor")
-        page = items[start:start + 20]
+        page = items[start:start + page_size]
         result = {kind: page}
         if start + len(page) < len(items):
             result["nextCursor"] = kind + ":" + str(start + len(page))
@@ -767,20 +769,22 @@ class StdioServer:
         request_id: Any,
         state: _RequestState,
     ) -> None:
+        finished = False
+        finish = getattr(self.protocol.runtime, "finish_request", None)
         try:
             response = self.protocol.handle(message)
             with self._state_lock:
-                if (
-                    response is not None
-                    and not state.cancelled.is_set()
-                    and not self._closing
-                ):
+                # Release Python resource use before publishing the response.
+                # A client may immediately reuse both its handle and request id.
+                if callable(finish):
+                    finish(request_id)
+                finished = True
+                if response is not None and not state.cancelled.is_set() and not self._closing:
                     self._write(response)
                 if self._active.get(request_id) is state:
                     del self._active[request_id]
         finally:
-            finish = getattr(self.protocol.runtime, "finish_request", None)
-            if callable(finish):
+            if not finished and callable(finish):
                 finish(request_id)
             with self._state_lock:
                 if self._active.get(request_id) is state:
