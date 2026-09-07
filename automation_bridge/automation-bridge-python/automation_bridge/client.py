@@ -269,12 +269,13 @@ class EngineLogStream:
                         raise
 
 
-def _cleanup_without_masking(cleanup: Any) -> None:
-    """Run best-effort cleanup while preserving an already-active exception."""
+def _cleanup_without_masking(cleanup: Any, interrupted: Optional[BaseException] = None) -> None:
+    """Preserve the original exception and retain cancellation cleanup evidence."""
     try:
         cleanup()
-    except BaseException:
-        pass
+    except BaseException as cleanup_error:
+        if isinstance(interrupted, OperationCancelled) and interrupted.cleanup_error is None:
+            interrupted.cleanup_error = cleanup_error
 
 
 class RuntimeLogs:
@@ -359,7 +360,10 @@ class RuntimeLogs:
 
 
 class InputInterruptionScope:
-    """Flush this client's input session if an enclosed operation is interrupted."""
+    """Flush this client's input session if an enclosed operation is interrupted.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, controller: "InputController", flush: bool, release: bool):
         self._controller = controller
@@ -373,7 +377,7 @@ class InputInterruptionScope:
         if exc_type is None:
             return
         if self.flush:
-            _cleanup_without_masking(lambda: self._controller.flush(release=self.release))
+            _cleanup_without_masking(lambda: self._controller.flush(release=self.release), exc)
 
 
 class InputController:
@@ -486,12 +490,16 @@ class InputController:
         queueing input with ``wait=False``. With ``flush=True`` (the default),
         both the active action and later actions owned by this client session
         are cancelled. Cleanup failures never mask the original exception.
+        Inspect ``OperationCancelled.cleanup_error`` when cleanup is refused.
         """
         return InputInterruptionScope(self, flush=flush, release=release)
 
 
 class PointerSession:
-    """Leased low-level pointer that guarantees up/cancel cleanup in a context manager."""
+    """Leased low-level pointer with up/cancel cleanup in a context manager.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, bridge: "Client", receipt: InputReceipt, lease: float):
         self._bridge = bridge
@@ -510,7 +518,7 @@ class PointerSession:
         if self.closed:
             return
         if exc_type is not None:
-            _cleanup_without_masking(self.cancel)
+            _cleanup_without_masking(self.cancel, exc)
             return
         self.up()
 

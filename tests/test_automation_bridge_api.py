@@ -2357,6 +2357,40 @@ class EngineClientUnitTest(unittest.TestCase):
             with bridge.pointer((10, 20), lease=2.0):
                 raise KeyboardInterrupt("stop")
 
+    def test_pointer_cancellation_preserves_cleanup_failure_and_allows_retry(self):
+        bridge = FakeInputClient()
+        original = engine.OperationCancelled('caller stopped')
+        refusal = RuntimeError('native cleanup refused')
+        with mock.patch.object(bridge.input, 'cancel', side_effect=refusal) as cancel:
+            with self.assertRaises(engine.OperationCancelled) as error:
+                with bridge.pointer((10, 20), lease=2.0) as pointer:
+                    raise original
+            cancel.assert_called_once_with(pointer.input_id, release=True)
+        self.assertIs(original, error.exception)
+        self.assertIs(refusal, error.exception.cleanup_error)
+        self.assertFalse(pointer.closed)
+        receipt = engine.InputReceipt({'input_id': pointer.input_id, 'state': 'cancelled'})
+        with mock.patch.object(bridge.input, 'cancel', return_value=receipt) as retry:
+            self.assertIs(receipt, pointer.cancel())
+            retry.assert_called_once_with(pointer.input_id, release=True)
+        self.assertTrue(pointer.closed)
+
+    def test_input_interruption_scope_preserves_first_cancellation_cleanup_error(self):
+        bridge = FakeInputClient()
+        for earlier_error in (None, RuntimeError('earlier cleanup refused')):
+            original = engine.OperationCancelled('caller stopped')
+            original.cleanup_error = earlier_error
+            refusal = RuntimeError('native cleanup refused')
+            with self.subTest(earlier_error=earlier_error), \
+                 mock.patch.object(bridge.input, 'flush', side_effect=refusal) as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.input.interruption_scope():
+                        raise original
+                flush.assert_called_once_with(release=True)
+            self.assertIs(original, error.exception)
+            self.assertIs(earlier_error if earlier_error is not None else refusal,
+                          error.exception.cleanup_error)
+
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
 
