@@ -40,14 +40,15 @@ the plugin and prepends `python/` to `sys.path`; it does not depend on a caller'
 
 ## Target project prerequisites
 
-- Install Defold and make `python3` available on `PATH`.
+- Install Defold 1.13.1 or newer and make Python 3.10+ available as `python3` on `PATH`.
 - Use a Defold project whose root contains `game.project`.
 - Add Automation Bridge as a project dependency and fetch libraries. The
-  current stable dependency URL is:
+  bundled wrapper uses native HTTP API v2 and requires extension 2.2.1 or newer.
+  A compatible pinned dependency is:
 
 ```ini
 [project]
-dependencies#0 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.0.2.zip
+dependencies#0 = https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.2.1.zip
 ```
 
 Choose the next free `dependencies#N` index when the project already has
@@ -90,16 +91,9 @@ the repository root:
 /absolute/path/to/extension-automation-bridge/plugins/automation-bridge
 ```
 
-Agent Plugins 1.0.0 clients discover `plugin.json`, the immediate skill under
-`skills/`, and `mcp.json` at fixed locations. The current official
-[compatible-client matrix](https://agent-plugins.org/compatible-clients) lists
-VS Code, Cursor, GitHub Copilot, ChatGPT and Codex, Kiro, and Hermes Agent with
-stdio support. Follow each client's source-install flow; for example, GitHub
-Copilot CLI accepts:
-
-```sh
-copilot plugin install /absolute/path/to/extension-automation-bridge/plugins/automation-bridge
-```
+Clients supporting Agent Plugins discover the portable `plugin.json`, skill,
+and `mcp.json`. Use that client's source-install workflow. The direct MCP
+configuration below also works with clients that implement standard stdio MCP.
 
 For a client that does not yet load Agent Plugins packages, use the direct MCP
 configuration below and load
@@ -151,42 +145,117 @@ rather than mixing legacy and modern fields.
 
 ## Use the APIs
 
-Always open a project with its explicit absolute `project_path`. A typical
-session opens `/absolute/path/to/my-defold-game`, builds and runs it, operates on
-the returned project or engine session, and releases all handles at the end.
+1. Call `defold_doctor` with the absolute game `project_path` to diagnose setup
+   without starting an editor or changing files.
+2. Probe `defold_open_project` with `start_if_needed=false`. If a launch is needed,
+   use the task's existing authorization and the host's application permissions.
+3. Call `defold_compile` for a compilation check or `defold_build_and_run`
+   directly for runtime testing. Build-and-run returns `data.engine`,
+   `data.build_result`, and `data.session`; retain the engine handle.
+4. Use `defold_find_elements` or `defold_observe`, then interact and synchronize
+   through focused input, event, state, and command tools.
+5. Close local clients with `defold_close`, release individual handles, or close
+   a logical MCP session. Terminate an engine only when intended and authorized.
 
-Focused tools cover routine project bootstrap, engine connection and health,
-element queries, clicks and drags, text and key input, synchronization, commands,
-screenshots, and lifecycle cleanup. The advanced API surface makes every public
-Automation Bridge Python API usable:
+| Editor feature | Defold 1.13.1 | Defold 1.13.2+ |
+| --- | --- | --- |
+| Build and run | Legacy `build` command | Negotiated `run` command; compilation included |
+| Focus | Native editor behavior | Defaults to `false` when advertised; explicit `focus` supported |
+| Compile only | Unsupported, with `minimum_version` | `defold_compile` |
+| Bob build/bundle | Unsupported, with `minimum_version` | `defold_bob(options, commands)` using editor token authentication |
+| Completion | Legacy acknowledgements are marked incomplete | Structured results with warnings/errors, ranges, and optional target URL |
 
-- `automation_bridge_catalog` describes modules, members, signatures, argument
-  schemas, ownership, and return behavior.
-- `automation_bridge_call` invokes non-destructive public methods and functions.
-- `automation_bridge_destructive_call` isolates engine shutdown, raw native
-  requests, and bridge updates behind explicit confirmation and a destructive
-  tool annotation.
-- `automation_bridge_get` reads public properties.
-- `automation_bridge_enter` and `automation_bridge_exit` manage context objects.
-- `automation_bridge_next` advances stateful iterators and streams.
-- `automation_bridge_release` releases any retained object handle.
+Capabilities come from the connected editor's advertised API. A prerelease that
+lacks a feature is handled like an older editor. Bob authentication is managed by
+the wrapper; callers never supply the editor token. Build failures preserve
+`result` and source locations. Build/Bob timeouts do not imply that work stopped,
+and are not marked automatically retryable.
 
-Opaque Python objects are represented by MCP handles, so editor clients, engine
-clients, elements, receipts, subscriptions, pointer sessions, recordings,
-traces, and other stateful APIs can be composed instead of flattened into an
-incomplete subset. MCP resources expose the full API catalog, best-practice
-examples, wrapper reference, and this installation guide.
+### Discovery and JSON adapters
 
-The checked catalog currently contains 197 operations: the audited 195-member
-editor/engine operational surface plus declarative adapters for
-`engine.wait_until` and `InputController.interruption_scope`. Python callback
-parameters become explicit recording stop/abort calls, exception-class retry
-parameters use the wrapper's safe defaults, varargs and integer-key maps have
-lossless JSON adapters, and complete `Element.raw` snapshots round-trip so
-logical stale-element guards remain active. The raw engine request escape hatch
-is present but requires explicit confirmation. Password preference values are
-never returned over MCP; preference metadata and non-secret values remain
-available.
+`automation_bridge_catalog` returns searchable summary pages (20 by default,
+maximum 100). Follow `next_cursor`; use `automation_bridge_describe` for one
+operation's full docstring, signature, argument schema, and restrictions. The
+catalog resource contains the first page. MCP `tools/list` also supports cursors.
+Use `defold_editor_capabilities` for the connected editor's commands and
+`defold_application_catalog` for the game's commands, states, and events.
+
+Generic `automation_bridge_call` and `automation_bridge_get` use allowlisted
+operation IDs. `automation_bridge_destructive_call` covers engine shutdown, raw
+native requests, and bridge updates. Its `confirm=true` flag records intended
+execution within existing authorization; it does not impose a fresh user prompt.
+Enter/exit, next, release, and declarative wait tools adapt Python contexts,
+iterators, and predicates. Callback and exception-class parameters have explicit
+restrictions. Python cancellation scopes are managed per MCP request and cannot
+be retained across worker threads. Password preference values are never returned.
+
+`defold_find_elements` returns `elements`, match counts, `next_cursor`, and
+frame/scene evidence. Preserve the complete Element wire values when passing
+targets to click and drag. Cursors traverse live snapshots, so re-query after
+scene changes. `defold_key` forwards holds and modifiers; click/drag support chords.
+
+### Images and observations
+
+Completed screenshots and editor previews include native MCP PNG image content
+alongside structured metadata. Image bytes are not duplicated into JSON text.
+Pending captures return their receipt without an image. The focused screenshot,
+preview, and observation workflows default to half resolution. Images are limited
+to 8 MiB; use a smaller resolution if needed. Missing or replaced capture files
+produce an error retaining the original receipt.
+
+`defold_observe` returns at most 50 elements (20 by default), up to 50 recent error
+lines (10 by default, 2,000 characters each), and an optional screenshot. Element,
+log, and screenshot samples are independent; inspect the supplied frame evidence
+instead of assuming they were captured simultaneously.
+
+### Sessions, cancellation, and cleanup
+
+One logical session is available by default. Open another with
+`automation_bridge_session(action="open")` and pass the returned `mcp_session`
+on subsequent tools. Sessions isolate handles within this local server process;
+they are coordination boundaries, not authentication for untrusted clients.
+
+Engine handles report `owns_engine` and `session_info`. Connect/build forward
+explicit `client_id` and `session_id`, or generate independent native identities.
+A duplicate identity pair is rejected while retained or connecting. Overlapping
+requests on the same Python client/resource return `handle_busy`; separate native
+clients continue to follow the engine's lease and execution rules.
+
+`defold_close` releases client input and child resources while leaving the engine
+running. Session close and EOF cancel work and finalize resources. Cleanup waits
+for active users of a handle; late results cannot allocate handles after shutdown.
+Owned engines also remain running on session cleanup: use `defold_close_engine`
+explicitly when termination is intended.
+
+MCP cancellation stops cooperative polling and requests native input/command
+cleanup. It cannot forcibly interrupt an HTTP request or a running Lua callback.
+Cancelled requests emit no response. Inspect bounded cleanup diagnostics through
+`automation_bridge_session(action="info")`; shutdown also reports them to stderr.
+A cleanup failure is preserved rather than silently reported as success.
+
+### Python scripts
+
+For substantial scripts or test loops, use the same bundled wrapper directly:
+
+```sh
+PYTHONPATH="/absolute/path/to/plugin/python" python3 my_test.py
+```
+
+```python
+from automation_bridge import editor, engine
+
+project = editor.open_project("/absolute/path/to/my-defold-game", start_if_needed=False)
+game = project.build_and_run()
+try:
+    print(game.elements_page(role="button", limit=10))
+finally:
+    if game.owns_engine:
+        game.close_engine()
+    game.close()
+```
+
+The public docstrings and MCP Python/best-practices resources describe the full
+wrapper. Each Python process owns its own client handles.
 
 ## Maintain and validate the package
 
@@ -197,8 +266,19 @@ copy and compare it with the source:
 python3 plugins/automation-bridge/scripts/sync_python.py
 python3 plugins/automation-bridge/scripts/validate_plugin.py --check-sync
 PYTHONPATH=automation_bridge/automation-bridge-python \
-  python3 -m unittest tests.test_mcp_server
+  python3 -m unittest tests.test_mcp_server tests.test_mcp_improvements
 ```
+
+When updating an installed local plugin, refresh the Codex manifest's cachebuster
+and mirror that version into portable `plugin.json`, validate, then reinstall:
+
+```sh
+codex plugin add automation-bridge@personal
+```
+
+Use a new Codex task to load the updated tools and skill. The launcher works from
+an installed cache, unrelated working directories, and paths containing spaces;
+keep the script path absolute in direct MCP configurations.
 
 The conformance suite checks every catalog owner/dispatcher, every physical MCP
 tool envelope, protocol-era wire shapes, strict schemas, handle/context/

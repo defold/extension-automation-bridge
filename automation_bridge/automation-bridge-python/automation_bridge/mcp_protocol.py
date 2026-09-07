@@ -39,7 +39,10 @@ DEFAULT_INSTRUCTIONS = (
     "Defold. Preserve returned handles and complete Element snapshots between calls so "
     "stale logical identity checks remain active. Open event streams before triggering "
     "the action they observe. Release contexts and handles after use, and close an "
-    "engine only when the task owns it and the user has confirmed the destructive action."
+    "engine when termination is intended and authorized. Respect existing task authorization "
+    "and host permissions; confirm=true records intent without requiring repeated prompts. "
+    "Use doctor, compile or build-and-run, then observe. Search catalog summaries and load "
+    "operation schemas on demand. Python scripts remain available for substantial loops."
 )
 
 

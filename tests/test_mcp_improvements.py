@@ -451,3 +451,30 @@ class DiscoveryTest(unittest.TestCase):
                 detail = runtime.call_tool('automation_bridge_describe', {'operation': operation})['data']
                 self.assertIn(parameter, detail['arguments_schema']['properties'])
         runtime.cleanup()
+
+
+class InstalledLayoutTest(unittest.TestCase):
+    def test_cached_plugin_with_spaces_and_unrelated_cwd_uses_its_bundle(self):
+        import shutil
+        import subprocess
+        import sys
+        from tests.mcp_client import StdioClient
+        with tempfile.TemporaryDirectory(prefix='automation plugin ') as directory:
+            root = Path(directory)
+            plugin = root / 'installed cache' / 'automation bridge'
+            shutil.copytree(ROOT / 'plugins/automation-bridge', plugin, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            cwd = root / 'unrelated project'
+            cwd.mkdir()
+            (cwd / 'game.project').write_text('[project]\ntitle = Decoy\n')
+            with StdioClient([sys.executable, str(plugin / 'scripts/run_mcp.py')], cwd=cwd, env={'PYTHONPATH': str(cwd)}) as client:
+                self.assertEqual('2025-11-25', client.initialize()['protocolVersion'])
+                tools = client.request('tools/list')['tools']
+                self.assertTrue(tools)
+                missing = client.tool('defold_open_project', {})['structuredContent']
+                self.assertEqual('missing_argument', missing['error']['code'])
+                doctor = client.tool('defold_doctor', {'project_path': str(cwd)})['structuredContent']
+                self.assertTrue(doctor['ok'], doctor)
+                self.assertIn(str(cwd), json.dumps(doctor['data']))
+            self.assertEqual(0, client.process.returncode)
+            subprocess.run([sys.executable, str(plugin / 'scripts/validate_plugin.py')], cwd=cwd,
+                           check=True, capture_output=True, text=True)
