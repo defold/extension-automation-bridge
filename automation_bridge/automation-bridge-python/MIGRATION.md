@@ -24,6 +24,16 @@ Put short examples below it only when a table entry is not sufficient. Do not
 rename unrelated variables or valid Defold GUI terms such as `gui_node`,
 `gui_node_box`, and `gui_node_text`.
 
+## Wrapper 3.0 → next release: explicit profiler connections
+
+| Wrapper 3.0 | Next wrapper release |
+| --- | --- |
+| `game.profiler.connect()`, `capture()`, and `start_recording()` assume port 17815 when no URL was discovered. | Use the current engine's discovered URL. For direct attachment, pass `profiler_url` to `engine.connect()`, or pass a known `port`/`url` to the profiler helper. Missing metadata raises `engine.ProfilerError`. |
+
+Editor bootstrap discovers the current engine's URL. When startup reports a
+Remotery initialization failure, choose a distinct `profiler.remotery_port` and
+start a new engine process.
+
 ## Wrapper 2.x → 3.0 (extension 2.0.x → 2.1.0)
 
 Most documented high-level calls are unchanged, including `element()`,

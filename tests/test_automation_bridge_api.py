@@ -2623,6 +2623,14 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual(23456, connection.port)
         self.assertEqual(3.0, connection.timeout)
 
+    def test_profiler_connection_requires_engine_metadata_or_an_explicit_port(self):
+        profiler = ProfilerClient(12345, timeout=3.0)
+        with mock.patch('automation_bridge.profiler.ProfilerConnection') as connection:
+            for kwargs in ({}, {'host': 'localhost'}):
+                with self.subTest(kwargs=kwargs), self.assertRaisesRegex(engine.ProfilerError, 'No Remotery URL was discovered'):
+                    profiler.connect(**kwargs)
+            connection.assert_not_called()
+
     def test_editor_latest_registration_remotery_urls(self):
         lines = [
             "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:11111/rmt)",
@@ -2633,6 +2641,74 @@ class EngineClientUnitTest(unittest.TestCase):
         ]
 
         self.assertEqual(["ws://127.0.0.1:22222/rmt"], EditorApiClient._latest_registration_remotery_urls(lines))
+
+    def test_profiler_discovery_covers_both_sides_of_current_registration(self):
+        previous = [
+            'INFO:AUTOMATIONBRIDGE: Automation Bridge endpoint registered',
+            'INFO:PROFILER: Initialized Remotery (ws://127.0.0.1:11111/rmt)',
+            'INFO:AUTOMATIONBRIDGE: Registered automation_bridge extension',
+        ]
+        registration = ['INFO:ENGINE: Engine service started on port 33333',
+                        'INFO:AUTOMATIONBRIDGE: Automation Bridge endpoint registered']
+        ready = 'INFO:PROFILER: Initialized Remotery (ws://127.0.0.1:22222/rmt)'
+        failed = 'ERROR:PROFILER: Failed to initialize Remotery: 5'
+        for current, expected in (
+            ([ready, *registration], ['ws://127.0.0.1:22222/rmt']),
+            ([*registration, ready], ['ws://127.0.0.1:22222/rmt']),
+            (registration, []),
+            ([failed, *registration], []),
+            ([ready, *registration, failed], []),
+        ):
+            with self.subTest(current=current):
+                self.assertEqual(expected, EditorApiClient._latest_registration_remotery_urls(previous + current))
+
+    def test_reported_target_waits_for_delayed_profiler_console_metadata(self):
+        project = EditorApiClient('.', port=12345)
+        registration = ['INFO:ENGINE: Engine service started on port 54321',
+                        'INFO:AUTOMATIONBRIDGE: Automation Bridge endpoint registered']
+        ready = [*registration, 'INFO:PROFILER: Initialized Remotery (ws://127.0.0.1:54322/rmt)']
+        with mock.patch.object(project, '_console_lines', side_effect=[[], registration, ready]) as console:
+            self.assertEqual('ws://127.0.0.1:54322/rmt', project._reported_target_remotery_url(54321, 0.5))
+        self.assertEqual(3, console.call_count)
+
+    def test_reported_target_allows_missing_profiler_metadata_and_preserves_cancellation(self):
+        project = EditorApiClient('.', port=12345)
+        registration = ['INFO:ENGINE: Engine service started on port 54321',
+                        'INFO:AUTOMATIONBRIDGE: Automation Bridge endpoint registered']
+        for line in ('ERROR:PROFILER: Failed to initialize Remotery: 5',
+                     'INFO:AUTOMATIONBRIDGE: Registered automation_bridge extension'):
+            with self.subTest(line=line), mock.patch.object(project, '_console_lines', return_value=[*registration, line]) as console:
+                self.assertIsNone(project._reported_target_remotery_url(54321, 0.5))
+                console.assert_called_once_with()
+        with mock.patch.object(project, '_console_lines', return_value=[]):
+            self.assertIsNone(project._reported_target_remotery_url(54321, 0.001))
+        with mock.patch.object(project, '_console_lines', side_effect=AutomationBridgeError('console unavailable')):
+            self.assertIsNone(project._reported_target_remotery_url(54321, 0.5))
+        with mock.patch.object(project, '_console_lines', side_effect=engine.OperationCancelled('cancel discovery')):
+            with self.assertRaises(engine.OperationCancelled):
+                project._reported_target_remotery_url(54321, 0.5)
+
+    def test_new_engine_registration_clears_previous_profiler_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'game.project').write_text('[project]\ntitle = fixture\n')
+            project = EditorApiClient(root, port=12345)
+            project._remember_remotery_url('ws://127.0.0.1:17815/rmt')
+            console = ['ERROR:PROFILER: Failed to initialize Remotery: 5',
+                       'INFO:ENGINE: Engine service started on port 54321',
+                       'INFO:AUTOMATIONBRIDGE: Automation Bridge endpoint registered']
+            health = {'identity': {'engine_instance_id': 'engine:new', 'project_identity': 'project:fixture', 'process_id': 42}}
+            with mock.patch.object(project, '_console_lines', return_value=console), \
+                 mock.patch.object(EngineClient, 'health', return_value=health), \
+                 mock.patch('automation_bridge.client.RuntimeLogs.start'):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+            try:
+                self.assertIsNone(bridge.profiler_url)
+                self.assertIsNone(project._cached_remotery_url_value())
+                self.assertFalse(project._remotery_url_cache_path.exists())
+                self.assertIsNone(EditorApiClient(root, port=12345)._cached_remotery_url_value())
+            finally:
+                bridge.close()
 
     def test_parse_remotery_sample_frame(self):
         frame = parse_sample_frame(_remotery_sample_frame_body(), {1: "Frame", 2: "Update"})

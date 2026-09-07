@@ -766,6 +766,24 @@ timing mode, or external services.
 All profiling is presented through `game.profiler`; the underlying stream
 protocol is an implementation detail.
 
+Editor connections discover the profiler URL from the current engine's startup
+logs, including engines that initialize Remotery after bridge registration. For
+structured launch results, bootstrap briefly polls for delayed console metadata;
+unavailable profiler metadata does not prevent connecting to the engine. If
+no URL was discovered, stream operations raise `engine.ProfilerError`. They do
+not guess port 17815, which may belong to a different game. Direct connections
+can supply `engine.connect(engine_port, profiler_url="ws://127.0.0.1:17816/rmt")`
+or use `game.profiler.connect(port=17816)` explicitly. Resource inspection through
+`game.profiler.resources()` uses the engine service and requires no stream URL.
+
+Concurrent games need distinct Remotery ports. Set `[profiler] remotery_port`
+in each game's `game.project`, then start a new engine process. A startup message
+`Failed to initialize Remotery: 5` can indicate an occupied port. In the tested
+Defold 1.13.1 and 1.13.2 alpha engines, this condition also caused an in-process
+reboot to stall inside the profiler; assigning an available port avoids that
+startup failure. This workaround requires a new process because an in-process
+reboot retains the profiler listener.
+
 ```python
 resources = game.profiler.resources()
 
