@@ -15,6 +15,7 @@ input_method = HiddenInputField
 [automation_bridge]
 application_api = 1
 event_capacity = 256
+test_contracts = 1
 
 [physics]
 gravity_y = -1000.0

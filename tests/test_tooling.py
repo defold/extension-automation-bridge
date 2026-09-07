@@ -348,8 +348,10 @@ class MetalCaptureTest(unittest.TestCase):
         ]
         bridge = self.Bridge(states)
         with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "traces" / "frame.gputrace"
+            expected_path = output_path.resolve()
             capture = MetalCaptureClient(bridge).start(
-                Path(directory) / "traces" / "frame.gputrace",
+                output_path,
                 frames=2,
                 timeout=1,
             )
@@ -358,7 +360,7 @@ class MetalCaptureTest(unittest.TestCase):
         self.assertEqual(2, capture.frames_captured)
         self.assertEqual(("POST", "/metal"), bridge.requests[0][:2])
         self.assertIsNone(bridge.requests[0][2])
-        self.assertTrue(bridge.requests[0][3]["path"].endswith("/traces/frame.gputrace"))
+        self.assertEqual(expected_path, Path(bridge.requests[0][3]["path"]))
         self.assertEqual(2, bridge.requests[0][3]["frames"])
         self.assertEqual(
             ["metal_capture_started", "metal_capture_finished"],

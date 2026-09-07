@@ -3,6 +3,8 @@
 import time
 from typing import Any, Callable, Mapping, Optional, Tuple, Type, TypeVar, Union
 
+from .cancellation import OperationCancelled, cancellable_sleep, check_cancelled
+
 
 T = TypeVar("T")
 RetryExceptions = Union[Type[BaseException], Tuple[Type[BaseException], ...]]
@@ -60,6 +62,7 @@ def wait_until(
     callback for clients that track it from native responses. ``predicate``
     can define success independently of truthiness so waits for values such as
     zero still retain the actual observation in timeout diagnostics.
+    An active ``engine.cancellation_scope(token)`` interrupts polling and delays.
     """
     retry_types = _normalize_retry_exceptions(retry_exceptions)
     if timeout < 0:
@@ -75,9 +78,11 @@ def wait_until(
     attempts = 0
 
     while True:
+        check_cancelled()
         attempts += 1
         try:
             last_value = fn()
+            check_cancelled()
             inferred_sequence = _sequence_from_value(last_value)
             last_scene_sequence = (
                 inferred_sequence
@@ -87,6 +92,8 @@ def wait_until(
             succeeded = predicate(last_value) if predicate is not None else bool(last_value)
             if succeeded:
                 return last_value
+        except OperationCancelled:
+            raise
         except retry_types as exc:
             last_error = exc
             last_scene_sequence = _read_scene_sequence(scene_sequence, last_scene_sequence)
@@ -105,7 +112,7 @@ def wait_until(
             if last_error is not None:
                 raise error from last_error
             raise error
-        time.sleep(min(interval, max(0.0, deadline - now)))
+        cancellable_sleep(min(interval, max(0.0, deadline - now)))
 
 
 def _normalize_retry_exceptions(value: RetryExceptions) -> Tuple[Type[BaseException], ...]:

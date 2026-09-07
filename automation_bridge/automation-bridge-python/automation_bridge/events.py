@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from typing import Any, List, Mapping, Optional, TYPE_CHECKING, Union
+from .cancellation import cancellation_active, check_cancelled
 
 if TYPE_CHECKING:
     from .client import Client
@@ -111,6 +112,7 @@ class EventStream:
 
     def poll(self, timeout: float = 0.0, limit: int = 100) -> List[Event]:
         """Long-poll once and advance the cursor after all returned events."""
+        check_cancelled()
         if self._closed:
             raise RuntimeError("event stream is closed")
         if timeout < 0:
@@ -118,6 +120,8 @@ class EventStream:
         if limit < 1 or limit > 256:
             raise ValueError("limit must be between 1 and 256")
         safe_wait = min(timeout, max(0.0, float(self.client.timeout) - 0.1), 30.0)
+        if cancellation_active():
+            safe_wait = min(safe_wait, 0.1)
         data = self.client.request(
             "GET", "/events",
             params={"cursor": self.cursor, "timeout_ms": int(safe_wait * 1000), "limit": limit},
@@ -143,6 +147,7 @@ class EventStream:
 
         deadline = time.monotonic() + timeout
         while True:
+            check_cancelled()
             for index, event in enumerate(self._pending):
                 if event.name == name and (event_type is None or event.type == event_type) and _mapping_contains(event.data, where):
                     return self._pending.pop(index)

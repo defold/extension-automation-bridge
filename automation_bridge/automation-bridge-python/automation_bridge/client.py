@@ -14,14 +14,20 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .elements import Element
+from .elements import Element, ElementPage, ElementSelector
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
+from .application import ApplicationCatalogPage
+from .cancellation import (
+    CancellationToken, OperationCancelled, cancellation_scope,
+    cancellable_sleep, cancellation_active, check_cancelled,
+)
 
 
 JsonDict = Dict[str, Any]
@@ -211,18 +217,29 @@ class EngineLogStream:
         if sock is None:
             return b""
         previous_timeout = sock.gettimeout()
+        budget = previous_timeout if timeout is None else timeout
+        deadline = time.monotonic() + budget if budget is not None else None
         timeout_changed = timeout is not None
         if timeout is not None:
             sock.settimeout(timeout)
+        if cancellation_active() and (budget is None or budget > 0.1):
+            sock.settimeout(0.1)
+            timeout_changed = True
         try:
             while True:
+                check_cancelled()
                 newline = self._buffer.find(b"\n")
                 if newline >= 0:
                     line = bytes(self._buffer[: newline + 1])
                     del self._buffer[: newline + 1]
                     return line
 
-                chunk = sock.recv(4096)
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    if cancellation_active() and (deadline is None or time.monotonic() < deadline):
+                        continue
+                    return b""
                 if not chunk:
                     if not self._buffer:
                         self.close()
@@ -404,12 +421,14 @@ class InputController:
         if receipt is not None:
             if receipt.state in {"cancelled", "failed"}:
                 raise InputExecutionError(receipt)
-            if state == "accepted" and receipt.state in {"accepted", "started", "released"}:
-                return receipt
         deadline = time.monotonic() + max(0.0, timeout)
         last = receipt
         try:
+            check_cancelled()
+            if receipt is not None and state == "accepted" and receipt.state in {"accepted", "started", "released"}:
+                return receipt
             while True:
+                check_cancelled()
                 if last is None or last.state == "accepted" or state == "released":
                     last = self.status(input_id)
                 if last.state in {"cancelled", "failed"}:
@@ -425,8 +444,8 @@ class InputController:
                         f"input {input_id} did not reach {state!r} within {timeout}s; "
                         f"last state was {last.state!r}"
                     )
-                time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
-        except BaseException:
+                cancellable_sleep(max(0.0, min(interval, deadline - time.monotonic())))
+        except BaseException as interrupted:
             if cancel_on_interrupt:
                 def cleanup() -> None:
                     if flush_on_interrupt:
@@ -436,7 +455,11 @@ class InputController:
 
                 # Keep cleanup failures from replacing the original timeout,
                 # cancellation, KeyboardInterrupt, or API error.
-                _cleanup_without_masking(cleanup)
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    if isinstance(interrupted, OperationCancelled):
+                        interrupted.cleanup_error = cleanup_error
             raise
 
     def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
@@ -725,6 +748,9 @@ class Client:
         required_capabilities: Sequence[str] = (),
     ):
         """Create a correlated client for an already-known engine service port."""
+        for name, value in (("client_id", client_id), ("session_id", session_id)):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v2"
@@ -740,6 +766,84 @@ class Client:
         self._active_traces: List[Any] = []
         self._required_capabilities = set(required_capabilities)
         self._last_health: Optional[JsonDict] = None
+        self._owns_engine = False
+        self._project_root: Optional[Path] = None
+        self._closed = False
+
+    @property
+    def owns_engine(self) -> bool:
+        """Whether this client built the engine rather than attaching to it.
+
+        This describes lifecycle intent, not permission. ``close()`` leaves
+        the process running; ``close_engine()`` explicitly exits it, including
+        when deliberately called on an attached client.
+        """
+        return self._owns_engine
+
+    @property
+    def closed(self) -> bool:
+        """Whether this client's local resources have been released."""
+        return self._closed
+
+    def session_info(self) -> JsonDict:
+        """Return session identity and lifecycle ownership without native requests."""
+        return {
+            "client_id": self.client_id,
+            "session_id": self.session_id,
+            "engine_instance_id": self.engine_instance_id,
+            "project_path": str(self._project_root) if self._project_root else None,
+            "port": self.port,
+            "owns_engine": self.owns_engine,
+            "closed": self.closed,
+        }
+
+    def close(self) -> None:
+        """Release the background collector without sending native mutations.
+
+        Closing is idempotent and prevents further requests through this client.
+        Explicit streams and captures retain their own context-manager lifecycle.
+        Use ``input.flush()`` before closing to cancel this session's input, and
+        ``close_engine()`` only when engine termination is intended.
+        """
+        if not self._closed:
+            self._logs.close()
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise AutomationBridgeError("engine client is closed; reconnect to continue")
+
+    @contextmanager
+    def cancellation_scope(self, token: CancellationToken):
+        """Cancel waits and request release of this session's input on cancellation.
+
+        One token belongs to one operation. Use separate clients/identities for
+        independent operations; cleanup only targets this client's native lease.
+        A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
+        """
+        entered = False
+        try:
+            with cancellation_scope(token):
+                entered = True
+                yield token
+        except OperationCancelled as exc:
+            if entered:
+                try:
+                    self.input.flush(release=True)
+                except Exception as cleanup_error:
+                    if exc.cleanup_error is None:
+                        exc.cleanup_error = cleanup_error
+            raise
+
+    def __enter__(self) -> "Client":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            _cleanup_without_masking(self.close)
 
     @property
     def input(self) -> InputController:
@@ -758,12 +862,19 @@ class Client:
         build_command: Optional[str] = None,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
+        check_cancelled()
         fresh_build = build_command is not None
+        session_identity = {key: value for key, value in (("client_id", client_id), ("session_id", session_id)) if value is not None}
+        for name, value in session_identity.items():
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
-            time.sleep(0.5)
+            cancellable_sleep(0.5)
             editor._build_and_run_command(build_command, timeout=timeout)
 
         def connect_candidate(
@@ -778,6 +889,7 @@ class Client:
                     service_port,
                     profiler_url=profiler_url,
                     required_capabilities=required_capabilities,
+                    **session_identity,
                 )
                 health = bridge.health()
                 if not editor._validate_cached_engine_health(
@@ -809,6 +921,8 @@ class Client:
             if profiler_url:
                 editor._remember_remotery_url(profiler_url)
             bridge.logs.start()
+            bridge._owns_engine = fresh_build
+            bridge._project_root = Path(editor.root)
             return bridge
 
         if not fresh_build:
@@ -869,7 +983,7 @@ class Client:
         if build_command is None:
             raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
-        time.sleep(0.5)
+        cancellable_sleep(0.5)
         editor._build_and_run_command(build_command, timeout=timeout)
         return cls._wait_for_bridge(
             bridge_after_build,
@@ -892,6 +1006,7 @@ class Client:
         last_error: Optional[BaseException] = None
         attempts = 0
         while time.monotonic() < deadline:
+            check_cancelled()
             attempts += 1
             try:
                 bridge = probe()
@@ -901,7 +1016,7 @@ class Client:
                 raise
             except retry_exceptions as exc:
                 last_error = exc
-            time.sleep(0.1)
+            cancellable_sleep(0.1)
         error = WaitTimeoutError(
             message,
             last_value=None,
@@ -1107,27 +1222,55 @@ class Client:
         return self._request("GET", "/scene", params)
 
     def elements(self, **selector: Any) -> List[Element]:
-        """Return one server-filtered page of inspectable scene elements."""
+        """Return one page of elements; see ``engine.ElementSelector`` for filters.
+
+        The default limit is 50. Use ``elements_page()`` to retain the native
+        match count, continuation cursor and snapshot metadata, or ``count()``
+        when only the complete match count is required.
+        """
         elements, _, _ = self._select_elements(selector)
         return elements
 
+
+    def elements_page(self, **selector: Any) -> ElementPage:
+        """Return elements and their native pagination and snapshot metadata.
+
+        Accepts the same ``engine.ElementSelector`` keywords as ``elements()``.
+        Keep filters unchanged when passing ``page.next_cursor`` as ``cursor``.
+        A later page can describe a newer frame; it is not an atomic scene dump.
+        """
+        self._validate_selector(selector)
+        self._require_cached_capability("scene.pagination")
+        data = self._request("GET", "/elements", self._server_params(selector, selector.get("limit", 50)))
+        return ElementPage.from_raw(data)
+
+
     def element(self, **selector: Any) -> Element:
-        """Return exactly one matching element or raise `SelectorError`."""
+        """Return exactly one matching element or raise ``SelectorError``.
+
+        Uses ``engine.ElementSelector`` filters. Pagination options cannot make
+        an ambiguous selector unique; use exact names or automation IDs.
+        """
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) == 1:
+        if len(elements) == 1 and metadata.get("matched", len(elements)) == 1:
             return elements[0]
         error = SelectorError(self._selector_error("expected exactly one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
 
+
     def maybe_element(self, **selector: Any) -> Optional[Element]:
         """Return zero or one matching element, raising if multiple elements match."""
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) <= 1:
-            return elements[0] if elements else None
+        matched = metadata.get("matched", len(elements))
+        if matched == 0:
+            return None
+        if len(elements) == 1 and matched == 1:
+            return elements[0]
         error = SelectorError(self._selector_error("expected zero or one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
+
 
     def element_by_id(
         self,
@@ -1179,6 +1322,7 @@ class Client:
         down and released one update after it comes up, so bindings that track the
         modifier's own key trigger observe the same ordering a human chord produces.
         """
+        check_cancelled()
         if isinstance(target, Element):
             json_body: Dict[str, Any] = {"id": target.id}
             if target.logical_id:
@@ -1226,6 +1370,7 @@ class Client:
         ``"LCTRL"`` for ctrl-drag), pressed one update before the pointer goes down
         and released one update after the final up.
         """
+        check_cancelled()
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
             json_body: Dict[str, Any] = {
                 "from_id": self._element_id(from_target),
@@ -1288,6 +1433,7 @@ class Client:
         ``modifiers`` holds up to four keys as a chord for the whole gesture, pressed
         one update before the pointer goes down and released one update after the up.
         """
+        check_cancelled()
         normalized_points = [self._point(point) for point in points]
         if path not in {"sampled", "linear", "quadratic", "cubic"}:
             raise ValueError("path must be sampled, linear, quadratic, or cubic")
@@ -1352,6 +1498,7 @@ class Client:
         ``modifiers`` holds up to four keys as a chord for the whole session, pressed
         one update before the pointer goes down and released one update after the up.
         """
+        check_cancelled()
         lease = self._input_duration(lease, "lease")
         if lease <= 0:
             raise ValueError("lease must be greater than zero")
@@ -1385,6 +1532,7 @@ class Client:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue FIFO text input and optionally wait for native completion."""
+        check_cancelled()
         json_body = self._input_json_body()
         json_body.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
@@ -1414,6 +1562,7 @@ class Client:
         continuous per-frame actions a physically held key generates. When
         waiting on a long hold, raise ``timeout`` above the hold duration.
         """
+        check_cancelled()
         hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
         if hold > 0.0:
@@ -1488,6 +1637,7 @@ class Client:
         matching value must not satisfy a wait for a *new* publication.
         ``state_name`` disambiguates a path before that state has first appeared.
         """
+        check_cancelled()
         snapshot = self.states()
         entries = [item for item in snapshot.get("states", []) if isinstance(item, Mapping)]
         current_revision = int(snapshot.get("revision", 0))
@@ -1497,6 +1647,7 @@ class Client:
         cursor = current_revision if after_revision is None else int(after_revision)
         deadline = time.monotonic() + timeout
         while True:
+            check_cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 observed = selected.value if selected is not None else "<unpublished>"
@@ -1505,6 +1656,8 @@ class Client:
                     f"last value={observed!r}, revision={cursor}"
                 )
             safe_wait = min(remaining, max(0.0, float(self.timeout) - 0.1), 1.0)
+            if cancellation_active():
+                safe_wait = min(safe_wait, 0.1)
             changed = self._request(
                 "GET", "/state/wait",
                 {"after_revision": cursor, "timeout_ms": int(safe_wait * 1000), "name": state_name},
@@ -1517,8 +1670,43 @@ class Client:
                 if candidate.value == expected and candidate.revision > (after_revision or 0):
                     return candidate
 
+    def application_catalog(
+        self,
+        *,
+        kind: Optional[str] = None,
+        name: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+    ) -> ApplicationCatalogPage:
+        """Discover application commands, states, events, and their contracts.
+
+        Requires ``application.catalog``. ``kind`` is command, state, or event;
+        ``name`` filters an exact name. All registered commands and published
+        states are listed, including those without metadata. Unpublished states
+        and events appear after Lua ``automation_bridge.describe()`` declarations.
+        Schemas are descriptive metadata and do not enforce payload validation.
+
+        ``limit`` is 0-100 (zero requests only the match count). Pass the returned
+        string ``next_cursor`` with the same filters to continue. Cursor takes
+        precedence over ``offset``; both must be valid unsigned 32-bit values.
+        Restart pagination if the catalog revision or engine identity changes.
+        """
+        if kind is not None and kind not in ("command", "state", "event"):
+            raise ValueError("kind must be command, state, or event")
+        if name is not None and (not isinstance(name, str) or not name or "\0" in name or len(name.encode("utf-8")) > 128):
+            raise ValueError("name must be a non-empty string of at most 128 UTF-8 bytes")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 100:
+            raise ValueError("limit must be an integer from 0 through 100")
+        pagination = {"limit": limit, "offset": offset, "cursor": cursor}
+        self._validate_selector(pagination)
+        self._require_cached_capability("application.catalog")
+        data = self._request("GET", "/application/catalog", {"kind": kind, "name": name, **pagination})
+        return ApplicationCatalogPage.from_raw(data)
+
     def start_command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Submit a registered named Lua command and return its pending id."""
+        check_cancelled()
         if timeout <= 0 or timeout > 300:
             raise ValueError("command timeout must be greater than 0 and at most 300 seconds")
         payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
@@ -1543,10 +1731,28 @@ class Client:
         return self._request("DELETE", "/commands", {"id": int(command_id)})
 
     def wait_for_command(self, command_id: int, timeout: float = 30.0, interval: float = 0.02) -> JsonDict:
-        """Wait for a command result, cancelling a still-pending command on timeout."""
+        """Wait for completion, requesting pending-command cancellation on interruption.
+
+        Running Lua callbacks cannot be preempted. A failed native cancellation
+        is preserved as ``OperationCancelled.cleanup_error``.
+        """
+        try:
+            return self._wait_for_command(command_id, timeout, interval)
+        except OperationCancelled as exc:
+            try:
+                self.cancel_command(command_id)
+            except Exception as cleanup_error:
+                exc.cleanup_error = cleanup_error
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            _cleanup_without_masking(lambda: self.cancel_command(command_id))
+            raise
+
+    def _wait_for_command(self, command_id: int, timeout: float, interval: float) -> JsonDict:
         deadline = time.monotonic() + timeout
         terminal = {"completed", "failed", "cancelled", "timed_out"}
         while True:
+            check_cancelled()
             status = self.command_status(command_id)
             if status.get("state") in terminal:
                 return status
@@ -1558,7 +1764,7 @@ class Client:
                 except AutomationBridgeError as exc:
                     cancellation_error = exc
                 raise CommandTimeout(command_id, timeout, cancellation_error) from cancellation_error
-            time.sleep(min(interval, remaining))
+            cancellable_sleep(min(interval, remaining))
 
     def command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Run a registered command and return its terminal result record."""
@@ -1601,6 +1807,7 @@ class Client:
         retry_exceptions: RetryExceptions = (),
     ) -> ScreenshotReceipt:
         """Capture a PNG, optionally returning a lower-resolution derived image."""
+        check_cancelled()
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
         if resolution_multiplier is not None:
@@ -1791,6 +1998,7 @@ class Client:
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
         """Request a resize and return requested, window, viewport, and outcome data."""
+        check_cancelled()
         _validate_screen_size(width, height)
         capabilities = self.health().get("capabilities", [])
         if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
@@ -1807,7 +2015,7 @@ class Client:
                 window = screen.get("window")
                 if isinstance(window, Mapping) and window.get("width") == width and window.get("height") == height:
                     break
-                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                cancellable_sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         window = screen.get("window") if isinstance(screen, Mapping) else None
         observed_width = None
         observed_height = None
@@ -1868,6 +2076,7 @@ class Client:
 
     def reboot(self, *args: str, wait: bool = True, timeout: Optional[float] = None) -> None:
         """Reboot the engine through `/post/@system/reboot` with up to six command-line args."""
+        check_cancelled()
         payload = _encode_system_reboot(args)
         self._post_engine_message("/post/@system/reboot", payload, timeout=timeout)
         self._last_window_size = None
@@ -1877,6 +2086,13 @@ class Client:
 
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
+        self._ensure_open()
+        try:
+            self._close_engine(timeout)
+        finally:
+            self.close()
+
+    def _close_engine(self, timeout: float) -> None:
         self._logs.close()
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
         try:
@@ -1913,7 +2129,7 @@ class Client:
                 self.health()
             except AutomationBridgeError:
                 return True
-            time.sleep(0.05)
+            cancellable_sleep(0.05)
         return False
 
     def _wait_ready_after_reboot(self, timeout: float) -> JsonDict:
@@ -1935,7 +2151,7 @@ class Client:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
-            time.sleep(min(0.05, remaining))
+            cancellable_sleep(min(0.05, remaining))
 
         try:
             data = self.health()
@@ -2230,6 +2446,7 @@ class Client:
         json_body: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
         url = self.base_url + path
+        self._ensure_open()
         encoded_params = self._encoded_params(params)
         if encoded_params:
             url += "?" + urllib.parse.urlencode(encoded_params)
@@ -2259,6 +2476,7 @@ class Client:
         return data
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        self._ensure_open()
         url = self.base_url + path
         compact_payload = {key: value for key, value in payload.items() if value is not None}
         data = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -2359,6 +2577,7 @@ class Client:
             trace.record(kind, payload)
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
+        self._ensure_open()
         url = f"http://127.0.0.1:{self.port}{path}"
         status, body = request_bytes(url, payload, timeout=self.timeout if timeout is None else timeout)
         if status < 200 or status >= 300:
@@ -2448,6 +2667,22 @@ class Client:
         unknown = set(selector) - self._SELECTOR_KEYS
         if unknown:
             raise TypeError(f"unknown element selector keys: {', '.join(sorted(unknown))}")
+        boolean_keys = {"enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive"}
+        for key, value in selector.items():
+            if value is None:
+                continue
+            if key in boolean_keys:
+                if not isinstance(value, bool):
+                    raise TypeError(f"{key} must be a bool")
+            elif key in {"limit", "offset"}:
+                maximum = 500 if key == "limit" else 0xFFFFFFFF
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                    raise ValueError(f"{key} must be an integer from 0 through {maximum}")
+            elif key == "cursor":
+                if not isinstance(value, str) or not value.isascii() or not value.isdigit() or int(value) > 0xFFFFFFFF:
+                    raise ValueError("cursor must be an unsigned decimal continuation string")
+            elif key != "include" and not isinstance(value, str):
+                raise TypeError(f"{key} must be a string")
 
     def _has_client_filters(self, selector: Mapping[str, Any]) -> bool:
         return any(selector.get(key) is not None for key in self._CLIENT_FILTERS)
