@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
@@ -22,6 +23,10 @@ from .elements import Element, ElementPage, ElementSelector
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
+from .cancellation import (
+    CancellationToken, OperationCancelled, cancellation_scope,
+    cancellable_sleep, cancellation_active, check_cancelled,
+)
 
 
 JsonDict = Dict[str, Any]
@@ -211,18 +216,29 @@ class EngineLogStream:
         if sock is None:
             return b""
         previous_timeout = sock.gettimeout()
+        budget = previous_timeout if timeout is None else timeout
+        deadline = time.monotonic() + budget if budget is not None else None
         timeout_changed = timeout is not None
         if timeout is not None:
             sock.settimeout(timeout)
+        if cancellation_active() and (budget is None or budget > 0.1):
+            sock.settimeout(0.1)
+            timeout_changed = True
         try:
             while True:
+                check_cancelled()
                 newline = self._buffer.find(b"\n")
                 if newline >= 0:
                     line = bytes(self._buffer[: newline + 1])
                     del self._buffer[: newline + 1]
                     return line
 
-                chunk = sock.recv(4096)
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    if cancellation_active() and (deadline is None or time.monotonic() < deadline):
+                        continue
+                    return b""
                 if not chunk:
                     if not self._buffer:
                         self.close()
@@ -410,6 +426,7 @@ class InputController:
         last = receipt
         try:
             while True:
+                check_cancelled()
                 if last is None or last.state == "accepted" or state == "released":
                     last = self.status(input_id)
                 if last.state in {"cancelled", "failed"}:
@@ -425,8 +442,8 @@ class InputController:
                         f"input {input_id} did not reach {state!r} within {timeout}s; "
                         f"last state was {last.state!r}"
                     )
-                time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
-        except BaseException:
+                cancellable_sleep(max(0.0, min(interval, deadline - time.monotonic())))
+        except BaseException as interrupted:
             if cancel_on_interrupt:
                 def cleanup() -> None:
                     if flush_on_interrupt:
@@ -436,7 +453,11 @@ class InputController:
 
                 # Keep cleanup failures from replacing the original timeout,
                 # cancellation, KeyboardInterrupt, or API error.
-                _cleanup_without_masking(cleanup)
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    if isinstance(interrupted, OperationCancelled):
+                        interrupted.cleanup_error = cleanup_error
             raise
 
     def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
@@ -790,6 +811,28 @@ class Client:
         if self._closed:
             raise AutomationBridgeError("engine client is closed; reconnect to continue")
 
+    @contextmanager
+    def cancellation_scope(self, token: CancellationToken):
+        """Cancel waits and request release of this session's input on cancellation.
+
+        One token belongs to one operation. Use separate clients/identities for
+        independent operations; cleanup only targets this client's native lease.
+        A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
+        """
+        entered = False
+        try:
+            with cancellation_scope(token):
+                entered = True
+                yield token
+        except OperationCancelled as exc:
+            if entered:
+                try:
+                    self.input.flush(release=True)
+                except Exception as cleanup_error:
+                    if exc.cleanup_error is None:
+                        exc.cleanup_error = cleanup_error
+            raise
+
     def __enter__(self) -> "Client":
         self._ensure_open()
         return self
@@ -821,6 +864,7 @@ class Client:
         session_id: Optional[str] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
+        check_cancelled()
         fresh_build = build_command is not None
         session_identity = {key: value for key, value in (("client_id", client_id), ("session_id", session_id)) if value is not None}
         for name, value in session_identity.items():
@@ -828,7 +872,7 @@ class Client:
                 raise ValueError(f"{name} must be a non-empty string when supplied")
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
-            time.sleep(0.5)
+            cancellable_sleep(0.5)
             editor._build_and_run_command(build_command, timeout=timeout)
 
         def connect_candidate(
@@ -937,7 +981,7 @@ class Client:
         if build_command is None:
             raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
-        time.sleep(0.5)
+        cancellable_sleep(0.5)
         editor._build_and_run_command(build_command, timeout=timeout)
         return cls._wait_for_bridge(
             bridge_after_build,
@@ -960,6 +1004,7 @@ class Client:
         last_error: Optional[BaseException] = None
         attempts = 0
         while time.monotonic() < deadline:
+            check_cancelled()
             attempts += 1
             try:
                 bridge = probe()
@@ -969,7 +1014,7 @@ class Client:
                 raise
             except retry_exceptions as exc:
                 last_error = exc
-            time.sleep(0.1)
+            cancellable_sleep(0.1)
         error = WaitTimeoutError(
             message,
             last_value=None,
@@ -1275,6 +1320,7 @@ class Client:
         down and released one update after it comes up, so bindings that track the
         modifier's own key trigger observe the same ordering a human chord produces.
         """
+        check_cancelled()
         if isinstance(target, Element):
             json_body: Dict[str, Any] = {"id": target.id}
             if target.logical_id:
@@ -1322,6 +1368,7 @@ class Client:
         ``"LCTRL"`` for ctrl-drag), pressed one update before the pointer goes down
         and released one update after the final up.
         """
+        check_cancelled()
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
             json_body: Dict[str, Any] = {
                 "from_id": self._element_id(from_target),
@@ -1384,6 +1431,7 @@ class Client:
         ``modifiers`` holds up to four keys as a chord for the whole gesture, pressed
         one update before the pointer goes down and released one update after the up.
         """
+        check_cancelled()
         normalized_points = [self._point(point) for point in points]
         if path not in {"sampled", "linear", "quadratic", "cubic"}:
             raise ValueError("path must be sampled, linear, quadratic, or cubic")
@@ -1448,6 +1496,7 @@ class Client:
         ``modifiers`` holds up to four keys as a chord for the whole session, pressed
         one update before the pointer goes down and released one update after the up.
         """
+        check_cancelled()
         lease = self._input_duration(lease, "lease")
         if lease <= 0:
             raise ValueError("lease must be greater than zero")
@@ -1481,6 +1530,7 @@ class Client:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue FIFO text input and optionally wait for native completion."""
+        check_cancelled()
         json_body = self._input_json_body()
         json_body.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
@@ -1510,6 +1560,7 @@ class Client:
         continuous per-frame actions a physically held key generates. When
         waiting on a long hold, raise ``timeout`` above the hold duration.
         """
+        check_cancelled()
         hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
         if hold > 0.0:
@@ -1584,6 +1635,7 @@ class Client:
         matching value must not satisfy a wait for a *new* publication.
         ``state_name`` disambiguates a path before that state has first appeared.
         """
+        check_cancelled()
         snapshot = self.states()
         entries = [item for item in snapshot.get("states", []) if isinstance(item, Mapping)]
         current_revision = int(snapshot.get("revision", 0))
@@ -1593,6 +1645,7 @@ class Client:
         cursor = current_revision if after_revision is None else int(after_revision)
         deadline = time.monotonic() + timeout
         while True:
+            check_cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 observed = selected.value if selected is not None else "<unpublished>"
@@ -1601,6 +1654,8 @@ class Client:
                     f"last value={observed!r}, revision={cursor}"
                 )
             safe_wait = min(remaining, max(0.0, float(self.timeout) - 0.1), 1.0)
+            if cancellation_active():
+                safe_wait = min(safe_wait, 0.1)
             changed = self._request(
                 "GET", "/state/wait",
                 {"after_revision": cursor, "timeout_ms": int(safe_wait * 1000), "name": state_name},
@@ -1615,6 +1670,7 @@ class Client:
 
     def start_command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Submit a registered named Lua command and return its pending id."""
+        check_cancelled()
         if timeout <= 0 or timeout > 300:
             raise ValueError("command timeout must be greater than 0 and at most 300 seconds")
         payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
@@ -1639,10 +1695,28 @@ class Client:
         return self._request("DELETE", "/commands", {"id": int(command_id)})
 
     def wait_for_command(self, command_id: int, timeout: float = 30.0, interval: float = 0.02) -> JsonDict:
-        """Wait for a command result, cancelling a still-pending command on timeout."""
+        """Wait for completion, requesting pending-command cancellation on interruption.
+
+        Running Lua callbacks cannot be preempted. A failed native cancellation
+        is preserved as ``OperationCancelled.cleanup_error``.
+        """
+        try:
+            return self._wait_for_command(command_id, timeout, interval)
+        except OperationCancelled as exc:
+            try:
+                self.cancel_command(command_id)
+            except Exception as cleanup_error:
+                exc.cleanup_error = cleanup_error
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            _cleanup_without_masking(lambda: self.cancel_command(command_id))
+            raise
+
+    def _wait_for_command(self, command_id: int, timeout: float, interval: float) -> JsonDict:
         deadline = time.monotonic() + timeout
         terminal = {"completed", "failed", "cancelled", "timed_out"}
         while True:
+            check_cancelled()
             status = self.command_status(command_id)
             if status.get("state") in terminal:
                 return status
@@ -1654,7 +1728,7 @@ class Client:
                 except AutomationBridgeError as exc:
                     cancellation_error = exc
                 raise CommandTimeout(command_id, timeout, cancellation_error) from cancellation_error
-            time.sleep(min(interval, remaining))
+            cancellable_sleep(min(interval, remaining))
 
     def command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Run a registered command and return its terminal result record."""
@@ -1697,6 +1771,7 @@ class Client:
         retry_exceptions: RetryExceptions = (),
     ) -> ScreenshotReceipt:
         """Capture a PNG, optionally returning a lower-resolution derived image."""
+        check_cancelled()
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
         if resolution_multiplier is not None:
@@ -1887,6 +1962,7 @@ class Client:
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
         """Request a resize and return requested, window, viewport, and outcome data."""
+        check_cancelled()
         _validate_screen_size(width, height)
         capabilities = self.health().get("capabilities", [])
         if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
@@ -1903,7 +1979,7 @@ class Client:
                 window = screen.get("window")
                 if isinstance(window, Mapping) and window.get("width") == width and window.get("height") == height:
                     break
-                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                cancellable_sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         window = screen.get("window") if isinstance(screen, Mapping) else None
         observed_width = None
         observed_height = None
@@ -1964,6 +2040,7 @@ class Client:
 
     def reboot(self, *args: str, wait: bool = True, timeout: Optional[float] = None) -> None:
         """Reboot the engine through `/post/@system/reboot` with up to six command-line args."""
+        check_cancelled()
         payload = _encode_system_reboot(args)
         self._post_engine_message("/post/@system/reboot", payload, timeout=timeout)
         self._last_window_size = None
@@ -2016,7 +2093,7 @@ class Client:
                 self.health()
             except AutomationBridgeError:
                 return True
-            time.sleep(0.05)
+            cancellable_sleep(0.05)
         return False
 
     def _wait_ready_after_reboot(self, timeout: float) -> JsonDict:
@@ -2038,7 +2115,7 @@ class Client:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
-            time.sleep(min(0.05, remaining))
+            cancellable_sleep(min(0.05, remaining))
 
         try:
             data = self.health()

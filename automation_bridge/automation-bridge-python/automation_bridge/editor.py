@@ -26,6 +26,7 @@ from .client import AutomationBridgeError, HttpError, request_json, request_raw
 from .preferences import PreferenceKey, Preferences
 from .waits import WaitTimeoutError, wait_until
 from .diagnostics import DiagnosticCheck, DoctorReport
+from .cancellation import cancellable_sleep, check_cancelled
 
 if TYPE_CHECKING:
     from .client import Client as EngineClient
@@ -748,6 +749,7 @@ class Client:
         launcher: Optional[Union[str, Path]] = None,
     ) -> "Client":
         """Connect to this project's editor, launching Defold when necessary."""
+        check_cancelled()
         timeout = float(timeout)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("timeout must be finite and greater than zero")
@@ -966,6 +968,7 @@ class Client:
             raise UnsupportedOperationError(f"editor does not advertise command {command!r}")
 
     def _empty_command(self, command: str, timeout: float) -> None:
+        check_cancelled()
         self._require_command(command)
         url = f"{self.base_url}/command/{command}"
         status, body = request_raw(url, method="POST", timeout=timeout)
@@ -1059,6 +1062,7 @@ class Client:
 
     def _build_and_run_command(self, command: str, timeout: float = 60.0) -> None:
         """Execute a desktop build-and-run command and await endpoint registration."""
+        check_cancelled()
         if command not in {"build", "clean-build"}:
             raise ValueError(f"unsupported desktop build-and-run command: {command}")
         self._require_command(command)
@@ -1095,7 +1099,7 @@ class Client:
             raise AutomationBridgeError(str(exc)) from exc
         self._record_lifecycle("new_engine_registered")
         self._last_build_had_engine_service_port = self._latest_registration_has_engine_service_port()
-        time.sleep(0.2)
+        cancellable_sleep(0.2)
 
     def _console_lines(self) -> list:
         """Return current editor console lines."""

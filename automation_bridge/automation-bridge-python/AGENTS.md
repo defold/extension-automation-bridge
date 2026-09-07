@@ -33,6 +33,9 @@
   validated special key.
 - Prefer events, published state, commands, acknowledgements, frame waits, and
   element waits over sleeps.
+- Wrap interruptible work in `game.cancellation_scope(token)` using an
+  `engine.CancellationToken` per operation. Native cleanup remains authoritative;
+  inspect `OperationCancelled.cleanup_error` when a cleanup request is refused.
 - Use atomic receipts for screenshots and recordings. Start visual inspection at
   `resolution_multiplier=0.5`; use `project.preview.render()` for editor-side
   validation without running the game. Optional diagnostics live under

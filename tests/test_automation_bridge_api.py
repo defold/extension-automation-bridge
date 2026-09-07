@@ -168,6 +168,109 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_cancellation_interrupts_long_poll_delay_from_another_thread(self):
+        token = engine.CancellationToken()
+        observed = threading.Event()
+        errors = []
+
+        def worker():
+            try:
+                with engine.cancellation_scope(token):
+                    wait_until(lambda: observed.set(), timeout=60, interval=60)
+            except engine.OperationCancelled as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(observed.wait(2))
+            token.cancel("caller stopped")
+            token.cancel("later reason")
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(["caller stopped"], [str(exc) for exc in errors])
+        finally:
+            token.cancel()
+            thread.join(2)
+
+    def test_cancellation_is_not_swallowed_by_retry_and_restores_outer_scope(self):
+        outer, inner = engine.CancellationToken(), engine.CancellationToken()
+        with self.assertRaisesRegex(engine.OperationCancelled, "outer"):
+            with engine.cancellation_scope(outer):
+                with self.assertRaisesRegex(engine.OperationCancelled, "inner"):
+                    with engine.cancellation_scope(inner):
+                        wait_until(lambda: inner.cancel("inner"), retry_exceptions=BaseException)
+                self.assertEqual(7, wait_until(lambda: 7))
+                outer.cancel("outer")
+        self.assertEqual(8, wait_until(lambda: 8))
+
+    def test_cancelled_scope_does_not_submit_input_or_launch_editor(self):
+        token = engine.CancellationToken()
+        token.cancel()
+        bridge = FakeInputClient()
+        with mock.patch("automation_bridge.editor.subprocess.Popen") as launch:
+            with self.assertRaises(engine.OperationCancelled):
+                with bridge.cancellation_scope(token):
+                    editor.open_project(".")
+                    bridge.key("SPACE")
+            launch.assert_not_called()
+        self.assertEqual([], bridge.api_requests)
+
+    def test_cancelled_input_wait_requests_native_release(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with engine.cancellation_scope(token):
+                token.cancel()
+                bridge.input.wait(42)
+        self.assertEqual(["/input/cancel"], [path for _, path, _ in bridge.api_requests])
+        self.assertTrue(bridge.api_requests[0][2]["release"])
+
+    def test_client_scope_releases_its_input_when_scene_wait_is_cancelled(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with bridge.cancellation_scope(token):
+                bridge.key("SPACE", hold=1, wait=False)
+                wait_until(lambda: token.cancel())
+        method, path, values = bridge.api_requests[-1]
+        self.assertEqual(("POST", "/input/flush"), (method, path))
+        self.assertEqual(bridge.client_id, values["client_id"])
+        self.assertEqual(bridge.session_id, values["session_id"])
+        self.assertTrue(values["release"])
+
+    def test_command_cancellation_preserves_native_refusal(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        refusal = RuntimeError("running Lua callbacks cannot be preempted")
+        with mock.patch.object(bridge, "cancel_command", side_effect=refusal) as cancel:
+            with self.assertRaises(engine.OperationCancelled) as error:
+                with engine.cancellation_scope(token):
+                    token.cancel()
+                    bridge.wait_for_command(23)
+            cancel.assert_called_once_with(23)
+        self.assertIs(refusal, error.exception.cleanup_error)
+
+    def test_log_cancellation_closes_idle_socket(self):
+        token = engine.CancellationToken()
+        stream = EngineLogStream.__new__(EngineLogStream)
+        sock = mock.Mock()
+        sock.gettimeout.return_value = None
+        stream._socket = sock
+        stream._buffer = bytearray()
+
+        def receive(_):
+            token.cancel()
+            raise socket.timeout()
+
+        sock.recv.side_effect = receive
+        with self.assertRaises(engine.OperationCancelled):
+            with engine.cancellation_scope(token):
+                stream.readline()
+        self.assertTrue(stream.closed)
+        sock.close.assert_called_once()
+        sock.settimeout.assert_called_once_with(0.1)
+
     def test_editor_workflows_forward_explicit_session_identity(self):
         project = EditorApiClient(".", port=1234)
         with mock.patch.object(EngineClient, "_from_editor") as connect:
@@ -3433,6 +3536,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
         attached.close()
         self.assertTrue(attached.closed)
         self.assertEqual(self.bridge.engine_instance_id, self.bridge.health()["engine_instance_id"])
+
+    def test_cancellation_releases_held_native_input(self):
+        self.ensure_running_bridge()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with self.bridge.cancellation_scope(token):
+                held = self.bridge.key("SPACE", hold=5, wait="started")
+                token.cancel("stop held input")
+                wait_until(lambda: False)
+        receipt = wait_until(
+            lambda: self.bridge.input.status(held.input_id),
+            predicate=lambda item: item.state in {"cancelled", "released"},
+            timeout=2,
+        )
+        self.assertLess(receipt["actual_duration"], 4)
+        self.assertEqual("released", self.bridge.key("SPACE", wait="released").state)
 
     def test_automation_bridge_api_end_to_end(self):
         previous_port = None

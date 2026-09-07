@@ -32,6 +32,7 @@ from .receipts import ObservationReceipt, ScreenshotReceipt
 from .trace import TraceSession
 from .visual import VisualObservation
 from .waits import WaitTimeoutError, wait_until
+from .cancellation import CancellationToken, OperationCancelled, cancellation_scope
 
 
 def connect(

@@ -462,6 +462,32 @@ with game.pointer((100, 100), lease=10) as pointer:
 
 ## Synchronization and observation
 
+Use a shared cancellation token when a host or another thread may stop an
+operation:
+
+```python
+token = engine.CancellationToken()
+# The controlling thread calls token.cancel("request cancelled").
+try:
+    with game.cancellation_scope(token):
+        game.key("SPACE", hold=5, wait=False)
+        game.wait_for_state("sample.game.ready", True)
+except engine.OperationCancelled as exc:
+    print(exc.reason, exc.cleanup_error)
+```
+
+Create one token per operation and enter the scope in the thread doing the work.
+Polling delays wake when cancelled; in-flight HTTP/profiler requests remain
+bounded by their transport timeouts. `game.cancellation_scope()` requests release
+of that client's queued input on cancellation. `engine.cancellation_scope()` also
+works without a client, including editor bootstrap. It cancels waits, with input
+receipt and Metal capture waits using their existing native cleanup paths.
+Pending commands receive a cancellation request; native code decides whether it
+can be honored. Running Lua callbacks cannot be preempted. Cleanup failures are
+retained in `OperationCancelled.cleanup_error`. Cancellation does not undo
+completed operations or terminate an engine. Use context managers for streams
+and recordings so they close when a scope is interrupted.
+
 Use application events and published state instead of sleeps:
 
 ```python
