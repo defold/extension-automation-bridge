@@ -369,6 +369,14 @@ and output. The wrapper reads `.internal/editor.token` for each call and sends
 it as a bearer token. Missing or rejected credentials raise `CommandError`.
 Bob requests are never automatically retried after an uncertain transport failure.
 
+When a 1.13.2 build result includes a target URL, bootstrap connects to that
+target and validates native health, capabilities, and identity before caching it.
+The current engine transport supports `http://127.0.0.1:PORT` and
+`http://localhost:PORT`. Other targets raise `UnsupportedOperationError`; select
+a local engine in Defold. A reported target never falls back to historical ports
+or triggers an automatic rebuild. Results without a URL continue to use console
+registration and existing recovery behavior, including on Defold 1.13.1.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

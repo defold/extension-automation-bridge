@@ -712,6 +712,7 @@ class Client:
         self._cached_engine_identity = self._read_cached_engine_identity()
         self._remotery_url: Optional[str] = self._read_cached_remotery_url()
         self._last_build_had_engine_service_port: Optional[bool] = None
+        self._last_build_target_port: Optional[int] = None
         self._last_command_result: Optional[BuildResult] = None
         self._lifecycle_events = []
         self._openapi_document: Optional[dict] = None
@@ -1324,6 +1325,8 @@ class Client:
         if command not in {"build", "run", "clean-build"}:
             raise ValueError(f"unsupported desktop build-and-run command: {command}")
         self._require_command(command)
+        self._last_build_target_port = None
+        self._last_build_had_engine_service_port = None
         url = f"{self.base_url}/command/{command}"
         if command == "run" or focus is not None:
             negotiated_focus = self._run_focus(command, focus)
@@ -1345,6 +1348,12 @@ class Client:
             raise
         self._record_lifecycle("editor_build_completed")
 
+        if result.target_url is not None:
+            self._last_build_target_port = self._local_target_port(result.target_url)
+            self._last_build_had_engine_service_port = True
+            self._record_lifecycle("editor_target_reported", port=self._last_build_target_port)
+            return result
+
         try:
             wait_until(
                 lambda: self._has_fresh_endpoint_registration(
@@ -1362,6 +1371,28 @@ class Client:
         self._last_build_had_engine_service_port = self._latest_registration_has_engine_service_port()
         cancellable_sleep(0.2)
         return result
+
+    @staticmethod
+    def _local_target_port(url: str) -> int:
+        """Accept only URLs representable by the IPv4 loopback engine client."""
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+            if (
+                parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}
+                and port is not None and 1 <= port <= 65535
+                and parsed.username is None and parsed.password is None
+                and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+                and not any(char.isspace() for char in url)
+            ):
+                return port
+        except ValueError:
+            pass
+        raise UnsupportedOperationError(
+            "editor returned a target URL unsupported by the local engine client; "
+            "expected http://127.0.0.1:PORT or http://localhost:PORT. "
+            "Select a local engine target in Defold"
+        )
 
     def _console_lines(self) -> list:
         """Return current editor console lines."""

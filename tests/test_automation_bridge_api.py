@@ -1679,6 +1679,104 @@ class EngineClientUnitTest(unittest.TestCase):
             self.assertIs(sentinel, EngineClient._recover_after_stale_build(project, lambda: None, 5, "run", focus=False))
         build.assert_called_once_with("run", timeout=5, focus=False)
 
+    def test_editor_target_urls_must_match_the_local_engine_transport(self):
+        for url in ("http://127.0.0.1:3456", "http://localhost:3456/", "http://LOCALHOST:3456"):
+            self.assertEqual(3456, EditorApiClient._local_target_port(url))
+        for url in ("https://localhost:3456", "http://example.test:3456", "http://127.0.0.2:3456",
+                    "http://[::1]:3456", "http://localhost", "http://localhost:0", "http://localhost:65536",
+                    "http://localhost:bad", "http://localhost:3456/other", "http://user:secret@localhost:3456",
+                    "http://localhost:3456?x=1", "http://localhost:3456#fragment", " http://localhost:3456"):
+            with self.subTest(url=url), self.assertRaisesRegex(editor.UnsupportedOperationError, "local engine client"):
+                EditorApiClient._local_target_port(url)
+
+    def test_editor_reported_target_skips_console_registration_wait_and_resets_on_next_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            payload = {"success": True, "issues": [], "target": {"url": "http://127.0.0.1:3456"}}
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True) as registration, \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, payload)):
+                result = project._build_and_run_command("run")
+                self.assertEqual("http://127.0.0.1:3456", result.target_url)
+                self.assertEqual(3456, project._last_build_target_port)
+                registration.assert_not_called()
+                del payload["target"]
+                project._build_and_run_command("run")
+                self.assertIsNone(project._last_build_target_port)
+                registration.assert_called_once()
+
+    def test_editor_bootstrap_prefers_reported_target_and_preserves_matching_profiler(self):
+        health = {"version": "2", "capabilities": ["runtime.health", "scene"],
+                  "identity": {"engine_instance_id": "engine:new", "project_identity": "project:test"}}
+        for console_port, expected_profiler in ((3456, "ws://127.0.0.1:5555/rmt"), (9876, None)):
+            with self.subTest(console_port=console_port), tempfile.TemporaryDirectory() as root:
+                project = EditorApiClient(root, port=12345)
+                project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+                lines = [f"INFO:ENGINE: Engine service started on port {console_port}",
+                         "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:5555/rmt)",
+                         "INFO:ENGINE: Automation Bridge endpoint registered"]
+                with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=lines), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.client.RuntimeLogs.start"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    bridge = project.build_and_run(required_capabilities=("scene",), client_id="agent-a", session_id="task-1")
+                self.assertEqual(3456, bridge.port)
+                self.assertTrue(bridge.owns_engine)
+                self.assertEqual(expected_profiler, bridge.profiler_url)
+                self.assertEqual("engine:new", bridge.engine_instance_id)
+                self.assertEqual("task-1", bridge.session_info()["session_id"])
+                self.assertEqual(3456, project._cached_engine_identity["port"])
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                build.assert_called_once()
+                bridge.close()
+
+    def test_editor_reported_target_never_falls_back_or_relaunches_after_health_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            project._cached_engine_identity = {"port": 3456, "project_identity": "project:expected"}
+            rejected = [
+                {"version": "2", "identity": {}},
+                {"version": "2", "identity": {"engine_instance_id": "engine:other", "project_identity": "project:other"}},
+            ]
+            for health in rejected:
+                with self.subTest(health=health), \
+                     mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=[]), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch.object(EngineClient, "_recover_after_stale_build") as recover, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    with self.assertRaisesRegex(WaitTimeoutError, "reported target"):
+                        project.build_and_run(timeout=0.002)
+                self.assertTrue(request.called)
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                recover.assert_not_called()
+                build.assert_called_once()
+                self.assertEqual("project:expected", project._cached_engine_identity["project_identity"])
+
+    def test_editor_reported_target_still_requires_native_capabilities(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(EngineClient, "_request", return_value={"version": "2", "capabilities": []}), \
+                 mock.patch("automation_bridge.client.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                with self.assertRaises(UnsupportedCapabilityError):
+                    project.build_and_run(required_capabilities=("scene",))
+            build.assert_called_once()
+
     def test_editor_preferences_catalog_and_custom_paths(self):
         project = EditorApiClient(".", port=12345)
         project._openapi_document = EDITOR_OPENAPI
