@@ -14,14 +14,20 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 import threading
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from .elements import Element
+from .elements import Element, ElementPage, ElementSelector
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
+from .application import ApplicationCatalogPage
+from .cancellation import (
+    CancellationToken, OperationCancelled, cancellation_scope,
+    cancellable_sleep, cancellation_active, check_cancelled,
+)
 
 
 JsonDict = Dict[str, Any]
@@ -33,11 +39,25 @@ _NAMED_KEYS = {
     "BACKSPACE", "INSERT", "DEL", "DELETE", "PAGEUP", "PAGEDOWN", "HOME", "END",
     "LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT", "RALT",
     *(f"F{number}" for number in range(1, 13)),
+    # Punctuation and symbol keys -- every remaining named key in dmHID's Key enum.
+    "EXCLAIM", "QUOTEDBL", "HASH", "DOLLAR", "AMPERSAND", "QUOTE", "LPAREN",
+    "RPAREN", "ASTERISK", "PLUS", "COMMA", "MINUS", "PERIOD", "SLASH", "COLON",
+    "SEMICOLON", "LESS", "EQUALS", "GREATER", "QUESTION", "AT", "LBRACKET",
+    "BACKSLASH", "RBRACKET", "CARET", "UNDERSCORE", "BACKQUOTE", "LBRACE",
+    "PIPE", "RBRACE", "TILDE",
+    # Keypad
+    *(f"KP_{number}" for number in range(10)),
+    "KP_DIVIDE", "KP_MULTIPLY", "KP_SUBTRACT", "KP_ADD", "KP_DECIMAL",
+    "KP_EQUAL", "KP_ENTER", "KP_NUM_LOCK",
+    # Lock/system keys
+    "CAPS_LOCK", "SCROLL_LOCK", "PAUSE", "LSUPER", "RSUPER", "MENU", "BACK",
 }
 _KEY_ERROR = (
-    "key must be A-Z, 0-9, F1-F12, or one of SPACE, ESCAPE, UP, DOWN, LEFT, "
-    "RIGHT, TAB, ENTER, BACKSPACE, INSERT, DELETE, PAGEUP, PAGEDOWN, HOME, END, "
-    "LSHIFT, RSHIFT, LCTRL, RCTRL, LALT, or RALT; an optional KEY_ prefix is accepted"
+    "key must be A-Z, 0-9, F1-F12, a named key from the engine's dmHID Key enum "
+    "(SPACE, ESCAPE, arrows, TAB, ENTER, BACKSPACE, navigation keys, modifiers, "
+    "punctuation/symbol keys such as EQUALS, MINUS, COMMA, PERIOD, SLASH, "
+    "keypad keys such as KP_0-KP_9 and KP_ADD, or lock/system keys such as "
+    "CAPS_LOCK, PAUSE, LSUPER); an optional KEY_ prefix is accepted"
 )
 PYTHON_PACKAGE_VERSION = "3.0.0"
 SUPPORTED_API_VERSION_MIN = 2
@@ -197,18 +217,29 @@ class EngineLogStream:
         if sock is None:
             return b""
         previous_timeout = sock.gettimeout()
+        budget = previous_timeout if timeout is None else timeout
+        deadline = time.monotonic() + budget if budget is not None else None
         timeout_changed = timeout is not None
         if timeout is not None:
             sock.settimeout(timeout)
+        if cancellation_active() and (budget is None or budget > 0.1):
+            sock.settimeout(0.1)
+            timeout_changed = True
         try:
             while True:
+                check_cancelled()
                 newline = self._buffer.find(b"\n")
                 if newline >= 0:
                     line = bytes(self._buffer[: newline + 1])
                     del self._buffer[: newline + 1]
                     return line
 
-                chunk = sock.recv(4096)
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    if cancellation_active() and (deadline is None or time.monotonic() < deadline):
+                        continue
+                    return b""
                 if not chunk:
                     if not self._buffer:
                         self.close()
@@ -358,11 +389,11 @@ class InputController:
         lease: float = 5.0,
     ) -> JsonDict:
         """Acquire/renew control and configure the default exclusive input device."""
-        params = self._bridge._input_params(lease=lease)
-        params["device"] = device
+        json_body = self._bridge._input_json_body(lease=lease)
+        json_body["device"] = device
         if visualize is not None:
-            params["visualize"] = visualize
-        return self._bridge._request("PUT", "/input/configure", json_body=params)
+            json_body["visualize"] = visualize
+        return self._bridge._request("PUT", "/input/configure", json_body=json_body)
 
     def pending(self) -> List[InputReceipt]:
         """Return FIFO-ordered accepted/started input receipts."""
@@ -390,12 +421,14 @@ class InputController:
         if receipt is not None:
             if receipt.state in {"cancelled", "failed"}:
                 raise InputExecutionError(receipt)
-            if state == "accepted" and receipt.state in {"accepted", "started", "released"}:
-                return receipt
         deadline = time.monotonic() + max(0.0, timeout)
         last = receipt
         try:
+            check_cancelled()
+            if receipt is not None and state == "accepted" and receipt.state in {"accepted", "started", "released"}:
+                return receipt
             while True:
+                check_cancelled()
                 if last is None or last.state == "accepted" or state == "released":
                     last = self.status(input_id)
                 if last.state in {"cancelled", "failed"}:
@@ -411,8 +444,8 @@ class InputController:
                         f"input {input_id} did not reach {state!r} within {timeout}s; "
                         f"last state was {last.state!r}"
                     )
-                time.sleep(max(0.0, min(interval, deadline - time.monotonic())))
-        except BaseException:
+                cancellable_sleep(max(0.0, min(interval, deadline - time.monotonic())))
+        except BaseException as interrupted:
             if cancel_on_interrupt:
                 def cleanup() -> None:
                     if flush_on_interrupt:
@@ -422,20 +455,24 @@ class InputController:
 
                 # Keep cleanup failures from replacing the original timeout,
                 # cancellation, KeyboardInterrupt, or API error.
-                _cleanup_without_masking(cleanup)
+                try:
+                    cleanup()
+                except BaseException as cleanup_error:
+                    if isinstance(interrupted, OperationCancelled):
+                        interrupted.cleanup_error = cleanup_error
             raise
 
     def cancel(self, input_id: int, release: bool = True) -> InputReceipt:
         """Request cancellation, releasing active pointer/key state by default."""
-        params = self._bridge._input_params()
-        params.update({"input_id": input_id, "release": release})
-        return InputReceipt(self._bridge._request("POST", "/input/cancel", json_body=params))
+        json_body = self._bridge._input_json_body()
+        json_body.update({"input_id": input_id, "release": release})
+        return InputReceipt(self._bridge._request("POST", "/input/cancel", json_body=json_body))
 
     def flush(self, release: bool = True) -> JsonDict:
         """Cancel this session's active and later queued inputs."""
-        params = self._bridge._input_params()
-        params["release"] = release
-        return self._bridge._request("POST", "/input/flush", json_body=params)
+        json_body = self._bridge._input_json_body()
+        json_body["release"] = release
+        return self._bridge._request("POST", "/input/flush", json_body=json_body)
 
     def interruption_scope(
         self,
@@ -486,8 +523,8 @@ class PointerSession:
         """Append one continuous movement segment without releasing the pointer."""
         self._ensure_open()
         x, y = self._bridge._point(target)
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update(
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update(
             {
                 "input_id": self.input_id,
                 "x": x,
@@ -497,29 +534,29 @@ class PointerSession:
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/move", json_body=params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/move", json_body=json_body))
         return self.receipt
 
     def hold(self, duration: float) -> InputReceipt:
         """Keep the pointer down at its current position for `duration`."""
         self._ensure_open()
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update(
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update(
             {
                 "input_id": self.input_id,
                 "duration": duration,
                 "pointer_lease": self.lease,
             }
         )
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/hold", json_body=params))
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/hold", json_body=json_body))
         return self.receipt
 
     def up(self, wait: Union[str, bool] = "released", timeout: float = 10.0) -> InputReceipt:
         """Request one final up event and optionally wait for native release injection."""
         self._ensure_open()
-        params = self._bridge._input_params(lease=max(5.0, self.lease))
-        params.update({"input_id": self.input_id, "pointer_lease": self.lease})
-        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/up", json_body=params))
+        json_body = self._bridge._input_json_body(lease=max(5.0, self.lease))
+        json_body.update({"input_id": self.input_id, "pointer_lease": self.lease})
+        self.receipt = InputReceipt(self._bridge._request("POST", "/input/pointer/up", json_body=json_body))
         self.closed = True
         if wait:
             target_state = "released" if wait is True else str(wait)
@@ -711,6 +748,9 @@ class Client:
         required_capabilities: Sequence[str] = (),
     ):
         """Create a correlated client for an already-known engine service port."""
+        for name, value in (("client_id", client_id), ("session_id", session_id)):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v2"
@@ -726,6 +766,84 @@ class Client:
         self._active_traces: List[Any] = []
         self._required_capabilities = set(required_capabilities)
         self._last_health: Optional[JsonDict] = None
+        self._owns_engine = False
+        self._project_root: Optional[Path] = None
+        self._closed = False
+
+    @property
+    def owns_engine(self) -> bool:
+        """Whether this client built the engine rather than attaching to it.
+
+        This describes lifecycle intent, not permission. ``close()`` leaves
+        the process running; ``close_engine()`` explicitly exits it, including
+        when deliberately called on an attached client.
+        """
+        return self._owns_engine
+
+    @property
+    def closed(self) -> bool:
+        """Whether this client's local resources have been released."""
+        return self._closed
+
+    def session_info(self) -> JsonDict:
+        """Return session identity and lifecycle ownership without native requests."""
+        return {
+            "client_id": self.client_id,
+            "session_id": self.session_id,
+            "engine_instance_id": self.engine_instance_id,
+            "project_path": str(self._project_root) if self._project_root else None,
+            "port": self.port,
+            "owns_engine": self.owns_engine,
+            "closed": self.closed,
+        }
+
+    def close(self) -> None:
+        """Release the background collector without sending native mutations.
+
+        Closing is idempotent and prevents further requests through this client.
+        Explicit streams and captures retain their own context-manager lifecycle.
+        Use ``input.flush()`` before closing to cancel this session's input, and
+        ``close_engine()`` only when engine termination is intended.
+        """
+        if not self._closed:
+            self._logs.close()
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise AutomationBridgeError("engine client is closed; reconnect to continue")
+
+    @contextmanager
+    def cancellation_scope(self, token: CancellationToken):
+        """Cancel waits and request release of this session's input on cancellation.
+
+        One token belongs to one operation. Use separate clients/identities for
+        independent operations; cleanup only targets this client's native lease.
+        A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
+        """
+        entered = False
+        try:
+            with cancellation_scope(token):
+                entered = True
+                yield token
+        except OperationCancelled as exc:
+            if entered:
+                try:
+                    self.input.flush(release=True)
+                except Exception as cleanup_error:
+                    if exc.cleanup_error is None:
+                        exc.cleanup_error = cleanup_error
+            raise
+
+    def __enter__(self) -> "Client":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            _cleanup_without_masking(self.close)
 
     @property
     def input(self) -> InputController:
@@ -744,58 +862,143 @@ class Client:
         build_command: Optional[str] = None,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        focus: Optional[bool] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
+        check_cancelled()
         fresh_build = build_command is not None
+        session_identity = {key: value for key, value in (("client_id", client_id), ("session_id", session_id)) if value is not None}
+        for name, value in session_identity.items():
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
-            time.sleep(0.5)
-            editor._build_and_run_command(build_command, timeout=timeout)
+            cancellable_sleep(0.5)
+            editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
+
+        def connect_candidate(
+            service_port: int,
+            profiler_url: Optional[str],
+            *,
+            registration_is_authoritative: bool,
+            require_cached_identity_match: bool = False,
+            require_target_identity: bool = False,
+        ) -> Optional["Client"]:
+            try:
+                bridge = cls(
+                    service_port,
+                    profiler_url=profiler_url,
+                    required_capabilities=required_capabilities,
+                    **session_identity,
+                )
+                health = bridge.health()
+                if require_target_identity:
+                    identity = health.get("identity", {})
+                    if not isinstance(identity, Mapping) or any(
+                        not isinstance(identity.get(key), str) or not identity[key]
+                        for key in ("engine_instance_id", "project_identity")
+                    ):
+                        raise AutomationBridgeError("reported build target did not provide an engine and project identity")
+                if not editor._validate_cached_engine_health(
+                    service_port,
+                    health,
+                    fresh_build=fresh_build or registration_is_authoritative,
+                ):
+                    if require_target_identity:
+                        raise AutomationBridgeError("reported build target identity does not match the cached project")
+                    return None
+                if require_cached_identity_match and not editor._cached_engine_health_matches(
+                    service_port,
+                    health,
+                ):
+                    return None
+            except (IncompatibleApiVersionError, UnsupportedCapabilityError):
+                raise
+            except AutomationBridgeError:
+                if require_target_identity:
+                    raise
+                return None
+            identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
+            editor._remember_engine_service_port(
+                service_port,
+                identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
+                identity.get("project_identity") if isinstance(identity, Mapping) else None,
+                identity.get("process_id") if isinstance(identity, Mapping) else None,
+            )
+            editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
+            lifecycle = health.get("lifecycle", {})
+            if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
+                editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
+            if profiler_url:
+                editor._remember_remotery_url(profiler_url)
+            bridge.logs.start()
+            bridge._owns_engine = fresh_build
+            bridge._project_root = Path(editor.root)
+            return bridge
+
+        if not fresh_build:
+            cached_port = editor._cached_engine_service_port_value()
+            if cached_port is not None:
+                cached_bridge = connect_candidate(
+                    cached_port,
+                    editor._cached_remotery_url_value(),
+                    registration_is_authoritative=False,
+                    require_cached_identity_match=True,
+                )
+                if cached_bridge is not None:
+                    return cached_bridge
 
         def bridge_after_build() -> Optional["Client"]:
-            service_ports = editor._engine_service_ports()
-            registration_ports = editor._current_registration_engine_service_ports()
-            profiler_url = cls._editor_profiler_url(editor, fresh_build=fresh_build)
-            for service_port in service_ports:
-                if not service_port:
-                    continue
-                try:
-                    bridge = cls(
-                        service_port,
-                        profiler_url=profiler_url,
-                        required_capabilities=required_capabilities,
-                    )
-                    health = bridge.health()
-                    registration_is_authoritative = service_port in registration_ports
-                    if not editor._validate_cached_engine_health(
-                        service_port,
-                        health,
-                        fresh_build=fresh_build or registration_is_authoritative,
-                    ):
-                        continue
-                except (IncompatibleApiVersionError, UnsupportedCapabilityError):
-                    raise
-                except AutomationBridgeError:
-                    continue
-                identity = health.get("identity", {}) if isinstance(health, Mapping) else {}
-                editor._remember_engine_service_port(
-                    service_port,
-                    identity.get("engine_instance_id") if isinstance(identity, Mapping) else None,
-                    identity.get("project_identity") if isinstance(identity, Mapping) else None,
-                    identity.get("process_id") if isinstance(identity, Mapping) else None,
+            target_port = editor._last_build_target_port if fresh_build else None
+            if target_port is not None:
+                bridge = connect_candidate(
+                    target_port, None,
+                    registration_is_authoritative=True,
+                    require_target_identity=True,
                 )
-                editor._record_lifecycle("bridge_healthy", engine_instance_id=bridge.engine_instance_id)
-                lifecycle = health.get("lifecycle", {})
-                if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
-                    editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
-                if profiler_url:
-                    editor._remember_remotery_url(profiler_url)
-                bridge.logs.start()
+                if bridge is not None:
+                    # The engine URL is authoritative; console metadata is optional.
+                    try:
+                        console_lines = editor._console_lines()
+                        if target_port in editor._current_registration_engine_service_ports(console_lines):
+                            profiler_url = cls._editor_profiler_url(editor, fresh_build=True, console_lines=console_lines)
+                            if profiler_url:
+                                bridge._remotery_url = profiler_url
+                                editor._remember_remotery_url(profiler_url)
+                    except AutomationBridgeError:
+                        pass
                 return bridge
+            console_lines = editor._console_lines()
+            service_ports = editor._engine_service_ports(console_lines)
+            registration_ports = editor._current_registration_engine_service_ports(console_lines)
+            profiler_url = cls._editor_profiler_url(
+                editor,
+                fresh_build=fresh_build,
+                console_lines=console_lines,
+            )
+            for service_port in service_ports:
+                bridge = connect_candidate(
+                    service_port,
+                    profiler_url,
+                    registration_is_authoritative=service_port in registration_ports,
+                )
+                if bridge is not None:
+                    return bridge
             return None
 
+        if fresh_build and editor._last_build_target_port is not None:
+            # Do not try historical ports or relaunch after an explicit target.
+            return cls._wait_for_bridge(
+                bridge_after_build,
+                timeout=timeout,
+                message="Automation Bridge did not become healthy at the editor's reported target",
+                retry_exceptions=(AutomationBridgeError,),
+            )
+
         if fresh_build and cls._last_build_missing_engine_service_port(editor):
-            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
         try:
             return cls._wait_for_bridge(
@@ -808,7 +1011,7 @@ class Client:
             if not fresh_build:
                 raise
 
-        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
     @classmethod
     def _recover_after_stale_build(
@@ -817,12 +1020,14 @@ class Client:
         bridge_after_build: Any,
         timeout: float,
         build_command: Optional[str],
+        *,
+        focus: Optional[bool] = None,
     ) -> "Client":
         if build_command is None:
             raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
-        time.sleep(0.5)
-        editor._build_and_run_command(build_command, timeout=timeout)
+        cancellable_sleep(0.5)
+        editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
         return cls._wait_for_bridge(
             bridge_after_build,
             timeout=timeout,
@@ -844,6 +1049,7 @@ class Client:
         last_error: Optional[BaseException] = None
         attempts = 0
         while time.monotonic() < deadline:
+            check_cancelled()
             attempts += 1
             try:
                 bridge = probe()
@@ -853,7 +1059,7 @@ class Client:
                 raise
             except retry_exceptions as exc:
                 last_error = exc
-            time.sleep(0.1)
+            cancellable_sleep(0.1)
         error = WaitTimeoutError(
             message,
             last_value=None,
@@ -871,11 +1077,21 @@ class Client:
         return editor._last_build_had_engine_service_port is False
 
     @staticmethod
-    def _editor_profiler_url(editor: Any, fresh_build: bool) -> Optional[str]:
+    def _editor_profiler_url(
+        editor: Any,
+        fresh_build: bool,
+        console_lines: Optional[list] = None,
+    ) -> Optional[str]:
         if fresh_build:
-            urls = editor._current_registration_remotery_urls()
+            urls = (
+                editor._current_registration_remotery_urls()
+                if console_lines is None
+                else editor._current_registration_remotery_urls(console_lines)
+            )
             return urls[0] if urls else None
-        return editor._remotery_url_value()
+        if console_lines is None:
+            return editor._remotery_url_value()
+        return editor._remotery_url_value(console_lines)
 
     def wait_ready(
         self,
@@ -898,10 +1114,23 @@ class Client:
         path: str,
         *,
         params: Optional[Mapping[str, Any]] = None,
+        json_body: Optional[Mapping[str, Any]] = None,
         json: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
-        """Call a raw Automation Bridge path and return its ``data`` object."""
-        return self._request(method.upper(), path, params, json_body=json)
+        """Call a raw Automation Bridge path and return its ``data`` object.
+
+        ``params`` are encoded into the URL. Use ``json_body`` for ``POST`` and
+        ``PUT`` payloads so they are not constrained by Defold's request-resource
+        limit. ``json`` is retained as a compatibility alias for ``json_body``.
+        """
+        if json_body is not None and json is not None:
+            raise ValueError("request accepts either json_body or its json compatibility alias, not both")
+        return self._request(
+            method.upper(),
+            path,
+            params,
+            json_body=json_body if json_body is not None else json,
+        )
 
     def health(self) -> JsonDict:
         """Return and validate API version, capabilities, identity, and backend data."""
@@ -941,6 +1170,18 @@ class Client:
     def supports(self, capability: str) -> bool:
         """Return whether the endpoint satisfies one capability declaration."""
         return self._capability_satisfies(capability, self._capability_versions(self.health()))
+
+    def _require_cached_capability(self, capability: str) -> None:
+        """Require one feature, reusing bootstrap health when it is available."""
+        health = self._last_health if isinstance(self._last_health, Mapping) else self.health()
+        versions = self._capability_versions(health)
+        if self._capability_satisfies(capability, versions):
+            return
+        backend = health.get("backend", {})
+        raise UnsupportedCapabilityError(
+            f"required Automation Bridge capability is unavailable or too old: {capability}; "
+            f"available={', '.join(sorted(versions)) or 'none'}; backend={backend!r}"
+        )
 
     def trace_metadata(self) -> JsonDict:
         """Return stable metadata to embed in trace bundles and CI artifacts."""
@@ -1024,27 +1265,55 @@ class Client:
         return self._request("GET", "/scene", params)
 
     def elements(self, **selector: Any) -> List[Element]:
-        """Return one server-filtered page of inspectable scene elements."""
+        """Return one page of elements; see ``engine.ElementSelector`` for filters.
+
+        The default limit is 50. Use ``elements_page()`` to retain the native
+        match count, continuation cursor and snapshot metadata, or ``count()``
+        when only the complete match count is required.
+        """
         elements, _, _ = self._select_elements(selector)
         return elements
 
+
+    def elements_page(self, **selector: Any) -> ElementPage:
+        """Return elements and their native pagination and snapshot metadata.
+
+        Accepts the same ``engine.ElementSelector`` keywords as ``elements()``.
+        Keep filters unchanged when passing ``page.next_cursor`` as ``cursor``.
+        A later page can describe a newer frame; it is not an atomic scene dump.
+        """
+        self._validate_selector(selector)
+        self._require_cached_capability("scene.pagination")
+        data = self._request("GET", "/elements", self._server_params(selector, selector.get("limit", 50)))
+        return ElementPage.from_raw(data)
+
+
     def element(self, **selector: Any) -> Element:
-        """Return exactly one matching element or raise `SelectorError`."""
+        """Return exactly one matching element or raise ``SelectorError``.
+
+        Uses ``engine.ElementSelector`` filters. Pagination options cannot make
+        an ambiguous selector unique; use exact names or automation IDs.
+        """
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) == 1:
+        if len(elements) == 1 and metadata.get("matched", len(elements)) == 1:
             return elements[0]
         error = SelectorError(self._selector_error("expected exactly one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
 
+
     def maybe_element(self, **selector: Any) -> Optional[Element]:
         """Return zero or one matching element, raising if multiple elements match."""
         elements, metadata, selector_text = self._select_elements(selector)
-        if len(elements) <= 1:
-            return elements[0] if elements else None
+        matched = metadata.get("matched", len(elements))
+        if matched == 0:
+            return None
+        if len(elements) == 1 and matched == 1:
+            return elements[0]
         error = SelectorError(self._selector_error("expected zero or one element", selector, selector_text, elements, metadata))
         self._trace_record("selector_error", {"selector": selector, "error": str(error)})
         raise error
+
 
     def element_by_id(
         self,
@@ -1087,23 +1356,35 @@ class Client:
         timeout: float = 5.0,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Queue one FIFO click and optionally wait for the native release receipt."""
+        """Queue one FIFO click and optionally wait for the native release receipt.
+
+        ``modifiers`` holds up to four keys as a chord for the whole click (e.g.
+        ``"LSHIFT"`` for shift-click): pressed one update before the pointer goes
+        down and released one update after it comes up, so bindings that track the
+        modifier's own key trigger observe the same ordering a human chord produces.
+        """
+        check_cancelled()
         if isinstance(target, Element):
-            params: Dict[str, Any] = {"id": target.id}
+            json_body: Dict[str, Any] = {"id": target.id}
             if target.logical_id:
-                params["expected_logical_id"] = target.logical_id
+                json_body["expected_logical_id"] = target.logical_id
         elif isinstance(target, str):
-            params = {"id": target}
+            json_body = {"id": target}
         else:
             x_value, y_value = self._point(target, y)
-            params = {"x": x_value, "y": y_value}
+            json_body = {"x": x_value, "y": y_value}
 
-        params.update(self._input_params())
-        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        json_body.update(self._input_json_body())
+        json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if pointer_id:
-            params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self._request("POST", "/input/click", json_body=params))
+            json_body["pointer_id"] = pointer_id
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
+        receipt = InputReceipt(self._request("POST", "/input/click", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1124,35 +1405,46 @@ class Client:
         timeout: Optional[float] = None,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing."""
+        """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing.
+
+        ``modifiers`` holds up to four keys as a chord for the whole drag (e.g.
+        ``"LCTRL"`` for ctrl-drag), pressed one update before the pointer goes down
+        and released one update after the final up.
+        """
+        check_cancelled()
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
-            params: Dict[str, Any] = {
+            json_body: Dict[str, Any] = {
                 "from_id": self._element_id(from_target),
                 "to_id": self._element_id(to_target),
                 "duration": duration,
             }
             if isinstance(from_target, Element) and from_target.logical_id:
-                params["expected_from_logical_id"] = from_target.logical_id
+                json_body["expected_from_logical_id"] = from_target.logical_id
             if isinstance(to_target, Element) and to_target.logical_id:
-                params["expected_to_logical_id"] = to_target.logical_id
+                json_body["expected_to_logical_id"] = to_target.logical_id
         else:
             x1, y1 = self._point(from_target)
             x2, y2 = self._point(to_target)
-            params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
+            json_body = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "duration": duration}
 
         controller_lease = min(60.0, max(5.0, duration + hold_before + hold_after + 2.0))
-        params.update(self._input_params(lease=controller_lease))
-        params.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
+        json_body.update(self._input_json_body(lease=controller_lease))
+        json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if easing != "linear":
-            params["easing"] = easing
+            json_body["easing"] = easing
         if hold_before:
-            params["hold_before"] = hold_before
+            json_body["hold_before"] = hold_before
         if hold_after:
-            params["hold_after"] = hold_after
+            json_body["hold_after"] = hold_after
         if pointer_id:
-            params["pointer_id"] = pointer_id
-        receipt = InputReceipt(self._request("POST", "/input/drag", json_body=params))
+            json_body["pointer_id"] = pointer_id
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
+        receipt = InputReceipt(self._request("POST", "/input/drag", json_body=json_body))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1177,8 +1469,14 @@ class Client:
         timeout: Optional[float] = None,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Run one down/path/up gesture with native segment timing, easing, holds, and curves."""
+        """Run one down/path/up gesture with native segment timing, easing, holds, and curves.
+
+        ``modifiers`` holds up to four keys as a chord for the whole gesture, pressed
+        one update before the pointer goes down and released one update after the up.
+        """
+        check_cancelled()
         normalized_points = [self._point(point) for point in points]
         if path not in {"sampled", "linear", "quadratic", "cubic"}:
             raise ValueError("path must be sampled, linear, quadratic, or cubic")
@@ -1200,8 +1498,8 @@ class Client:
         easing_values = [easing] * expected_segments if isinstance(easing, str) else list(easing)
         if len(easing_values) != expected_segments or any(value not in _INPUT_EASINGS for value in easing_values):
             raise ValueError(f"drag_path requires {expected_segments} supported easing values")
-        params = self._input_params(lease=min(60.0, max(5.0, total_duration + 2.0)))
-        params.update(
+        json_body = self._input_json_body(lease=min(60.0, max(5.0, total_duration + 2.0)))
+        json_body.update(
             {
                 "points": ";".join(f"{x},{y}" for x, y in normalized_points),
                 "durations": ",".join(str(value) for value in duration_values),
@@ -1215,7 +1513,11 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=params))
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
+        receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=json_body))
         return self._wait_input_compat(
             receipt,
             wait,
@@ -1232,14 +1534,20 @@ class Client:
         device: Optional[str] = None,
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> PointerSession:
-        """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup."""
+        """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup.
+
+        ``modifiers`` holds up to four keys as a chord for the whole session, pressed
+        one update before the pointer goes down and released one update after the up.
+        """
+        check_cancelled()
         lease = self._input_duration(lease, "lease")
         if lease <= 0:
             raise ValueError("lease must be greater than zero")
         x, y = self._point(start)
-        params = self._input_params(lease=max(5.0, lease))
-        params.update(
+        json_body = self._input_json_body(lease=max(5.0, lease))
+        json_body.update(
             {
                 "x": x,
                 "y": y,
@@ -1250,7 +1558,11 @@ class Client:
                 "expected_scene_sequence": expected_scene_sequence,
             }
         )
-        receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=params))
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
+        receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=json_body))
         return PointerSession(self, receipt, lease)
 
     def type_text(
@@ -1263,9 +1575,10 @@ class Client:
         flush_on_interrupt: bool = False,
     ) -> InputReceipt:
         """Queue FIFO text input and optionally wait for native completion."""
-        params = self._input_params()
-        params.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
+        check_cancelled()
+        json_body = self._input_json_body()
+        json_body.update({"text": text, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1278,12 +1591,34 @@ class Client:
         timeout: float = 10.0,
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
+        hold: float = 0.0,
+        modifiers: Optional[Union[str, Sequence[str]]] = None,
     ) -> InputReceipt:
-        """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``."""
+        """Queue one FIFO special key, accepting names such as ``M``, ``SPACE``, or ``KEY_ENTER``.
+
+        ``modifiers`` holds up to four keys as a chord across the press (e.g.
+        ``key("Z", modifiers="LCTRL")`` for ctrl-Z), pressed one update before the
+        key and released one update after it; composes with ``hold``.
+
+        ``hold`` keeps the key pressed for that many seconds (``0..60``, default
+        ``0`` -- a single-update tap) before releasing it, producing the same
+        continuous per-frame actions a physically held key generates. When
+        waiting on a long hold, raise ``timeout`` above the hold duration.
+        """
+        check_cancelled()
+        hold = self._input_duration(hold, "hold")
         keys = f"{{{self._normalize_key(key)}}}"
-        params = self._input_params()
-        params.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
-        receipt = InputReceipt(self._request("POST", "/input/key", json_body=params))
+        if hold > 0.0:
+            self._require_cached_capability("input.key>=2")
+        json_body = self._input_json_body()
+        json_body.update({"keys": keys, "expected_scene_sequence": expected_scene_sequence})
+        if hold > 0.0:
+            json_body["hold"] = hold
+        normalized_modifiers = self._normalize_modifiers(modifiers)
+        if normalized_modifiers is not None:
+            self._require_cached_capability("input.modifiers")
+            json_body["modifiers"] = normalized_modifiers
+        receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -1345,6 +1680,7 @@ class Client:
         matching value must not satisfy a wait for a *new* publication.
         ``state_name`` disambiguates a path before that state has first appeared.
         """
+        check_cancelled()
         snapshot = self.states()
         entries = [item for item in snapshot.get("states", []) if isinstance(item, Mapping)]
         current_revision = int(snapshot.get("revision", 0))
@@ -1354,6 +1690,7 @@ class Client:
         cursor = current_revision if after_revision is None else int(after_revision)
         deadline = time.monotonic() + timeout
         while True:
+            check_cancelled()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 observed = selected.value if selected is not None else "<unpublished>"
@@ -1362,6 +1699,8 @@ class Client:
                     f"last value={observed!r}, revision={cursor}"
                 )
             safe_wait = min(remaining, max(0.0, float(self.timeout) - 0.1), 1.0)
+            if cancellation_active():
+                safe_wait = min(safe_wait, 0.1)
             changed = self._request(
                 "GET", "/state/wait",
                 {"after_revision": cursor, "timeout_ms": int(safe_wait * 1000), "name": state_name},
@@ -1374,16 +1713,56 @@ class Client:
                 if candidate.value == expected and candidate.revision > (after_revision or 0):
                     return candidate
 
+    def application_catalog(
+        self,
+        *,
+        kind: Optional[str] = None,
+        name: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+    ) -> ApplicationCatalogPage:
+        """Discover application commands, states, events, and their contracts.
+
+        Requires ``application.catalog``. ``kind`` is command, state, or event;
+        ``name`` filters an exact name. All registered commands and published
+        states are listed, including those without metadata. Unpublished states
+        and events appear after Lua ``automation_bridge.describe()`` declarations.
+        Schemas are descriptive metadata and do not enforce payload validation.
+
+        ``limit`` is 0-100 (zero requests only the match count). Pass the returned
+        string ``next_cursor`` with the same filters to continue. Cursor takes
+        precedence over ``offset``; both must be valid unsigned 32-bit values.
+        Restart pagination if the catalog revision or engine identity changes.
+        """
+        if kind is not None and kind not in ("command", "state", "event"):
+            raise ValueError("kind must be command, state, or event")
+        if name is not None and (not isinstance(name, str) or not name or "\0" in name or len(name.encode("utf-8")) > 128):
+            raise ValueError("name must be a non-empty string of at most 128 UTF-8 bytes")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 100:
+            raise ValueError("limit must be an integer from 0 through 100")
+        pagination = {"limit": limit, "offset": offset, "cursor": cursor}
+        self._validate_selector(pagination)
+        self._require_cached_capability("application.catalog")
+        data = self._request("GET", "/application/catalog", {"kind": kind, "name": name, **pagination})
+        return ApplicationCatalogPage.from_raw(data)
+
     def start_command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Submit a registered named Lua command and return its pending id."""
+        check_cancelled()
         if timeout <= 0 or timeout > 300:
             raise ValueError("command timeout must be greater than 0 and at most 300 seconds")
         payload = json.dumps({} if data is None else data, allow_nan=False, separators=(",", ":"))
         if len(payload.encode("utf-8")) > 32768:
             raise ValueError("command JSON payload exceeds 32768 bytes")
         return self._request(
-            "POST", "/commands",
-            {"name": name, "data": payload, "timeout_ms": max(1, int(timeout * 1000))},
+            "POST",
+            "/commands",
+            json_body={
+                "name": name,
+                "data": payload,
+                "timeout_ms": max(1, int(timeout * 1000)),
+            },
         )
 
     def command_status(self, command_id: int) -> JsonDict:
@@ -1395,10 +1774,28 @@ class Client:
         return self._request("DELETE", "/commands", {"id": int(command_id)})
 
     def wait_for_command(self, command_id: int, timeout: float = 30.0, interval: float = 0.02) -> JsonDict:
-        """Wait for a command result, cancelling a still-pending command on timeout."""
+        """Wait for completion, requesting pending-command cancellation on interruption.
+
+        Running Lua callbacks cannot be preempted. A failed native cancellation
+        is preserved as ``OperationCancelled.cleanup_error``.
+        """
+        try:
+            return self._wait_for_command(command_id, timeout, interval)
+        except OperationCancelled as exc:
+            try:
+                self.cancel_command(command_id)
+            except Exception as cleanup_error:
+                exc.cleanup_error = cleanup_error
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            _cleanup_without_masking(lambda: self.cancel_command(command_id))
+            raise
+
+    def _wait_for_command(self, command_id: int, timeout: float, interval: float) -> JsonDict:
         deadline = time.monotonic() + timeout
         terminal = {"completed", "failed", "cancelled", "timed_out"}
         while True:
+            check_cancelled()
             status = self.command_status(command_id)
             if status.get("state") in terminal:
                 return status
@@ -1410,7 +1807,7 @@ class Client:
                 except AutomationBridgeError as exc:
                     cancellation_error = exc
                 raise CommandTimeout(command_id, timeout, cancellation_error) from cancellation_error
-            time.sleep(min(interval, remaining))
+            cancellable_sleep(min(interval, remaining))
 
     def command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Run a registered command and return its terminal result record."""
@@ -1435,8 +1832,13 @@ class Client:
         if recording_timestamp_us is None:
             recording_timestamp_us = time.monotonic_ns() // 1000
         return self._request(
-            "POST", "/markers",
-            {"name": name, "data": payload, "recording_timestamp_us": int(recording_timestamp_us)},
+            "POST",
+            "/markers",
+            json_body={
+                "name": name,
+                "data": payload,
+                "recording_timestamp_us": int(recording_timestamp_us),
+            },
         )
 
     def screenshot(
@@ -1448,6 +1850,7 @@ class Client:
         retry_exceptions: RetryExceptions = (),
     ) -> ScreenshotReceipt:
         """Capture a PNG, optionally returning a lower-resolution derived image."""
+        check_cancelled()
         if not isinstance(after_frames, int) or after_frames < 0 or after_frames > 600:
             raise ValueError("after_frames must be an integer from 0 through 600")
         if resolution_multiplier is not None:
@@ -1638,6 +2041,7 @@ class Client:
 
     def resize(self, width: int, height: int, wait: float = 0.25) -> JsonDict:
         """Request a resize and return requested, window, viewport, and outcome data."""
+        check_cancelled()
         _validate_screen_size(width, height)
         capabilities = self.health().get("capabilities", [])
         if not isinstance(capabilities, (list, tuple, set)) or "screen.resize" not in capabilities:
@@ -1654,7 +2058,7 @@ class Client:
                 window = screen.get("window")
                 if isinstance(window, Mapping) and window.get("width") == width and window.get("height") == height:
                     break
-                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+                cancellable_sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         window = screen.get("window") if isinstance(screen, Mapping) else None
         observed_width = None
         observed_height = None
@@ -1715,6 +2119,7 @@ class Client:
 
     def reboot(self, *args: str, wait: bool = True, timeout: Optional[float] = None) -> None:
         """Reboot the engine through `/post/@system/reboot` with up to six command-line args."""
+        check_cancelled()
         payload = _encode_system_reboot(args)
         self._post_engine_message("/post/@system/reboot", payload, timeout=timeout)
         self._last_window_size = None
@@ -1724,6 +2129,13 @@ class Client:
 
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
+        self._ensure_open()
+        try:
+            self._close_engine(timeout)
+        finally:
+            self.close()
+
+    def _close_engine(self, timeout: float) -> None:
         self._logs.close()
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
         try:
@@ -1760,7 +2172,7 @@ class Client:
                 self.health()
             except AutomationBridgeError:
                 return True
-            time.sleep(0.05)
+            cancellable_sleep(0.05)
         return False
 
     def _wait_ready_after_reboot(self, timeout: float) -> JsonDict:
@@ -1782,7 +2194,7 @@ class Client:
             remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 break
-            time.sleep(min(0.05, remaining))
+            cancellable_sleep(min(0.05, remaining))
 
         try:
             data = self.health()
@@ -2057,6 +2469,18 @@ class Client:
             message=f"element did not disappear: {element_id}",
         )
 
+    @staticmethod
+    def _api_error_status(error: Mapping[str, Any], transport_status: int) -> int:
+        """Prefer a valid logical error status over its compatible transport fallback."""
+        logical_status = error.get("status")
+        if (
+            isinstance(logical_status, int)
+            and not isinstance(logical_status, bool)
+            and 400 <= logical_status <= 599
+        ):
+            return logical_status
+        return transport_status
+
     def _request(
         self,
         method: str,
@@ -2065,6 +2489,7 @@ class Client:
         json_body: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
         url = self.base_url + path
+        self._ensure_open()
         encoded_params = self._encoded_params(params)
         if encoded_params:
             url += "?" + urllib.parse.urlencode(encoded_params)
@@ -2082,6 +2507,7 @@ class Client:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
+            status = self._api_error_status(error, status)
             request_trace.update({"status": status, "error": response})
             self._trace_record("action" if path.startswith("/input/") else "request_error", request_trace)
             error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
@@ -2093,6 +2519,7 @@ class Client:
         return data
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        self._ensure_open()
         url = self.base_url + path
         compact_payload = {key: value for key, value in payload.items() if value is not None}
         data = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -2107,22 +2534,23 @@ class Client:
             error = response.get("error", {})
             code = str(error.get("code", "unknown"))
             message = str(error.get("message", response))
+            status = self._api_error_status(error, status)
             error_type = StaleElementError if code == "stale_element" else AutomationBridgeApiError
             raise error_type(code, message, status, response)
         data = response.get("data", {})
         self._remember_scene_sequence(data)
         return data
 
-    def _input_params(self, lease: float = 5.0) -> Dict[str, Any]:
+    def _input_json_body(self, lease: float = 5.0) -> Dict[str, Any]:
         """Return ownership and per-request correlation fields for mutating input calls."""
-        params: Dict[str, Any] = {
+        json_body: Dict[str, Any] = {
             "client_id": self.client_id,
             "session_id": self.session_id,
             "request_id": f"r-{uuid.uuid4().hex[:12]}",
         }
         if lease != 5.0:
-            params["lease"] = lease
-        return params
+            json_body["lease"] = lease
+        return json_body
 
     def _wait_input_compat(
         self,
@@ -2175,11 +2603,24 @@ class Client:
             return f"KEY_{name}"
         raise ValueError(_KEY_ERROR)
 
+    @classmethod
+    def _normalize_modifiers(cls, modifiers: Optional[Union[str, Sequence[str]]]) -> Optional[str]:
+        """Normalize chord modifiers into the wire format (comma-separated ``KEY_`` names)."""
+        if modifiers is None:
+            return None
+        names = [modifiers] if isinstance(modifiers, str) else list(modifiers)
+        if len(names) == 0:
+            raise ValueError("modifiers must name at least one key")
+        if len(names) > 4:
+            raise ValueError("at most 4 modifiers are supported")
+        return ",".join(cls._normalize_key(name) for name in names)
+
     def _trace_record(self, kind: str, payload: Any) -> None:
         for trace in tuple(self._active_traces):
             trace.record(kind, payload)
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
+        self._ensure_open()
         url = f"http://127.0.0.1:{self.port}{path}"
         status, body = request_bytes(url, payload, timeout=self.timeout if timeout is None else timeout)
         if status < 200 or status >= 300:
@@ -2269,6 +2710,22 @@ class Client:
         unknown = set(selector) - self._SELECTOR_KEYS
         if unknown:
             raise TypeError(f"unknown element selector keys: {', '.join(sorted(unknown))}")
+        boolean_keys = {"enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive"}
+        for key, value in selector.items():
+            if value is None:
+                continue
+            if key in boolean_keys:
+                if not isinstance(value, bool):
+                    raise TypeError(f"{key} must be a bool")
+            elif key in {"limit", "offset"}:
+                maximum = 500 if key == "limit" else 0xFFFFFFFF
+                if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+                    raise ValueError(f"{key} must be an integer from 0 through {maximum}")
+            elif key == "cursor":
+                if not isinstance(value, str) or not value.isascii() or not value.isdigit() or int(value) > 0xFFFFFFFF:
+                    raise ValueError("cursor must be an unsigned decimal continuation string")
+            elif key != "include" and not isinstance(value, str):
+                raise TypeError(f"{key} must be a string")
 
     def _has_client_filters(self, selector: Mapping[str, Any]) -> bool:
         return any(selector.get(key) is not None for key in self._CLIENT_FILTERS)

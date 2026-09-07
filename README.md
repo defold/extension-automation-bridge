@@ -8,6 +8,18 @@ annotations, and input acknowledgements.
 
 ## Installation
 
+To install the matching Python wrapper without manually copying files, first
+Fetch Libraries in the target project, then run the installer from an extension
+checkout:
+
+```sh
+python3 automation_bridge/automation-bridge-python/install.py /absolute/path/to/game
+```
+
+The installer uses that game's fetched dependency archive, requires no editor
+connection or `PYTHONPATH`, and leaves `game.project` unchanged. It replaces the
+managed wrapper directory as a unit; keep your scripts outside that directory.
+
 After Defold has fetched the extension into your project, copy the
 `automation-bridge-python` directory from the extension into your project root.
 When you update the extension, update the copied Python helper directory at the
@@ -36,9 +48,24 @@ application_api = 1
 
 ## Documentation
 
+Diagnose setup without launching, building, or changing the project:
+
+```python
+from automation_bridge import editor
+
+report = editor.doctor(".", required_capabilities=("elements", "input.click"))
+for check in report.checks:
+    print(check.name, check.status, check.message, check.action or "")
+```
+
+`report.ready` requires a compatible running engine. `report.as_dict()` provides
+JSON-serializable evidence, including independently reported Python and native
+versions and runtime capabilities.
+
 - Native extension endpoint reference: [`automation_bridge/`](automation_bridge/README.md)
 - Dependency-free Python helpers for editor bootstrap, element queries, input gestures, race-free events/state/commands, semantic annotations, timeline markers, waits, screenshots, Metal GPU traces, and diagnostics: [`automation_bridge/automation-bridge-python/`](automation_bridge/automation-bridge-python/README.md)
 - Portable Agent Plugin and MCP server for Codex and other Agent Plugins clients: [`plugins/automation-bridge/`](plugins/automation-bridge/README.md)
+- Development constraints and regression-prevention rationale: [`DEVELOPMENT.md`](DEVELOPMENT.md)
 
 The repository-local marketplace is declared in
 `.agents/plugins/marketplace.json`. The plugin bundles the Python wrapper, so a

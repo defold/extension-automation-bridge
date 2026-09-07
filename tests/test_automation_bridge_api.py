@@ -18,6 +18,8 @@ import zlib
 from pathlib import Path
 from unittest import mock
 
+from tests.editor_http_fixture import EditorHttpFixture
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "automation_bridge" / "automation-bridge-python"))
@@ -44,7 +46,7 @@ from automation_bridge.engine import (  # noqa: E402
 EngineClient = engine.Client
 EditorApiClient = editor.Client
 InstallationType = editor.Installation
-from automation_bridge.client import EngineLogStream, _encode_system_reboot  # noqa: E402
+from automation_bridge.client import EngineLogStream, _encode_system_reboot, request_json  # noqa: E402
 from automation_bridge.profiler import (  # noqa: E402
     ProfilerCapture,
     ProfilerConnection,
@@ -61,7 +63,8 @@ from automation_bridge.remotery import (  # noqa: E402
 )
 
 
-EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi.json").read_text(encoding="utf-8"))
+EDITOR_OPENAPI = json.loads((ROOT / "tests/fixtures/editor_openapi_1_13_1.json").read_text(encoding="utf-8"))
+EDITOR_OPENAPI_1_13_2 = json.loads((ROOT / "tests/fixtures/editor_openapi_1_13_2.json").read_text(encoding="utf-8"))
 
 
 def _read_automation_bridge_png(path):
@@ -95,14 +98,20 @@ def _read_automation_bridge_png(path):
     raw = zlib.decompress(bytes(idat))
     stride = width * 4
     pixels = bytearray()
+    previous = bytearray(stride)
     offset = 0
     for _ in range(height):
         filter_type = raw[offset]
-        if filter_type != 0:
+        if filter_type not in (0, 2):
             raise AssertionError(f"unexpected png filter {filter_type}: {path}")
         offset += 1
-        pixels.extend(raw[offset : offset + stride])
+        row = bytearray(raw[offset : offset + stride])
         offset += stride
+        if filter_type == 2:
+            for index, value in enumerate(row):
+                row[index] = (value + previous[index]) & 0xFF
+        pixels.extend(row)
+        previous = row
     return width, height, bytes(pixels)
 
 
@@ -162,6 +171,360 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_editor_discovery_accepts_individual_command_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {
+            "/command/run": {"post": {"summary": "Compile and launch", "parameters": [
+                {"name": "focus", "in": "query", "schema": {"type": "boolean", "default": True}},
+            ]}},
+            "/command/compile": {"post": {"summary": "Compile without launching"}},
+            "/command/documentation": {"post": {}},
+        }}
+        self.assertEqual(["compile", "run"], [item.name for item in project.commands.catalog()])
+        self.assertTrue(project.commands.supports("run", parameter="focus"))
+        self.assertFalse(project.commands.supports("compile", parameter="focus"))
+        self.assertFalse(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("documentation"))
+        self.assertEqual("Compile and launch", project._require_command("run").summary)
+        self.assertEqual("/command/compile", project._require_command("compile").path)
+
+    def test_editor_discovery_preserves_legacy_commands_and_version_guidance(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        self.assertTrue(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("build", parameter="focus"))
+        for name in ("compile", "run"):
+            with self.subTest(name=name), self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2") as error:
+                project._require_command(name)
+            self.assertEqual("1.13.2", error.exception.minimum_version)
+
+    def test_editor_discovery_refreshes_without_executing_commands(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"paths": {"/command/compile": {"post": {}}}})) as request:
+            self.assertFalse(project.commands.supports("compile"))
+            self.assertEqual(["compile"], [item.name for item in project.commands.catalog(refresh=True)])
+        request.assert_called_once_with(project.base_url + "/openapi.json", timeout=10.0)
+
+    def test_required_runtime_does_not_silently_skip_missing_editor(self):
+        with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "missing editor"):
+                AutomationBridgeApiTest.runtime_unavailable("missing editor")
+        with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "0"}):
+            with self.assertRaises(unittest.SkipTest):
+                AutomationBridgeApiTest.runtime_unavailable("missing editor")
+
+    def test_runtime_teardown_only_terminates_owned_engine(self):
+        for owned in (True, False):
+            bridge = mock.Mock()
+            with self.subTest(owned=owned), mock.patch.object(AutomationBridgeApiTest, "bridge", bridge, create=True), mock.patch.object(AutomationBridgeApiTest, "_owns_runtime", owned, create=True):
+                AutomationBridgeApiTest.close_bridge()
+            self.assertEqual(int(owned), bridge.close_engine.call_count)
+            self.assertEqual(int(not owned), bridge.close.call_count)
+
+    def test_application_catalog_retains_contracts_and_pagination(self):
+        bridge = EngineClient(12345)
+        bridge._last_health = {"capabilities": ["application.catalog"]}
+        response = {
+            "entries": [{"kind": "command", "name": "test.reset", "contract": {
+                "description": "Reset the test.", "input_schema": False, "output_schema": {"type": "object"},
+            }}],
+            "count": 1, "matched": 3, "offset": 1, "next_cursor": "2",
+            "revision": 7, "engine_instance_id": "engine:test",
+        }
+        with mock.patch.object(bridge, "_request", return_value=response) as request:
+            page = bridge.application_catalog(kind="command", limit=1, cursor="1")
+        self.assertIsInstance(page, engine.ApplicationCatalogPage)
+        self.assertEqual((1, 3, 1, "2", 7, "engine:test"), (page.count, page.matched, page.offset, page.next_cursor, page.revision, page.engine_instance_id))
+        self.assertEqual("Reset the test.", page.entries[0].description)
+        self.assertIs(False, page.entries[0].input_schema)
+        self.assertEqual({"type": "object"}, page.entries[0].output_schema)
+        self.assertIsNone(page.entries[0].schema)
+        self.assertEqual("/application/catalog", request.call_args.args[1])
+        self.assertEqual("1", request.call_args.args[2]["cursor"])
+
+    def test_application_catalog_requires_capability_before_query(self):
+        bridge = FakeEngineClient()
+        with self.assertRaises(UnsupportedCapabilityError):
+            bridge.application_catalog()
+        self.assertEqual(["/health"], [path for _, path, _ in bridge.api_requests])
+
+    def test_application_catalog_rejects_malformed_filters_before_io(self):
+        bridge = EngineClient(12345)
+        for options in ({"kind": "commands"}, {"name": ""}, {"name": 5}, {"name": "a" * 129}, {"limit": True}, {"limit": 101}, {"offset": -1}, {"cursor": 1}, {"cursor": "x"}):
+            with self.subTest(options=options), mock.patch.object(bridge, "_request") as request:
+                with self.assertRaises((TypeError, ValueError)):
+                    bridge.application_catalog(**options)
+                request.assert_not_called()
+    def test_cancellation_interrupts_long_poll_delay_from_another_thread(self):
+        token = engine.CancellationToken()
+        observed = threading.Event()
+        errors = []
+
+        def worker():
+            try:
+                with engine.cancellation_scope(token):
+                    wait_until(lambda: observed.set(), timeout=60, interval=60)
+            except engine.OperationCancelled as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(observed.wait(2))
+            token.cancel("caller stopped")
+            token.cancel("later reason")
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(["caller stopped"], [str(exc) for exc in errors])
+        finally:
+            token.cancel()
+            thread.join(2)
+
+    def test_cancellation_is_not_swallowed_by_retry_and_restores_outer_scope(self):
+        outer, inner = engine.CancellationToken(), engine.CancellationToken()
+        with self.assertRaisesRegex(engine.OperationCancelled, "outer"):
+            with engine.cancellation_scope(outer):
+                with self.assertRaisesRegex(engine.OperationCancelled, "inner"):
+                    with engine.cancellation_scope(inner):
+                        wait_until(lambda: inner.cancel("inner"), retry_exceptions=BaseException)
+                self.assertEqual(7, wait_until(lambda: 7))
+                outer.cancel("outer")
+        self.assertEqual(8, wait_until(lambda: 8))
+
+    def test_cancelled_scope_does_not_submit_input_or_launch_editor(self):
+        token = engine.CancellationToken()
+        token.cancel()
+        bridge = FakeInputClient()
+        with mock.patch("automation_bridge.editor.subprocess.Popen") as launch:
+            with self.assertRaises(engine.OperationCancelled):
+                with bridge.cancellation_scope(token):
+                    editor.open_project(".")
+                    bridge.key("SPACE")
+            launch.assert_not_called()
+        self.assertEqual([], bridge.api_requests)
+
+    def test_cancelled_input_wait_requests_native_release(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with engine.cancellation_scope(token):
+                token.cancel()
+                bridge.input.wait(42)
+        self.assertEqual(["/input/cancel"], [path for _, path, _ in bridge.api_requests])
+        self.assertTrue(bridge.api_requests[0][2]["release"])
+
+    def test_cancelled_accepted_receipt_wait_honors_cleanup_option(self):
+        for cleanup in (True, False):
+            token = engine.CancellationToken()
+            bridge = FakeInputClient()
+            with self.subTest(cleanup=cleanup), self.assertRaises(engine.OperationCancelled):
+                with engine.cancellation_scope(token):
+                    token.cancel()
+                    bridge.input.wait({"input_id": 42, "state": "accepted"}, state="accepted", cancel_on_interrupt=cleanup)
+            self.assertEqual(["/input/cancel"] if cleanup else [], [path for _, path, _ in bridge.api_requests])
+
+    def test_client_scope_releases_its_input_when_scene_wait_is_cancelled(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with bridge.cancellation_scope(token):
+                bridge.key("SPACE", hold=1, wait=False)
+                wait_until(lambda: token.cancel())
+        method, path, values = bridge.api_requests[-1]
+        self.assertEqual(("POST", "/input/flush"), (method, path))
+        self.assertEqual(bridge.client_id, values["client_id"])
+        self.assertEqual(bridge.session_id, values["session_id"])
+        self.assertTrue(values["release"])
+
+    def test_command_cancellation_preserves_native_refusal(self):
+        bridge = FakeInputClient()
+        token = engine.CancellationToken()
+        refusal = RuntimeError("running Lua callbacks cannot be preempted")
+        with mock.patch.object(bridge, "cancel_command", side_effect=refusal) as cancel:
+            with self.assertRaises(engine.OperationCancelled) as error:
+                with engine.cancellation_scope(token):
+                    token.cancel()
+                    bridge.wait_for_command(23)
+            cancel.assert_called_once_with(23)
+        self.assertIs(refusal, error.exception.cleanup_error)
+
+    def test_log_cancellation_closes_idle_socket(self):
+        token = engine.CancellationToken()
+        stream = EngineLogStream.__new__(EngineLogStream)
+        sock = mock.Mock()
+        sock.gettimeout.return_value = None
+        stream._socket = sock
+        stream._buffer = bytearray()
+
+        def receive(_):
+            token.cancel()
+            raise socket.timeout()
+
+        sock.recv.side_effect = receive
+        with self.assertRaises(engine.OperationCancelled):
+            with engine.cancellation_scope(token):
+                stream.readline()
+        self.assertTrue(stream.closed)
+        sock.close.assert_called_once()
+        sock.settimeout.assert_called_once_with(0.1)
+
+    def test_editor_workflows_forward_explicit_session_identity(self):
+        project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch.object(EngineClient, "_from_editor") as connect:
+            for method in (project.connect_engine, project.build_and_run, project.clean_build_and_run):
+                method(client_id="agent-a", session_id="task-1")
+                self.assertEqual("agent-a", connect.call_args.kwargs["client_id"])
+                self.assertEqual("task-1", connect.call_args.kwargs["session_id"])
+
+    def test_client_close_releases_local_resources_without_native_mutations(self):
+        bridge = EngineClient(1234, client_id="agent-a", session_id="task-1")
+        with mock.patch.object(bridge._logs, "close") as close, \
+             mock.patch.object(bridge, "_post_engine_message") as post:
+            with bridge:
+                self.assertFalse(bridge.owns_engine)
+                self.assertFalse(bridge.closed)
+                self.assertEqual("task-1", bridge.session_info()["session_id"])
+            bridge.close()
+        close.assert_called_once()
+        post.assert_not_called()
+        self.assertTrue(bridge.closed)
+        with self.assertRaisesRegex(AutomationBridgeError, "closed"):
+            bridge.health()
+
+    def test_invalid_session_identity_is_rejected_before_build(self):
+        project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch.object(project, "_build_and_run_command") as build:
+            for value in (False, "", 1):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    project.build_and_run(session_id=value)
+        build.assert_not_called()
+
+    def test_element_page_retains_cursor_counts_and_snapshot_metadata(self):
+        bridge = EngineClient(1234)
+        bridge._last_health = {"version": "2", "capabilities": ["scene.pagination"]}
+        payload = {"elements": [{"id": "e:1", "logical_id": "i:g1"}], "matched": 8, "total": 12,
+                   "offset": 3, "next_cursor": "4", "truncated": True, "scene_sequence": 7,
+                   "engine_frame": 90, "excluded": {"visibility": 2}}
+        with mock.patch.object(bridge, "_request", return_value=payload) as request:
+            page = bridge.elements_page(type="goc", cursor="3", limit=1)
+        self.assertIsInstance(page, engine.ElementPage)
+        self.assertEqual((1, 8, 12, 3, "4", 7, 90),
+                         (page.count, page.matched, page.total, page.offset, page.next_cursor, page.scene_sequence, page.engine_frame))
+        self.assertEqual("i:g1", page.elements[0].logical_id)
+        self.assertEqual({"visibility": 2}, page.raw["excluded"])
+        self.assertEqual("3", request.call_args.args[2]["cursor"])
+
+    def test_element_page_supports_zero_matches_and_count_only(self):
+        for matched in (0, 20):
+            page = engine.ElementPage.from_raw({"elements": [], "matched": matched, "next_cursor": None})
+            self.assertEqual(matched, page.matched)
+            self.assertEqual(0, page.count)
+            self.assertIsNone(page.next_cursor)
+
+    def test_pagination_cannot_hide_ambiguous_single_element_selector(self):
+        bridge = EngineClient(1234)
+        data = {"elements": [{"id": "e:1"}], "matched": 2, "truncated": True, "next_cursor": "1"}
+        with mock.patch.object(bridge, "_request", return_value=data):
+            for method in (bridge.element, bridge.maybe_element):
+                with self.assertRaises(engine.SelectorError):
+                    method(limit=1)
+        with mock.patch.object(bridge, "_request", return_value={"elements": [], "matched": 1}):
+            with self.assertRaises(engine.SelectorError):
+                bridge.maybe_element(limit=0)
+
+    def test_selector_values_are_validated_before_requesting(self):
+        bridge = EngineClient(1234)
+        with mock.patch.object(bridge, "_request") as request:
+            for selector in ({"limit": -1}, {"limit": 501}, {"limit": True}, {"offset": 0.5},
+                             {"cursor": "bad"}, {"cursor": "4294967296"}, {"visible": "false"}, {"type": 42}):
+                with self.subTest(selector=selector), self.assertRaises((ValueError, TypeError)):
+                    bridge.elements(**selector)
+        request.assert_not_called()
+
+    def test_page_requires_pagination_capability(self):
+        bridge = EngineClient(1234)
+        bridge._last_health = {"version": "2", "capabilities": ["elements"]}
+        with self.assertRaises(engine.UnsupportedCapabilityError):
+            bridge.elements_page()
+
+    def test_doctor_reports_invalid_project_without_launching(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(editor, "open_project") as open_project:
+            report = editor.doctor(root)
+        self.assertFalse(report.ready)
+        self.assertEqual("project", report.checks[0].name)
+        self.assertIn("game.project", report.checks[0].action)
+        json.dumps(report.as_dict())
+        open_project.assert_not_called()
+
+    def test_doctor_reports_connection_failure_without_launching_or_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text("[project]\ntitle = Test\n")
+            before = sorted(root.rglob("*"))
+            with mock.patch.object(editor, "installations", return_value=[]), mock.patch.object(editor, "open_project") as launch:
+                report = editor.doctor(root)
+            self.assertEqual(before, sorted(root.rglob("*")))
+        self.assertFalse(report.ready)
+        checks = {check.name: check for check in report.checks}
+        self.assertEqual("error", checks["editor_connection"].status)
+        self.assertIn("sandbox", checks["editor_connection"].action)
+        launch.assert_not_called()
+
+    def test_doctor_validates_cached_engine_without_collectors_or_cache_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text("[project]\ntitle = Test\n")
+            native = root / "automation_bridge"
+            native.mkdir()
+            (native / "ext.manifest").touch()
+            project = EditorApiClient(root, port=1234)
+            project._engine_service_port = 1235
+            project._cached_engine_identity = {"port": 1235, "engine_instance_id": "e1", "project_identity": "p1"}
+            health = {"version": "2", "identity": {"engine_instance_id": "e1", "project_identity": "p1"}, "capabilities": ["elements"]}
+            with mock.patch.object(editor, "installations", return_value=[]), \
+                 mock.patch.object(editor, "Client", return_value=project), \
+                 mock.patch.object(project, "_check_connection"), \
+                 mock.patch.object(project, "_write_cached_engine_identity") as write, \
+                 mock.patch.object(engine.RuntimeLogs, "start") as collect, \
+                 mock.patch.object(editor, "request_json", return_value=(200, {"lines": []})), \
+                 mock.patch.object(EngineClient, "_request", return_value=health):
+                report = editor.doctor(root, required_capabilities=("elements",))
+                missing = editor.doctor(root, required_capabilities=("unavailable",))
+        self.assertTrue(report.ready)
+        self.assertFalse(missing.ready)
+        self.assertIn("unavailable", missing.checks[-1].message)
+        write.assert_not_called()
+        collect.assert_not_called()
+
+    def test_update_python_wrapper_uses_fetched_archive_without_editing_project(self):
+        dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = f"[project]\ntitle = Existing\ndependencies#3 = {dependency}\n"
+            (root / "game.project").write_text(content)
+            self._write_automation_bridge_archive(root, dependency)
+            with mock.patch.object(editor, "open_project") as launch:
+                path = editor.update_python_wrapper(root)
+            self.assertEqual("new", (path / "automation_bridge" / "__init__.py").read_text())
+            self.assertEqual(content, (root / "game.project").read_text())
+        launch.assert_not_called()
+
+    def test_update_python_wrapper_rejects_ambiguous_dependencies_and_preserves_wrapper(self):
+        dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text(f"[project]\ndependencies#0 = {dependency}\ndependencies#1 = {dependency}\n")
+            wrapper = root / "automation-bridge-python"
+            wrapper.mkdir()
+            marker = wrapper / "existing.py"
+            marker.write_text("original")
+            with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "ambiguous"):
+                editor.update_python_wrapper(root)
+            self.assertEqual("original", marker.read_text())
+
     def test_public_surface_excludes_removed_aliases_and_backend_types(self):
         bridge = EngineClient(1)
         removed_client_names = {
@@ -213,6 +576,34 @@ class EngineClientUnitTest(unittest.TestCase):
             required_capabilities=("scene", "input.drag"),
         )
 
+    def test_raw_request_uses_json_body_and_retains_json_alias(self):
+        bridge = EngineClient(1)
+        with mock.patch.object(bridge, "_request", return_value={}) as request:
+            bridge.request(
+                "post",
+                "/markers",
+                params={"query": "value"},
+                json_body={"body": "value"},
+            )
+            request.assert_called_once_with(
+                "POST",
+                "/markers",
+                {"query": "value"},
+                json_body={"body": "value"},
+            )
+
+            request.reset_mock()
+            bridge.request("post", "/markers", json={"legacy": True})
+            request.assert_called_once_with(
+                "POST",
+                "/markers",
+                None,
+                json_body={"legacy": True},
+            )
+
+        with self.assertRaisesRegex(ValueError, "either json_body.*json compatibility alias"):
+            bridge.request("POST", "/markers", json_body={}, json={})
+
     def test_event_stream_resolves_now_before_wait_and_preserves_unmatched_events(self):
         class ScriptedClient:
             timeout = 10.0
@@ -220,7 +611,7 @@ class EngineClientUnitTest(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            def request(self, method, path, *, params=None, json=None):
+            def request(self, method, path, *, params=None, json_body=None):
                 self.requests.append((path, params))
                 if path == "/events/cursor":
                     return {"cursor": 5, "oldest_cursor": 2}
@@ -266,7 +657,7 @@ class EngineClientUnitTest(unittest.TestCase):
         class OverflowClient:
             timeout = 10.0
 
-            def request(self, method, path, *, params=None, json=None):
+            def request(self, method, path, *, params=None, json_body=None):
                 if path == "/events/cursor":
                     return {"cursor": 20, "oldest_cursor": 10}
                 return {"events": [], "next_cursor": 10, "oldest_cursor": 10, "latest_cursor": 20, "overflow": True}
@@ -312,14 +703,14 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("status_ready", element.localization_key)
         self.assertEqual("status", element.role)
 
-    def test_command_and_marker_encode_bounded_json(self):
+    def test_command_and_marker_use_json_bodies(self):
         class ApplicationClient(EngineClient):
             def __init__(self):
                 super().__init__(12345)
                 self.requests = []
 
-            def _request(self, method, path, params=None):
-                self.requests.append((method, path, params))
+            def _request(self, method, path, params=None, json_body=None):
+                self.requests.append((method, path, params, json_body))
                 if path == "/commands":
                     return {"command_id": 9, "state": "pending"}
                 if path == "/markers":
@@ -331,10 +722,13 @@ class EngineClientUnitTest(unittest.TestCase):
         marker = bridge.mark("workflow_started", {"case": 7}, recording_timestamp_us=1234)
 
         self.assertEqual(9, accepted["command_id"])
-        self.assertEqual('{"name":"standard"}', bridge.requests[0][2]["data"])
-        self.assertEqual(2000, bridge.requests[0][2]["timeout_ms"])
+        self.assertIsNone(bridge.requests[0][2])
+        self.assertEqual('{"name":"standard"}', bridge.requests[0][3]["data"])
+        self.assertEqual(2000, bridge.requests[0][3]["timeout_ms"])
         self.assertEqual(12, marker["event_sequence"])
-        self.assertEqual(1234, bridge.requests[1][2]["recording_timestamp_us"])
+        self.assertIsNone(bridge.requests[1][2])
+        self.assertEqual('{"case":7}', bridge.requests[1][3]["data"])
+        self.assertEqual(1234, bridge.requests[1][3]["recording_timestamp_us"])
 
     def test_health_rejects_incompatible_native_api_version(self):
         bridge = FakeEngineClient()
@@ -465,6 +859,238 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertTrue(accepted)
 
+    def test_editor_connection_uses_validated_cache_without_reading_console(self):
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:cached",
+                "project_identity": "project:same",
+                "process_id": 123,
+            },
+            "lifecycle": {"current_stage": "initial_scene_ready"},
+        }
+        health_ports = []
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", side_effect=AssertionError("console read")) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(43210, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17815/rmt", bridge._remotery_url)
+        self.assertEqual([43210], health_ports)
+        console_read.assert_not_called()
+        self.assertEqual(
+            ["bridge_healthy", "initial_scene_ready"],
+            [event["stage"] for event in project.lifecycle_events],
+        )
+
+    def test_editor_connection_reads_console_once_after_cached_identity_rejection(self):
+        health_ports = []
+        health_by_port = {
+            43210: {
+                "identity": {
+                    "engine_instance_id": "engine:other",
+                    "project_identity": "project:other",
+                    "process_id": 999,
+                }
+            },
+            54321: {
+                "identity": {
+                    "engine_instance_id": "engine:current",
+                    "project_identity": "project:same",
+                    "process_id": 456,
+                }
+            },
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            health = health_by_port[bridge.port]
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:17816/rmt)",
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", bridge._remotery_url)
+        self.assertEqual([43210, 54321], health_ports)
+        console_read.assert_called_once_with()
+        self.assertEqual("cached_port_rejected", project.lifecycle_events[0]["stage"])
+
+    def test_editor_connection_reads_console_once_when_cached_port_is_unreachable(self):
+        health_ports = []
+        current_health = {
+            "identity": {
+                "engine_instance_id": "engine:current",
+                "project_identity": "project:same",
+                "process_id": 456,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            if bridge.port == 43210:
+                raise AutomationBridgeError("cached endpoint is unavailable")
+            bridge._last_health = current_health
+            return current_health
+
+        lines = [
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual([43210, 54321], health_ports)
+        console_read.assert_called_once_with()
+
+    def test_editor_connection_refreshes_same_process_reboot_from_one_console_read(self):
+        health_ports = []
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:rebooted",
+                "project_identity": "project:same",
+                "process_id": 123,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:17816/rmt)",
+            "INFO:ENGINE: Engine service started on port 43210",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            (internal / "automation_bridge.engine.identity.json").write_text(
+                '{"port":43210,"engine_instance_id":"engine:cached",'
+                '"project_identity":"project:same","process_id":123}\n',
+                encoding="utf-8",
+            )
+            (internal / "automation_bridge.remotery.url").write_text(
+                "ws://127.0.0.1:17815/rmt\n",
+                encoding="utf-8",
+            )
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(43210, bridge.port)
+        self.assertEqual("ws://127.0.0.1:17816/rmt", bridge._remotery_url)
+        self.assertEqual([43210, 43210], health_ports)
+        console_read.assert_called_once_with()
+        self.assertEqual("engine:rebooted", project._cached_engine_identity["engine_instance_id"])
+
+    def test_editor_connection_skips_fast_path_when_cached_identity_is_missing(self):
+        health_ports = []
+        health = {
+            "identity": {
+                "engine_instance_id": "engine:current",
+                "project_identity": "project:same",
+                "process_id": 456,
+            }
+        }
+
+        def fake_health(bridge):
+            health_ports.append(bridge.port)
+            bridge._last_health = health
+            return health
+
+        lines = [
+            "INFO:ENGINE: Engine service started on port 54321",
+            "INFO:ENGINE: Automation Bridge endpoint registered",
+        ]
+        with tempfile.TemporaryDirectory() as root:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            (internal / "automation_bridge.engine.port").write_text("43210\n", encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+
+            with (
+                mock.patch.object(project, "_console_lines", return_value=lines) as console_read,
+                mock.patch.object(EngineClient, "health", fake_health),
+                mock.patch("automation_bridge.client.RuntimeLogs.start", autospec=True, side_effect=lambda logs: logs),
+            ):
+                bridge = EngineClient._from_editor(project, timeout=0.1)
+
+        self.assertEqual(54321, bridge.port)
+        self.assertEqual([54321], health_ports)
+        console_read.assert_called_once_with()
+
     def test_editor_installations_returns_newest_valid_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -507,6 +1133,7 @@ class EngineClientUnitTest(unittest.TestCase):
         project = EditorApiClient(".", port=12345)
         project._openapi_document = EDITOR_OPENAPI
 
+        self.assertEqual("http://127.0.0.1:12345", project.base_url)
         self.assertFalse(hasattr(project, "extensions"))
         self.assertFalse(hasattr(project, "window"))
         self.assertFalse(hasattr(project, "help"))
@@ -520,7 +1147,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
         parameters = EDITOR_OPENAPI["paths"]["/command/{command}"]["post"]["parameters"]
         advertised = set(parameters[0]["schema"]["enum"])
-        self.assertEqual(advertised, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
+        self.assertEqual(advertised | {"compile", "run"}, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
         self.assertFalse(editor._SUPPORTED_COMMANDS & editor._EXCLUDED_COMMANDS)
         self.assertEqual({("/eval", "post")}, editor._EXCLUDED_PATHS)
         advertised_paths = {
@@ -528,7 +1155,7 @@ class EngineClientUnitTest(unittest.TestCase):
             for path, operations in EDITOR_OPENAPI["paths"].items()
             for method in operations
         }
-        self.assertEqual(advertised_paths, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
+        self.assertEqual(advertised_paths | {("/bob", "post")}, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
 
     def test_every_editor_command_wrapper_uses_its_advertised_command(self):
         project = EditorApiClient(".", port=12345)
@@ -786,7 +1413,7 @@ class EngineClientUnitTest(unittest.TestCase):
             with project.console.stream(connect_timeout=3, read_timeout=1.5) as stream:
                 self.assertEqual("streamed line", stream.readline())
                 self.assertIsNone(stream.readline())
-        urlopen.assert_called_once_with("http://localhost:12345/console/stream", timeout=3)
+        urlopen.assert_called_once_with("http://127.0.0.1:12345/console/stream", timeout=3)
         response.fp.raw._sock.settimeout.assert_called_with(1.5)
         response.close.assert_called_once_with()
 
@@ -833,9 +1460,67 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("/main/main.script", actual.resource)
         self.assertEqual((7, 3), (actual.range.start.line, actual.range.start.character))
         self.assertEqual((7, 8), (actual.range.end.line, actual.range.end.character))
+        self.assertIs(project.last_command_result, raised.exception.result)
+        self.assertFalse(raised.exception.result.success)
+
+    def test_editor_legacy_acknowledgements_do_not_claim_completion(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, body in ((202, b""), (202, b"202 Accepted\n"), (200, b"200 OK\n")):
+            with self.subTest(body=body), mock.patch("automation_bridge.editor.request_raw", return_value=(status, body)):
+                self.assertIsNone(project.commands.hot_reload())
+            result = project.last_command_result
+            self.assertEqual(("hot-reload", status, False, None), (result.command, result.status, result.completed, result.success))
+
+    def test_editor_completion_retains_warnings_target_and_additional_fields(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payload = {"success": True, "issues": [{"severity": "warning", "message": "unused variable"}],
+                   "target": {"url": "http://localhost:3456"}, "future_metadata": "retained"}
+        for operation in (project.commands.hot_reload, project.debugger.start, project.build_and_run_html5):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                self.assertIsNone(operation())
+            result = project.last_command_result
+            self.assertTrue(result.completed)
+            self.assertTrue(result.success)
+            self.assertEqual("warning", result.issues[0].severity)
+            self.assertEqual("http://localhost:3456", result.target_url)
+            self.assertEqual("retained", result.raw["future_metadata"])
+        with mock.patch("automation_bridge.editor.request_raw", side_effect=editor.HttpError("POST", project.base_url, "unavailable")):
+            with self.assertRaises(editor.HttpError):
+                project.commands.hot_reload()
+        self.assertIsNone(project.last_command_result)
+
+    def test_editor_completion_surfaces_build_failure_and_missing_target(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        for status, success in ((200, True), (422, False), (200, False)):
+            with mock.patch("automation_bridge.editor.request_raw", return_value=(status, json.dumps({"success": success, "issues": []}).encode())):
+                if success:
+                    project.commands.hot_reload()
+                else:
+                    with self.assertRaises(editor.BuildError) as error:
+                        project.commands.hot_reload()
+                    self.assertIs(project.last_command_result, error.exception.result)
+            self.assertIsNone(project.last_command_result.target_url)
+            self.assertEqual(success, project.last_command_result.success)
+
+    def test_editor_rejects_malformed_completion_evidence(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        payloads = [[], {}, {"success": "false"}, {"success": True, "issues": None},
+                    {"success": True, "issues": [None]}, {"success": True, "target": {}},
+                    {"success": True, "target": {"url": 123}},
+                    {"success": True, "issues": [{"severity": "error", "message": "broken", "range": {"start": {"line": "7", "character": 0}, "end": {"line": 7, "character": 1}}}]}]
+        for payload in payloads:
+            with self.subTest(payload=payload), mock.patch("automation_bridge.editor.request_raw", return_value=(200, json.dumps(payload).encode())):
+                with self.assertRaises(editor.HttpError):
+                    project.commands.hot_reload()
+            self.assertIsNone(project.last_command_result)
 
     def test_editor_build_workflows_delegate_with_explicit_command_names(self):
         project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
         sentinel = object()
         with mock.patch.object(EngineClient, "_from_editor", return_value=sentinel) as connect:
             self.assertIs(sentinel, project.build_and_run(timeout=12, required_capabilities=("scene",)))
@@ -844,6 +1529,256 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("build", connect.call_args_list[0].kwargs["build_command"])
         self.assertEqual("clean-build", connect.call_args_list[1].kwargs["build_command"])
         self.assertIsNone(connect.call_args_list[2].kwargs["build_command"])
+
+    def test_editor_compile_never_enters_engine_lifecycle(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/compile": {"post": {}}}}
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+             mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch.object(project, "_console_lines") as console:
+            result = project.compile(timeout=12)
+        self.assertIs(project.last_command_result, result)
+        self.assertTrue(result.completed)
+        self.assertEqual("compile", result.command)
+        request.assert_called_once_with(project.base_url + "/command/compile", method="POST", timeout=12)
+        bootstrap.assert_not_called()
+        console.assert_not_called()
+
+    def test_editor_bob_sends_options_and_reads_each_session_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            token_path = root / ".internal/editor.token"
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+                 mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                for token in ("first-session", "second-session"):
+                    token_path.write_text(token + "\n", encoding="utf-8")
+                    result = project.bob(options={"platform": "wasm-web", "archive": True, "architectures": ["wasm-web", "js-web"]}, commands=("build", "bundle"), timeout=90)
+                    self.assertEqual("Bearer " + token, request.call_args.kwargs["headers"]["Authorization"])
+                    self.assertEqual("application/json", request.call_args.kwargs["headers"]["Content-Type"])
+                    self.assertEqual(90, request.call_args.kwargs["timeout"])
+                    self.assertEqual(project.base_url + "/bob", request.call_args.args[0])
+                    self.assertEqual(["build", "bundle"], json.loads(request.call_args.kwargs["data"])["commands"])
+                    self.assertEqual(["wasm-web", "js-web"], json.loads(request.call_args.kwargs["data"])["options"]["architectures"])
+                    self.assertIs(project.last_command_result, result)
+                    self.assertTrue(result.success)
+                    self.assertEqual("bob", result.command)
+            self.assertEqual(2, request.call_count)
+            bootstrap.assert_not_called()
+
+    def test_editor_bob_rejects_unsupported_and_malformed_input_before_request(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json") as request:
+            with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                project.bob()
+            for options in ([], "--help", {3: "value"}, {"value": float("nan")}, {"value": object()}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    project.bob(options=options)
+            for commands in (None, "build", b"build", [False], 1):
+                with self.subTest(commands=commands), self.assertRaises(ValueError):
+                    project.bob(commands=commands)
+        request.assert_not_called()
+
+    def test_editor_bob_missing_credentials_and_rejections_do_not_leak_token_or_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json") as request:
+                with self.assertRaisesRegex(editor.CommandError, "editor.token"):
+                    project.bob()
+            request.assert_not_called()
+            (root / ".internal").mkdir()
+            token = "private-test-token"
+            (root / ".internal/editor.token").write_text(token, encoding="utf-8")
+            failures = [(401, {"error": token}), (403, {"error": token}),
+                        editor.HttpError("POST", project.base_url + "/bob", token, status=401)]
+            for failure in failures:
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with mock.patch("automation_bridge.editor.request_json", **kwargs) as request:
+                    with self.assertRaisesRegex(editor.CommandError, "authentication was rejected") as error:
+                        project.bob()
+                self.assertNotIn(token, str(error.exception))
+                self.assertIsNone(error.exception.__cause__)
+                request.assert_called_once()
+                self.assertIsNone(project.last_command_result)
+
+    def test_editor_bob_preserves_build_diagnostics_without_retrying_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            (root / ".internal/editor.token").write_text("test-session", encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            payload = {"success": False, "issues": [{"severity": "error", "message": "invalid option"}]}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(422, payload)):
+                with self.assertRaises(editor.BuildError) as error:
+                    project.bob(options={"help": True})
+            self.assertIs(project.last_command_result, error.exception.result)
+            with mock.patch("automation_bridge.editor.request_json", side_effect=editor.HttpError("POST", project.base_url, "timed out")) as request:
+                with self.assertRaises(editor.HttpError):
+                    project.bob()
+            request.assert_called_once()
+            self.assertIsNone(project.last_command_result)
+
+    def test_editor_compile_and_focus_reject_legacy_before_mutation(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch("automation_bridge.editor.request_json") as request:
+            for operation in (project.compile, lambda: project.build_and_run(focus=False)):
+                with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                    operation()
+        request.assert_not_called()
+        bootstrap.assert_not_called()
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            project.build_and_run(focus=True)
+        self.assertEqual("build", bootstrap.call_args.kwargs["build_command"])
+        self.assertNotIn("focus", bootstrap.call_args.kwargs)
+
+    def test_editor_run_negotiates_focus_and_prefers_new_command(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/run": {"post": {"parameters": [
+            {"name": "focus", "in": "query", "schema": {"type": "boolean"}},
+        ]}}, "/command/build": {"post": {}}}}
+        for supplied, expected in ((None, False), (False, False), (True, True)):
+            with self.subTest(focus=supplied), mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                project.build_and_run(focus=supplied)
+            self.assertEqual("run", bootstrap.call_args.kwargs["build_command"])
+            self.assertIs(expected, bootstrap.call_args.kwargs["focus"])
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True), \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request:
+                project._build_and_run_command("run", focus=expected)
+            self.assertEqual(project.base_url + "/command/run?focus=" + str(expected).lower(), request.call_args.args[0])
+            self.assertEqual(1, request.call_count)
+
+    def test_editor_run_validates_focus_and_clean_build_before_bootstrap(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {}}
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            for focus in (0, 1, "false", [], {}):
+                with self.subTest(focus=focus), self.assertRaisesRegex(ValueError, "focus"):
+                    project.build_and_run(focus=focus)
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.clean_build_and_run()
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.build_and_run()
+        bootstrap.assert_not_called()
+
+    def test_editor_run_keeps_focus_during_stale_build_recovery(self):
+        project = EditorApiClient(".", port=12345)
+        sentinel = object()
+        with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+             mock.patch("automation_bridge.client.cancellable_sleep"), \
+             mock.patch.object(EngineClient, "_wait_for_bridge", return_value=sentinel), \
+             mock.patch.object(project, "_build_and_run_command") as build:
+            self.assertIs(sentinel, EngineClient._recover_after_stale_build(project, lambda: None, 5, "run", focus=False))
+        build.assert_called_once_with("run", timeout=5, focus=False)
+
+    def test_editor_target_urls_must_match_the_local_engine_transport(self):
+        for url in ("http://127.0.0.1:3456", "http://localhost:3456/", "http://LOCALHOST:3456"):
+            self.assertEqual(3456, EditorApiClient._local_target_port(url))
+        for url in ("https://localhost:3456", "http://example.test:3456", "http://127.0.0.2:3456",
+                    "http://[::1]:3456", "http://localhost", "http://localhost:0", "http://localhost:65536",
+                    "http://localhost:bad", "http://localhost:3456/other", "http://user:secret@localhost:3456",
+                    "http://localhost:3456?x=1", "http://localhost:3456#fragment", " http://localhost:3456"):
+            with self.subTest(url=url), self.assertRaisesRegex(editor.UnsupportedOperationError, "local engine client"):
+                EditorApiClient._local_target_port(url)
+
+    def test_editor_reported_target_skips_console_registration_wait_and_resets_on_next_build(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            payload = {"success": True, "issues": [], "target": {"url": "http://127.0.0.1:3456"}}
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True) as registration, \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, payload)):
+                result = project._build_and_run_command("run")
+                self.assertEqual("http://127.0.0.1:3456", result.target_url)
+                self.assertEqual(3456, project._last_build_target_port)
+                registration.assert_not_called()
+                del payload["target"]
+                project._build_and_run_command("run")
+                self.assertIsNone(project._last_build_target_port)
+                registration.assert_called_once()
+
+    def test_editor_bootstrap_prefers_reported_target_and_preserves_matching_profiler(self):
+        health = {"version": "2", "capabilities": ["runtime.health", "scene"],
+                  "identity": {"engine_instance_id": "engine:new", "project_identity": "project:test"}}
+        for console_port, expected_profiler in ((3456, "ws://127.0.0.1:5555/rmt"), (9876, None)):
+            with self.subTest(console_port=console_port), tempfile.TemporaryDirectory() as root:
+                project = EditorApiClient(root, port=12345)
+                project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+                lines = [f"INFO:ENGINE: Engine service started on port {console_port}",
+                         "INFO:ENGINE: Initialized Remotery (ws://127.0.0.1:5555/rmt)",
+                         "INFO:ENGINE: Automation Bridge endpoint registered"]
+                with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=lines), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.client.RuntimeLogs.start"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    bridge = project.build_and_run(required_capabilities=("scene",), client_id="agent-a", session_id="task-1")
+                self.assertEqual(3456, bridge.port)
+                self.assertTrue(bridge.owns_engine)
+                self.assertEqual(expected_profiler, bridge.profiler_url)
+                self.assertEqual("engine:new", bridge.engine_instance_id)
+                self.assertEqual("task-1", bridge.session_info()["session_id"])
+                self.assertEqual(3456, project._cached_engine_identity["port"])
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                build.assert_called_once()
+                bridge.close()
+
+    def test_editor_reported_target_never_falls_back_or_relaunches_after_health_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            project._cached_engine_identity = {"port": 3456, "project_identity": "project:expected"}
+            rejected = [
+                {"version": "2", "identity": {}},
+                {"version": "2", "identity": {"engine_instance_id": "engine:other", "project_identity": "project:other"}},
+            ]
+            for health in rejected:
+                with self.subTest(health=health), \
+                     mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                     mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                     mock.patch.object(project, "_console_lines", return_value=[]), \
+                     mock.patch.object(EngineClient, "_request", autospec=True, return_value=health) as request, \
+                     mock.patch.object(EngineClient, "_recover_after_stale_build") as recover, \
+                     mock.patch("automation_bridge.client.cancellable_sleep"), \
+                     mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                    with self.assertRaisesRegex(WaitTimeoutError, "reported target"):
+                        project.build_and_run(timeout=0.002)
+                self.assertTrue(request.called)
+                self.assertTrue(all(call.args[0].port == 3456 for call in request.call_args_list))
+                recover.assert_not_called()
+                build.assert_called_once()
+                self.assertEqual("project:expected", project._cached_engine_identity["project_identity"])
+
+    def test_editor_reported_target_still_requires_native_capabilities(self):
+        with tempfile.TemporaryDirectory() as root:
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/command/run": {"post": {}}}}
+            with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(EngineClient, "_request", return_value={"version": "2", "capabilities": []}), \
+                 mock.patch("automation_bridge.client.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": [], "target": {"url": "http://localhost:3456"}})) as build:
+                with self.assertRaises(UnsupportedCapabilityError):
+                    project.build_and_run(required_capabilities=("scene",))
+            build.assert_called_once()
 
     def test_editor_preferences_catalog_and_custom_paths(self):
         project = EditorApiClient(".", port=12345)
@@ -961,7 +1896,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
             with mock.patch("automation_bridge.editor.sys.platform", "linux"):
                 with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
-                    with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
+                    with mock.patch.object(EditorApiClient, "_check_connection", return_value=None):
                         editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
 
         self.assertEqual(54321, editor_client.port)
@@ -1240,11 +2175,14 @@ class EngineClientUnitTest(unittest.TestCase):
     def test_key_normalizes_common_names_and_optional_prefixes(self):
         bridge = FakeInputClient()
 
-        for key in ("M", "space", "KEY_ESCAPE", "{key_f12}", "7"):
+        for key in ("M", "space", "KEY_ESCAPE", "{key_f12}", "7", "EQUALS", "minus", "kp_0", "{KEY_CAPS_LOCK}"):
             bridge.key(key, wait=False)
 
         self.assertEqual(
-            ["{KEY_M}", "{KEY_SPACE}", "{KEY_ESCAPE}", "{KEY_F12}", "{KEY_7}"],
+            [
+                "{KEY_M}", "{KEY_SPACE}", "{KEY_ESCAPE}", "{KEY_F12}", "{KEY_7}",
+                "{KEY_EQUALS}", "{KEY_MINUS}", "{KEY_KP_0}", "{KEY_CAPS_LOCK}",
+            ],
             [request[2]["keys"] for request in bridge.api_requests],
         )
 
@@ -1258,6 +2196,90 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual([], bridge.api_requests)
 
+    def test_key_hold_is_validated_and_forwarded(self):
+        bridge = FakeInputClient()
+
+        bridge.key("KEY_UP", wait=False, hold=1.5)
+        bridge.key("KEY_UP", wait=False, hold=6)
+        # This fake-client call validates the inclusive boundary immediately; it
+        # does not execute or wait for a real 60-second native hold.
+        bridge.key("KEY_UP", wait=False, hold=60)
+        bridge.key("KEY_UP", wait=False)
+
+        short_hold, long_hold, maximum_hold, tapped = (request[2] for request in bridge.api_requests)
+        self.assertEqual("{KEY_UP}", short_hold["keys"])
+        self.assertEqual(1.5, short_hold["hold"])
+        self.assertEqual(6.0, long_hold["hold"])
+        self.assertEqual(60.0, maximum_hold["hold"])
+        # Finite key holds reserve their controller lifetime in the native bridge.
+        # The public wrapper should not duplicate that lease policy.
+        self.assertTrue(all("lease" not in request for request in (short_hold, long_hold, maximum_hold)))
+        self.assertNotIn("hold", tapped)
+
+    def test_key_hold_rejects_invalid_durations_before_queueing(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(ValueError, "between 0 and 60"):
+            bridge.key("KEY_UP", wait=False, hold=60.5)
+        with self.assertRaises(TypeError):
+            bridge.key("KEY_UP", wait=False, hold="2")
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_key_hold_requires_input_key_v2_before_queueing(self):
+        bridge = FakeInputClient(input_key_version="1")
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.key>=2"):
+            bridge.key("KEY_UP", wait=False, hold=1)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_key_tap_remains_compatible_with_input_key_v1(self):
+        bridge = FakeInputClient(input_key_version="1")
+
+        bridge.key("KEY_UP", wait=False)
+
+        self.assertEqual("{KEY_UP}", bridge.api_requests[0][2]["keys"])
+
+    def test_modifiers_are_normalized_and_forwarded(self):
+        bridge = FakeInputClient()
+
+        bridge.click((10, 10), modifiers="lshift", wait=False)
+        bridge.drag((0, 0), (10, 10), duration=0.1, modifiers=["KEY_LCTRL", "{key_lalt}"], wait=False)
+        bridge.key("Z", modifiers="LCTRL", hold=1.0, wait=False)
+        bridge.click((10, 10), wait=False)
+
+        clicked, dragged, chorded, plain = (request[2] for request in bridge.api_requests)
+        self.assertEqual("KEY_LSHIFT", clicked["modifiers"])
+        self.assertEqual("KEY_LCTRL,KEY_LALT", dragged["modifiers"])
+        self.assertEqual("KEY_LCTRL", chorded["modifiers"])
+        self.assertEqual("{KEY_Z}", chorded["keys"])
+        self.assertEqual(1.0, chorded["hold"])
+        self.assertNotIn("modifiers", plain)
+
+    def test_modifiers_require_capability_before_queueing(self):
+        bridge = FakeInputClient(modifiers_supported=False)
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.modifiers"):
+            bridge.click((10, 10), modifiers="LSHIFT", wait=False)
+
+        self.assertEqual([], bridge.api_requests)
+
+        # An unmodified gesture stays compatible with a bridge that lacks the capability.
+        bridge.click((10, 10), wait=False)
+        self.assertNotIn("modifiers", bridge.api_requests[0][2])
+
+    def test_modifiers_reject_invalid_before_queueing(self):
+        bridge = FakeInputClient()
+
+        with self.assertRaisesRegex(ValueError, "A-Z, 0-9"):
+            bridge.click((10, 10), modifiers="COMMAND", wait=False)
+        with self.assertRaisesRegex(ValueError, "at most 4"):
+            bridge.key("Z", modifiers=["LSHIFT", "RSHIFT", "LCTRL", "RCTRL", "LALT"], wait=False)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            bridge.drag((0, 0), (10, 10), duration=0.1, modifiers=[], wait=False)
+
+        self.assertEqual([], bridge.api_requests)
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
 
@@ -1777,6 +2799,24 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual("stale_element", raised.exception.code)
 
+    def test_error_envelope_status_overrides_remapped_http_transport_status(self):
+        response = b'{"ok":false,"error":{"status":409,"code":"stale_element","message":"refresh it"}}'
+        with FakeHttpServer(response, status=500, reason="Internal Server Error") as server:
+            bridge = EngineClient(server.port, timeout=1.0)
+            with self.assertRaises(StaleElementError) as raised:
+                bridge.click("e:1", wait=False)
+
+        self.assertEqual(409, raised.exception.status)
+
+    def test_error_envelope_cannot_turn_failure_status_into_success(self):
+        response = b'{"ok":false,"error":{"status":200,"code":"bad_request","message":"invalid"}}'
+        with FakeHttpServer(response, status=500, reason="Internal Server Error") as server:
+            bridge = EngineClient(server.port, timeout=1.0)
+            with self.assertRaises(AutomationBridgeApiError) as raised:
+                bridge.request("POST", "/input/key", json_body={"keys": "{KEY_ENTER}"})
+
+        self.assertEqual(500, raised.exception.status)
+
     def test_convert_point_uses_json_body(self):
         response = b'{"ok":true,"data":{"point":{"x":400,"y":300}}}'
         with FakeHttpServer(response) as server:
@@ -1789,6 +2829,50 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertIn(
             b'{"point":{"x":0.5,"y":0.5},"from_space":"normalized_viewport","to_space":"window"}',
             server.request_bytes,
+        )
+
+    def test_start_command_uses_json_body_for_large_payload(self):
+        response = b'{"ok":true,"data":{"command_id":9,"state":"pending"}}'
+        command_data = {"value": "x" * 30000}
+        with FakeHttpServer(response) as server:
+            accepted = EngineClient(server.port, timeout=1.0).start_command(
+                "test.load_fixture",
+                command_data,
+                timeout=2,
+            )
+
+        self.assertEqual(9, accepted["command_id"])
+        self.assertEqual("POST /automation-bridge/v2/commands HTTP/1.1", server.request_line)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertEqual(
+            {
+                "name": "test.load_fixture",
+                "data": json.dumps(command_data, separators=(",", ":")),
+                "timeout_ms": 2000,
+            },
+            json.loads(server.request_body),
+        )
+
+    def test_mark_uses_json_body_for_large_payload(self):
+        response = b'{"ok":true,"data":{"event_sequence":12}}'
+        marker_data = {"value": "x" * 30000}
+        with FakeHttpServer(response) as server:
+            marker = EngineClient(server.port, timeout=1.0).mark(
+                "workflow_started",
+                marker_data,
+                recording_timestamp_us=1234,
+            )
+
+        self.assertEqual(12, marker["event_sequence"])
+        self.assertEqual("POST /automation-bridge/v2/markers HTTP/1.1", server.request_line)
+        self.assertIn("Content-Type: application/json", server.request_text)
+        self.assertEqual(
+            {
+                "name": "workflow_started",
+                "data": json.dumps(marker_data, separators=(",", ":")),
+                "recording_timestamp_us": 1234,
+            },
+            json.loads(server.request_body),
         )
 
     def test_screenshot_waits_for_native_complete_receipt(self):
@@ -1854,7 +2938,8 @@ class EngineClientUnitTest(unittest.TestCase):
                         "sha256": "native-sha",
                     }
 
-            receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
+            with mock.patch("automation_bridge.visual.zlib.compress", wraps=zlib.compress) as compress:
+                receipt = ScreenshotClient().screenshot(resolution_multiplier=0.5)
 
             self.assertEqual((2, 1), (receipt.width, receipt.height))
             self.assertEqual(0.5, receipt.raw["resolution_multiplier"])
@@ -1863,6 +2948,8 @@ class EngineClientUnitTest(unittest.TestCase):
             self.assertTrue(receipt.exists())
             self.assertEqual((2, 1), _read_automation_bridge_png(receipt.path)[:2])
             self.assertEqual(hashlib.sha256(receipt.read_bytes()).hexdigest(), receipt.sha256)
+            compress.assert_called_once()
+            self.assertEqual(zlib.Z_BEST_SPEED, compress.call_args.kwargs["level"])
 
     def test_screenshot_validates_resolution_multiplier(self):
         bridge = EngineClient(1)
@@ -2096,6 +3183,377 @@ class EngineClientUnitTest(unittest.TestCase):
             )
 
 
+class EditorCompatibilityUnitTest(unittest.TestCase):
+    def test_versioned_discovery_uses_paths_instead_of_api_info_version(self):
+        for document, has_new_commands in ((EDITOR_OPENAPI, False), (EDITOR_OPENAPI_1_13_2, True)):
+            with self.subTest(new_api=has_new_commands), tempfile.TemporaryDirectory() as root, \
+                 EditorHttpFixture(document, lambda request: (404, b"Not Found")) as server:
+                project = EditorApiClient(root, port=server.port)
+                self.assertEqual("1.0", document["info"]["version"])
+                self.assertEqual(has_new_commands, project.commands.supports("compile"))
+                self.assertEqual(has_new_commands, project.commands.supports("run", parameter="focus"))
+                self.assertEqual(not has_new_commands, project.commands.supports("build"))
+                catalog = {item.name: item for item in project.commands.catalog()}
+                self.assertNotIn("documentation", catalog)
+                self.assertIn("clean-build", catalog)
+                if has_new_commands:
+                    self.assertEqual("boolean", catalog["run"].parameters[0]["schema"]["type"])
+                    self.assertIn("without launching", catalog["compile"].summary)
+                self.assertEqual(["/openapi.json"], [request["path"] for request in server.requests])
+
+    def test_build_and_run_over_http_for_both_versions_and_optional_target(self):
+        for document, target_present, expected_command in (
+            (EDITOR_OPENAPI, False, "/command/build"),
+            (EDITOR_OPENAPI_1_13_2, False, "/command/run?focus=false"),
+            (EDITOR_OPENAPI_1_13_2, True, "/command/run?focus=false"),
+        ):
+            with self.subTest(command=expected_command, target=target_present), tempfile.TemporaryDirectory() as root:
+                health = {"ok": True, "data": {"version": "2", "capabilities": ["scene"],
+                          "identity": {"engine_instance_id": "engine:fixture", "project_identity": "project:fixture"}}}
+                with FakeHttpServer(json.dumps(health).encode()) as native:
+                    console = []
+
+                    def respond(request):
+                        if request["method"] == "GET" and request["path"] == "/console":
+                            return 200, {"lines": console}
+                        if request["method"] == "POST" and request["path"] == expected_command:
+                            console.extend([f"INFO:ENGINE: Engine service started on port {native.port}",
+                                            "INFO:ENGINE: Automation Bridge endpoint registered"])
+                            result = {"success": True, "issues": []}
+                            if target_present:
+                                result["target"] = {"url": f"http://127.0.0.1:{native.port}"}
+                            return 200, result
+                        return 404, b"Not Found"
+
+                    with EditorHttpFixture(document, respond) as server, \
+                         mock.patch("automation_bridge.client.RuntimeLogs.start"), \
+                         mock.patch("automation_bridge.client.cancellable_sleep"), \
+                         mock.patch("automation_bridge.editor.cancellable_sleep"):
+                        project = EditorApiClient(root, port=server.port)
+                        bridge = project.build_and_run(timeout=1, required_capabilities=("scene",))
+                        self.assertEqual(native.port, bridge.port)
+                        self.assertTrue(bridge.owns_engine)
+                        self.assertEqual("engine:fixture", bridge.engine_instance_id)
+                        self.assertTrue(project.last_command_result.completed)
+                        self.assertEqual(target_present, project.last_command_result.target_url is not None)
+                        self.assertEqual([expected_command], [request["path"] for request in server.requests if request["method"] == "POST"])
+                        bridge.close()
+                self.assertEqual("/automation-bridge/v2/health", urllib.parse.urlsplit(native.request_line.split()[1]).path)
+
+    def test_legacy_http_acknowledgements_and_unsupported_features(self):
+        with tempfile.TemporaryDirectory() as root, \
+             EditorHttpFixture(EDITOR_OPENAPI, lambda request: (202, b"202 Accepted\n")) as server:
+            project = EditorApiClient(root, port=server.port)
+            for operation in (project.build_and_run_html5, project.debugger.start, project.commands.hot_reload):
+                operation()
+                self.assertFalse(project.last_command_result.completed)
+                self.assertIsNone(project.last_command_result.success)
+            sent = len(server.requests)
+            for operation in (project.compile, project.bob, lambda: project.build_and_run(focus=False)):
+                with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                    operation()
+            self.assertEqual(sent, len(server.requests))
+
+    def test_modern_compile_and_completion_diagnostics_over_http(self):
+        result = {"success": True, "issues": [{"severity": "warning", "message": "unused variable",
+                  "resource": "/main/main.script", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 4}}}]}
+        with tempfile.TemporaryDirectory() as root, \
+             EditorHttpFixture(EDITOR_OPENAPI_1_13_2, lambda request: (200 if result["success"] else 422, result)) as server:
+            project = EditorApiClient(root, port=server.port)
+            for operation in (project.compile, project.build_and_run_html5, project.debugger.start, project.commands.hot_reload):
+                operation()
+                self.assertTrue(project.last_command_result.success)
+                self.assertTrue(project.last_command_result.completed)
+                issue = project.last_command_result.issues[0]
+                self.assertEqual("warning", issue.severity)
+                self.assertEqual(2, issue.range.start.line)
+            result["success"] = False
+            result["issues"][0]["severity"] = "error"
+            with self.assertRaises(editor.BuildError) as error:
+                project.compile()
+            self.assertEqual(422, error.exception.result.status)
+            self.assertEqual("/main/main.script", error.exception.issues[0].resource)
+            self.assertIs(project.last_command_result, error.exception.result)
+
+    def test_bob_authorization_json_and_plain_text_rejection_over_http(self):
+        authorized_calls = []
+
+        def respond(request):
+            if request["path"] != "/bob":
+                return 404, b"Not Found"
+            if request["headers"].get("Authorization") != "Bearer current-session":
+                return 401, b"401 Unauthorized\n"
+            authorized_calls.append(json.loads(request["body"]))
+            return 200, {"success": True, "issues": []}
+
+        with tempfile.TemporaryDirectory() as root, EditorHttpFixture(EDITOR_OPENAPI_1_13_2, respond) as server:
+            internal = Path(root) / ".internal"
+            internal.mkdir()
+            token_path = internal / "editor.token"
+            project = EditorApiClient(root, port=server.port)
+            token_path.write_text("old-session", encoding="utf-8")
+            with self.assertRaisesRegex(editor.CommandError, "authentication was rejected"):
+                project.bob()
+            self.assertEqual([], authorized_calls)
+            token_path.write_text("current-session", encoding="utf-8")
+            result = project.bob(options={"platform": "wasm-web", "archive": True}, commands=("build", "bundle"))
+            self.assertTrue(result.success)
+            self.assertEqual([{"options": {"platform": "wasm-web", "archive": True}, "commands": ["build", "bundle"]}], authorized_calls)
+            self.assertEqual(2, sum(request["method"] == "POST" for request in server.requests))
+
+
+class EditorDiscoveryUnitTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        (self.root / ".internal").mkdir()
+        self.port_file = self.root / ".internal" / "editor.port"
+        self.port_file.write_text("12345", encoding="utf-8")
+        (self.root / "game.project").write_text("[project]\ntitle = Test\n", encoding="utf-8")
+        self.launcher = self.root / "Defold"
+        self.launcher.touch()
+        self.now = 0.0
+        self._patch("automation_bridge.editor.time.monotonic", side_effect=lambda: self.now)
+        self.sleep = self._patch("automation_bridge.editor.time.sleep", side_effect=self._advance)
+        self._patch("automation_bridge.editor._macos_gui_launch_is_sandboxed", return_value=False)
+        self.popen = self._patch(
+            "automation_bridge.editor.subprocess.Popen",
+            side_effect=AssertionError("unexpected editor launch"),
+        )
+        self.response = mock.MagicMock()
+        self.response.__enter__.return_value = self.response
+        self.response.getcode.return_value = 200
+        self.response.read.return_value = b'{"openapi":"3.0.3"}'
+        self.urlopen = self._patch(
+            "automation_bridge.client.urllib.request.urlopen",
+            return_value=self.response,
+        )
+
+    def _patch(self, target, **kwargs):
+        patcher = mock.patch(target, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def _advance(self, seconds):
+        self.now += seconds
+
+    def _slow_response(self, request, *, timeout):
+        delay = 1.2
+        self._advance(min(delay, timeout))
+        if timeout < delay:
+            raise TimeoutError("timed out")
+        return self.response
+
+    def _launch(self, *args, **kwargs):
+        self.port_file.write_text("54321", encoding="utf-8")
+        self.urlopen.side_effect = None
+        return mock.Mock(pid=4321)
+
+    def test_slow_editor_is_reused_with_supplied_timeout(self):
+        self.urlopen.side_effect = self._slow_response
+
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(12345, project.port)
+        self.assertEqual("editor_reused", project.lifecycle_events[-1]["stage"])
+        self.assertAlmostEqual(1.2, self.now)
+        self.popen.assert_not_called()
+
+    def test_transient_failures_recover_on_third_attempt_without_launching(self):
+        self.urlopen.side_effect = [
+            urllib.error.URLError(ConnectionRefusedError("not listening yet")),
+            ConnectionResetError("connection reset"),
+            self.response,
+        ]
+
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(12345, project.port)
+        self.assertEqual(3, self.urlopen.call_count)
+        self.popen.assert_not_called()
+
+    def test_missing_or_partial_port_file_can_appear_during_discovery(self):
+        for initial in (None, "", "writing"):
+            for start_if_needed in (False, True):
+                with self.subTest(initial=initial, start_if_needed=start_if_needed):
+                    self.now = 0.0
+                    if initial is None:
+                        self.port_file.unlink()
+                    else:
+                        self.port_file.write_text(initial, encoding="utf-8")
+
+                    def publish_port(seconds):
+                        self._advance(seconds)
+                        if self.now >= 4.0:
+                            self.port_file.write_text("54321", encoding="utf-8")
+
+                    self.sleep.side_effect = publish_port
+                    project = editor.open_project(
+                        self.root,
+                        start_if_needed=start_if_needed,
+                        timeout=5,
+                        launcher=self.launcher,
+                    )
+
+                    self.assertEqual(54321, project.port)
+                    self.assertEqual("editor_reused", project.lifecycle_events[-1]["stage"])
+                    self.popen.assert_not_called()
+
+    def test_port_is_reread_after_a_failed_request(self):
+        def replace_port(request, *, timeout):
+            self.port_file.write_text("54321", encoding="utf-8")
+            self.urlopen.side_effect = None
+            raise urllib.error.URLError(ConnectionRefusedError("old port closed"))
+
+        self.urlopen.side_effect = replace_port
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        urls = [call.args[0].full_url for call in self.urlopen.call_args_list]
+        self.assertEqual([
+            "http://127.0.0.1:12345/openapi.json",
+            "http://127.0.0.1:54321/openapi.json",
+        ], urls)
+        self.popen.assert_not_called()
+
+    def test_timeout_preserves_cause_and_does_not_launch(self):
+        failure = TimeoutError("editor response timed out")
+
+        def never_respond(request, *, timeout):
+            self._advance(timeout)
+            raise failure
+
+        self.urlopen.side_effect = never_respond
+        with self.assertRaisesRegex(editor.NotRunningError, "editor response timed out") as raised:
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertAlmostEqual(5, self.now)
+        self.assertIn("http://127.0.0.1:12345/openapi.json", str(raised.exception))
+        wait_error = raised.exception.__cause__
+        self.assertIs(failure, wait_error.last_exception.__cause__)
+        self.popen.assert_not_called()
+
+    def test_denied_connection_never_launches_even_if_later_refused(self):
+        attempts = 0
+
+        def unavailable(request, *, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError(PermissionError("connection denied"))
+            raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+
+        self.urlopen.side_effect = unavailable
+        with self.assertRaisesRegex(editor.NotRunningError, "connection denied"):
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertAlmostEqual(5, self.now)
+        self.popen.assert_not_called()
+
+    def test_http_and_json_errors_keep_diagnostics_without_launching(self):
+        for status, body, detail in (
+            (503, b'{"error":"busy"}', "HTTP 503"),
+            (403, b'{"error":"denied"}', "HTTP 403"),
+            (200, b"not JSON", "invalid JSON response"),
+        ):
+            with self.subTest(status=status, body=body):
+                self.now = 0.0
+                self.response.getcode.return_value = status
+                self.response.read.return_value = body
+                with self.assertRaisesRegex(editor.NotRunningError, detail):
+                    editor.open_project(self.root, timeout=5, launcher=self.launcher)
+                self.assertAlmostEqual(5, self.now)
+                self.popen.assert_not_called()
+
+    def test_unreadable_port_file_keeps_diagnostics_without_launching(self):
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("port file denied")):
+            with self.assertRaisesRegex(editor.NotRunningError, "port file denied"):
+                editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.urlopen.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_invalid_engine_cache_is_not_mistaken_for_an_absent_editor(self):
+        cache = self.root / ".internal" / "automation_bridge.remotery.url"
+        cache.write_bytes(b"\xff")
+        with self.assertRaisesRegex(editor.NotRunningError, "utf-8"):
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+        self.popen.assert_not_called()
+
+    def test_missing_editor_launches_once_after_grace_period(self):
+        self.port_file.unlink()
+        self.popen.side_effect = self._launch
+
+        project = editor.open_project(self.root, timeout=30, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.assertEqual("editor_started", project.lifecycle_events[-1]["stage"])
+        self.assertGreaterEqual(self.now, 5)
+        self.assertLess(self.now, 6)
+        self.popen.assert_called_once()
+
+    def test_refused_stale_port_can_launch_with_a_short_timeout(self):
+        self.urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError("stale port"))
+        self.popen.side_effect = self._launch
+
+        project = editor.open_project(self.root, timeout=0.2, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.popen.assert_called_once()
+
+    def test_no_start_waits_for_the_supplied_timeout_when_file_is_missing(self):
+        self.port_file.unlink()
+        with self.assertRaisesRegex(editor.NotRunningError, "editor.port"):
+            editor.open_project(self.root, start_if_needed=False, timeout=5)
+
+        self.assertAlmostEqual(5, self.now)
+        self.popen.assert_not_called()
+
+    def test_started_editor_uses_remaining_startup_timeout_for_slow_reply(self):
+        self.port_file.unlink()
+
+        def launch(*args, **kwargs):
+            process = self._launch(*args, **kwargs)
+            self.urlopen.side_effect = self._slow_response
+            return process
+
+        self.popen.side_effect = launch
+        project = editor.open_project(self.root, timeout=2, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.assertAlmostEqual(3.2, self.now)
+        self.popen.assert_called_once()
+
+    def test_startup_failure_preserves_diagnostics_and_does_not_launch_again(self):
+        self.port_file.unlink()
+
+        def launch(*args, **kwargs):
+            process = self._launch(*args, **kwargs)
+            self.urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError("not ready"))
+            return process
+
+        self.popen.side_effect = launch
+        with self.assertRaisesRegex(WaitTimeoutError, "not ready"):
+            editor.open_project(self.root, timeout=0.2, launcher=self.launcher)
+        self.popen.assert_called_once()
+
+    def test_invalid_timeout_fails_before_discovery_or_launch(self):
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout must be finite and greater than zero"):
+                    editor.open_project(self.root, timeout=timeout, launcher=self.launcher)
+        self.urlopen.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_is_running_remains_a_single_boolean_probe(self):
+        self.urlopen.side_effect = TimeoutError("timed out")
+        self.assertFalse(editor.is_running(self.root, timeout=2))
+        self.assertEqual(1, self.urlopen.call_count)
+        self.popen.assert_not_called()
+
+
 class FakeEngineClient(EngineClient):
     def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
@@ -2139,10 +3597,19 @@ class FakeEngineClient(EngineClient):
 
 
 class FakeInputClient(EngineClient):
-    def __init__(self, statuses=None):
+    def __init__(self, statuses=None, input_key_version="2", modifiers_supported=True):
         super().__init__(12345, client_id="test-client", session_id="test-session")
         self.api_requests = []
         self.statuses = list(statuses or [])
+        capabilities = ["input.key"]
+        if modifiers_supported:
+            capabilities.append("input.modifiers")
+        self._last_health = {
+            "version": "2",
+            "capabilities": capabilities,
+            "capability_versions": {"input.key": input_key_version},
+            "backend": {"headless": False, "graphics": True, "hid": True},
+        }
 
     def _request(self, method, path, params=None, json_body=None):
         params = json_body if json_body is not None else params
@@ -2538,9 +4005,16 @@ class AutomationBridgeApiTest(unittest.TestCase):
     SPRITE_COUNTER_NAME = "Sprite"
 
     @classmethod
+    def runtime_unavailable(cls, message):
+        if os.environ.get("AUTOMATION_BRIDGE_REQUIRE_RUNTIME") == "1":
+            raise RuntimeError(message)
+        raise unittest.SkipTest(message)
+
+    @classmethod
     def setUpClass(cls):
         cls.editor = None
         cls.bridge = None
+        cls._owns_runtime = False
         port = os.environ.get("AUTOMATION_BRIDGE_ENGINE_PORT")
         if port:
             remotery_url = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_URL")
@@ -2551,10 +4025,13 @@ class AutomationBridgeApiTest(unittest.TestCase):
             cls.bridge.wait_ready()
             return
 
+        if not (ROOT / ".internal" / "editor.port").is_file():
+            cls.runtime_unavailable("Defold editor port file is missing")
+
         try:
             cls.editor = editor.open_project(ROOT, start_if_needed=False)
         except (FileNotFoundError, editor.NotRunningError) as exc:
-            raise unittest.SkipTest(str(exc)) from exc
+            cls.runtime_unavailable(str(exc))
 
     @classmethod
     def close_bridge(cls):
@@ -2562,7 +4039,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
             return
         bridge = cls.bridge
         cls.bridge = None
-        bridge.close_engine()
+        if cls._owns_runtime:
+            bridge.close_engine()
+        else:
+            bridge.close()
 
     @classmethod
     def tearDownClass(cls):
@@ -2572,6 +4052,127 @@ class AutomationBridgeApiTest(unittest.TestCase):
         if self.bridge:
             self.reset_if_popup_is_visible()
 
+    def test_pagination_preserves_metadata_and_rejects_invalid_native_values(self):
+        self.ensure_running_bridge()
+        first = self.bridge.elements_page(type="goc", limit=1)
+        self.assertGreater(first.matched, 1)
+        self.assertEqual(1, first.count)
+        second = self.bridge.elements_page(type="goc", limit=1, cursor=first.next_cursor)
+        self.assertEqual(1, second.offset)
+        self.assertNotEqual(first.elements[0].logical_id, second.elements[0].logical_id)
+        self.assertGreaterEqual(second.engine_frame, first.engine_frame)
+        for params in ({"limit": "invalid"}, {"limit": 501}, {"cursor": "invalid"}, {"offset": -1}, {"offset": "9" * 30}, {"cursor": "9" * 30}):
+            with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
+                self.bridge.request("GET", "/elements", params=params)
+            self.assertEqual(400, error.exception.status)
+
+    def test_application_catalog_discovers_command_and_state_event_contracts(self):
+        self.ensure_running_bridge()
+        command = self.bridge.application_catalog(kind="command", name="sample.reset")
+        self.assertEqual(1, command.matched)
+        self.assertIn("Remove all items", command.entries[0].description)
+        self.assertEqual("string", command.entries[0].input_schema["properties"]["request_id"]["type"])
+        state = self.bridge.application_catalog(kind="state", name="sample.game")
+        self.assertEqual("integer", state.entries[0].schema["properties"]["item_count"]["type"])
+        event = self.bridge.application_catalog(kind="event", name="sample.reset_complete")
+        self.assertEqual("object", event.entries[0].schema["type"])
+        first = self.bridge.application_catalog(limit=1)
+        second = self.bridge.application_catalog(limit=1, cursor=first.next_cursor)
+        self.assertEqual((first.revision, first.engine_instance_id), (second.revision, second.engine_instance_id))
+        self.assertNotEqual(first.entries[0].name, second.entries[0].name)
+        self.assertEqual(0, self.bridge.application_catalog(limit=0).count)
+        for params in ({"kind": "unknown"}, {"name": ""}, {"limit": "invalid"}, {"limit": 101}, {"offset": -1}, {"cursor": ""}):
+            with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
+                self.bridge.request("GET", "/application/catalog", params=params)
+            self.assertEqual(400, error.exception.status)
+
+    def test_application_contract_validation_and_replacement_are_atomic(self):
+        self.ensure_running_bridge()
+        checks = self.bridge.state("sample.contract_checks").value["rejected"]
+        self.assertEqual(13, len(checks))
+        self.assertTrue(all(checks), checks)
+        future = self.bridge.application_catalog(kind="state", name="sample.future")
+        self.assertEqual("Replacement declaration", future.entries[0].description)
+        self.assertIs(False, future.entries[0].schema)
+        self.assertEqual(0, len(self.bridge.states(name="sample.future")["states"]))
+        undocumented = self.bridge.application_catalog(kind="command", name="sample.catalog_probe")
+        self.assertEqual({}, undocumented.entries[0].contract)
+        self.assertEqual({"available": True}, self.bridge.command("sample.catalog_probe")["result"])
+        before = self.bridge.application_catalog().revision
+        result = self.bridge.command("sample.catalog_reject")
+        self.assertTrue(result["result"]["rejected"])
+        self.assertEqual(before, self.bridge.application_catalog().revision)
+
+    def test_session_ownership_and_detach_leave_engine_available(self):
+        if self.editor is not None:
+            self.bridge = self.editor.build_and_run(timeout=20, client_id="owner", session_id="lifecycle-test")
+            self.__class__.bridge = self.bridge
+            self.__class__._owns_runtime = True
+            self.assertTrue(self.bridge.owns_engine)
+            self.assertEqual("lifecycle-test", self.bridge.session_info()["session_id"])
+        self.ensure_running_bridge()
+        attached = engine.connect(self.bridge.port, client_id="observer", session_id="detach-test")
+        self.assertFalse(attached.owns_engine)
+        attached.close()
+        self.assertTrue(attached.closed)
+        self.assertEqual(self.bridge.engine_instance_id, self.bridge.health()["engine_instance_id"])
+
+    def test_cancellation_releases_held_native_input(self):
+        self.ensure_running_bridge()
+        token = engine.CancellationToken()
+        with self.assertRaises(engine.OperationCancelled):
+            with self.bridge.cancellation_scope(token):
+                held = self.bridge.key("SPACE", hold=5, wait="started")
+                token.cancel("stop held input")
+                wait_until(lambda: False)
+        receipt = wait_until(
+            lambda: self.bridge.input.status(held.input_id),
+            predicate=lambda item: item.state in {"cancelled", "released"},
+            timeout=2,
+        )
+        self.assertLess(receipt["actual_duration"], 4)
+        self.assertEqual("released", self.bridge.key("SPACE", wait="released").state)
+
+    def test_competing_clients_preserve_ownership_and_allow_observation(self):
+        self.ensure_running_bridge()
+        # Exercise both halves of the native identity pair.
+        for client_id, session_id in ((self.bridge.client_id, "competing-session"), ("competing-client", self.bridge.session_id)):
+            with self.subTest(client_id=client_id, session_id=session_id):
+                with engine.connect(self.bridge.port, client_id=client_id, session_id=session_id) as observer:
+                    held = self.bridge.key("SPACE", hold=5, wait="started")
+                    try:
+                        self.assertGreater(observer.elements_page(limit=0).matched, 0)
+                        for mutation in (lambda: observer.key("SPACE"), lambda: observer.input.cancel(held.input_id), lambda: observer.input.flush()):
+                            with self.assertRaises(AutomationBridgeApiError) as error:
+                                mutation()
+                            self.assertEqual("input_controller_busy", error.exception.code)
+                            self.assertEqual(409, error.exception.status)
+                        self.assertEqual("started", self.bridge.input.status(held.input_id).state)
+                    finally:
+                        self.bridge.input.flush()
+                    wait_until(lambda: self.bridge.input.status(held.input_id), predicate=lambda item: item.state == "cancelled", timeout=2)
+
+    def test_native_lease_expiry_allows_another_client_to_acquire_control(self):
+        self.ensure_running_bridge()
+        self.bridge.input.configure(lease=0.2)
+
+        def acquire(client):
+            try:
+                return client.input.configure(lease=0.3)
+            except AutomationBridgeApiError as exc:
+                if exc.code != "input_controller_busy":
+                    raise
+                return None
+
+        try:
+            with engine.connect(self.bridge.port, client_id="lease-successor", session_id="lease-test") as successor:
+                wait_until(lambda: acquire(successor), timeout=2, interval=0.01)
+                with self.assertRaises(AutomationBridgeApiError) as error:
+                    self.bridge.input.configure()
+                self.assertEqual("input_controller_busy", error.exception.code)
+        finally:
+            wait_until(lambda: acquire(self.bridge), timeout=2, interval=0.01)
+
     def test_automation_bridge_api_end_to_end(self):
         previous_port = None
         run_count = 1 if self.editor is None else 2
@@ -2580,6 +4181,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             if self.editor is not None:
                 self.bridge = self.editor.build_and_run(timeout=20)
                 self.__class__.bridge = self.bridge
+                self.__class__._owns_runtime = True
                 self.bridge.wait_ready()
                 if previous_port is not None:
                     self.assertNotEqual(previous_port, self.bridge.port)
@@ -2606,7 +4208,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
         port = self.bridge.port
         before = self.bridge.health()["identity"]
 
-        status, response = self.editor._json_command("build", timeout=20)
+        command = "run" if self.editor.commands.supports("run") else "build"
+        status, response = self.editor._json_command(command, timeout=20)
         self.assertEqual(200, status)
         self.assertTrue(response["success"], response.get("issues"))
 
@@ -2632,6 +4235,25 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.__class__.bridge = attached
         self.assertEqual(port, attached.port)
         self.assertEqual(after["identity"]["engine_instance_id"], attached.health()["identity"]["engine_instance_id"])
+
+    def test_editor_compile_and_bob_preserve_running_engine(self):
+        if self.editor is None or not self.editor.commands.supports("compile"):
+            raise unittest.SkipTest("compile and Bob require Defold 1.13.2 editor capabilities")
+        self.ensure_running_bridge()
+        before = self.bridge.health()["identity"]["engine_instance_id"]
+        result = self.editor.compile(timeout=60)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.success)
+        self.assertIsNone(result.target_url)
+        self.assertEqual(before, self.bridge.health()["identity"]["engine_instance_id"])
+        result = self.editor.bob(options={"help": True}, timeout=60)
+        self.assertTrue(result.completed)
+        self.assertTrue(result.success)
+        self.assertIsNone(result.target_url)
+        self.assertEqual(before, self.bridge.health()["identity"]["engine_instance_id"])
+        self.editor.commands.hot_reload(timeout=60)
+        self.assertTrue(self.editor.last_command_result.completed)
+        self.assertTrue(self.editor.last_command_result.success)
 
     def test_drag_item_along_cubic_curve_and_closed_circle(self):
         self.ensure_running_bridge()
@@ -2683,6 +4305,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         before = self.label_count("L1")
         self.bridge.click(spawner)
         wait_until(lambda: self.label_count("L1") > before, timeout=2, message="circular-drag item missing")
+        self.arrange_items()
         item_label = self.bridge.element(type="labelc", text="L1", visible=True)
         item = self.bridge.parent(item_label)
         center_x = float(item.center["x"])
@@ -2737,18 +4360,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.reset_if_popup_is_visible()
         screen = self.bridge.screen()
         window = screen["window"]
-        y = max(4, window["height"] - 16)
-        start = (max(4, window["width"] * 0.15), y)
-        end = (min(window["width"] - 4, window["width"] * 0.85), y)
+        requested_y = max(4, window["height"] - 16) + 0.75
+        requested_start = (max(4, window["width"] * 0.15) + 0.75, requested_y)
+        requested_end = (min(window["width"] - 4, window["width"] * 0.85) + 0.75, requested_y)
+        # Native HID receives integer framebuffer coordinates. The overlay must
+        # mark those exact coordinates, not the fractional request values.
+        start = (int(requested_start[0]), int(requested_start[1]))
+        end = (int(requested_end[0]), int(requested_end[1]))
         baseline_path = self.bridge.screenshot(wait=True, timeout=5)
-        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
 
-        self.bridge.drag(start, end, duration=1.0, wait=0)
+        self.bridge.drag(requested_start, requested_end, duration=1.0, wait=0, visualize=True)
         last_observation = {"path": None, "orange_pixels": 0, "baseline_path": baseline_path, "baseline_orange": baseline_orange}
 
         def visible_overlay():
             screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
-            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end)
+            orange_pixels = _count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3)
             last_observation["path"] = screenshot_path
             last_observation["orange_pixels"] = orange_pixels
             print(
@@ -2767,6 +4394,27 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.assertGreater(orange_pixels, max(20, baseline_orange + 20))
         finally:
             time.sleep(1.0)
+
+    def test_drag_without_visualization_has_no_debug_overlay(self):
+        self.ensure_running_bridge()
+        self.reset_if_popup_is_visible()
+        time.sleep(1.05)
+        screen = self.bridge.screen()
+        window = screen["window"]
+        y = max(4, window["height"] - 32)
+        start = (max(4, window["width"] * 0.2), y)
+        end = (min(window["width"] - 4, window["width"] * 0.8), y)
+        baseline_path = self.bridge.screenshot(wait=True, timeout=5)
+        baseline_orange = _count_orange_debug_pixels_near_segment(baseline_path, start, end, max_distance=3)
+
+        self.bridge.drag(start, end, duration=0.4, wait=0, visualize=False)
+        observed = []
+        for _ in range(3):
+            screenshot_path = self.bridge.screenshot(wait=True, timeout=5)
+            observed.append(_count_orange_debug_pixels_near_segment(screenshot_path, start, end, max_distance=3))
+            time.sleep(0.05)
+
+        self.assertLessEqual(max(observed), baseline_orange + 5, (baseline_path, baseline_orange, observed))
 
     def test_screenshot_rows_match_top_left_scene_bounds(self):
         self.ensure_running_bridge()
@@ -2867,9 +4515,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.bridge.wait_ready()
             return
         if self.editor is None:
-            raise unittest.SkipTest("no Automation Bridge engine or Defold editor is available")
+            self.runtime_unavailable("no Automation Bridge engine or Defold editor is available")
         self.bridge = self.editor.build_and_run(timeout=20)
         self.__class__.bridge = self.bridge
+        self.__class__._owns_runtime = True
         self.bridge.wait_ready()
 
     def supports_capability(self, capability):
@@ -2914,6 +4563,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertIn("scene.pagination", health["capabilities"])
         self.assertGreaterEqual(health["engine_frame"], 0)
         self.assertEqual("1", health["capability_versions"]["scene"])
+        self.assertEqual("2", health["capability_versions"]["input.key"])
         self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
         self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
         self.assertGreater(health["identity"]["start_wall_time_us"], 0)
@@ -2956,9 +4606,23 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertIsNotNone(spawner_detail.instance_generation)
         self.assertIsNotNone(spawner_detail.logical_id)
 
+        transport_status, stale_response = request_json(
+            self.bridge.base_url + "/input/click",
+            method="POST",
+            json_body={
+                "id": spawner.id,
+                "expected_scene_sequence": 0,
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            },
+        )
+        self.assertEqual(500, transport_status)
+        self.assertEqual(409, stale_response["error"]["status"])
+
         with self.assertRaises(AutomationBridgeApiError) as stale:
             self.bridge.click(spawner, wait=0, expected_scene_sequence=0)
         self.assertEqual("stale_scene", stale.exception.code)
+        self.assertEqual(409, stale.exception.status)
 
         stale_spawner = Element({**spawner.raw, "logical_id": "instance:stale:g0"})
         with self.assertRaises(StaleElementError) as stale_identity:
@@ -2980,14 +4644,161 @@ class AutomationBridgeApiTest(unittest.TestCase):
 
         special_key = self.bridge.key("KEY_ENTER")
         self.assertEqual("key", special_key["kind"])
+        for key in ("KEY_EQUALS", "KEY_KP_0", "KEY_CAPS_LOCK"):
+            with self.subTest(named_key=key):
+                named_key = self.bridge.key(key, wait="released")
+                self.assertEqual("released", named_key["state"])
+
+        hold_timer = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True)
+        # Physical keyboard state can update the demo before this assertion; verify
+        # the timer format here and its exact automated result below.
+        self.assertRegex(
+            hold_timer.text,
+            r"^(?:Hold SPACE|Holding SPACE|Last SPACE hold): \d+\.\d{2}s / 60s$",
+        )
+
+        held_key = self.bridge.key("KEY_SPACE", hold=0.3, wait="released")
+        self.assertEqual("released", held_key["state"])
+        self.assertAlmostEqual(0.3, held_key["requested_duration"], places=5)
+        # actual_duration is release minus start: a tap measures ~one frame, so a
+        # value near the requested hold proves the key genuinely stayed pressed.
+        self.assertGreaterEqual(held_key["actual_duration"], 0.25)
+
+        def released_hold_timer_text():
+            text = self.bridge.element(type="gui_node_text", name_exact="hold_timer", visible=True).text
+            return text if text.startswith("Last SPACE hold: ") else None
+
+        timer_text = wait_until(released_hold_timer_text, timeout=2, message="hold timer did not stop")
+        displayed_duration = float(timer_text.split(": ", 1)[1].split("s", 1)[0])
+        self.assertGreaterEqual(displayed_duration, 0.2)
+        self.assertLess(displayed_duration, 0.6)
+
+        short_lease_hold = self.bridge.request("POST", "/input/key", json_body={
+            "keys": "{KEY_ENTER}",
+            "hold": 0.3,
+            "lease": 0.1,
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        })
+        short_lease_hold = self.bridge.input.wait(short_lease_hold, state="released", timeout=2)
+        self.assertEqual("released", short_lease_hold["state"])
+        self.assertGreaterEqual(short_lease_hold["actual_duration"], 0.25)
+
+        for payload in ({"text": "x" * 20}, {"keys": "{KEY_A}" * 20}):
+            with self.subTest(progressing_key_event=next(iter(payload))):
+                progressing = self.bridge.request("POST", "/input/key", json_body={
+                    **payload,
+                    "lease": 0.1,
+                    "client_id": self.bridge.client_id,
+                    "session_id": self.bridge.session_id,
+                })
+                progressing = self.bridge.input.wait(progressing, state="released", timeout=2)
+                self.assertEqual("released", progressing["state"])
 
         with self.assertRaises(AutomationBridgeApiError) as unsupported_key:
-            self.bridge.request("POST", "/input/key", json={
+            self.bridge.request("POST", "/input/key", json_body={
                 "keys": "{M}",
                 "client_id": self.bridge.client_id,
                 "session_id": self.bridge.session_id,
             })
         self.assertEqual("unsupported_key", unsupported_key.exception.code)
+
+        with self.assertRaises(AutomationBridgeApiError) as unheld_text:
+            self.bridge.request("POST", "/input/key", json_body={
+                "text": "hello",
+                "hold": 1.0,
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("bad_request", unheld_text.exception.code)
+
+        input_identity = {
+            "keys": "{KEY_ENTER}",
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        }
+        transport_status, invalid_response = request_json(
+            self.bridge.base_url + "/input/key",
+            method="POST",
+            json_body={**input_identity, "hold": "abc"},
+        )
+        self.assertEqual(500, transport_status)
+        self.assertEqual(400, invalid_response["error"]["status"])
+        for invalid_hold in ("", "abc", "nan"):
+            with self.subTest(invalid_query_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_query:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        params={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_query.exception.code)
+                self.assertEqual(400, invalid_query.exception.status)
+
+        for invalid_hold in ("", "abc", None, {}, [], True):
+            with self.subTest(invalid_json_hold=invalid_hold):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_json:
+                    self.bridge.request(
+                        "POST",
+                        "/input/key",
+                        json_body={**input_identity, "hold": invalid_hold},
+                    )
+                self.assertEqual("bad_request", invalid_json.exception.code)
+
+        # Chord modifiers ride inside one FIFO event (pressed one update before the
+        # primary action, released one update after), so a modified gesture completes
+        # its normal lifecycle. Clicked at a neutral coordinate so no game element
+        # reacts and later label-count assertions stay undisturbed.
+        chorded_click = self.bridge.click((1, 1), modifiers="LSHIFT", wait="released")
+        self.assertEqual("released", chorded_click["state"])
+        # modifier_count is echoed so callers can detect a bridge that silently ignored
+        # an unknown modifiers parameter (same contract as hold's requested_duration).
+        self.assertEqual(1, chorded_click["modifier_count"])
+        # Exercise the chord in the game, not only in receipt metadata. The GUI tracks
+        # modifier key_trigger state before handling H and keeps visible evidence of
+        # the exact chord it observed.
+        chorded_key = self.bridge.key(
+            "KEY_H",
+            modifiers=("LSHIFT", "LALT"),
+            wait="released",
+        )
+        self.assertEqual("released", chorded_key["state"])
+        self.assertEqual(2, chorded_key["modifier_count"])
+
+        def received_modifier_chord():
+            text = self.bridge.element(
+                type="gui_node_text",
+                name_exact="modifier_chord",
+                visible=True,
+            ).text
+            return text if text == "Received H + SHIFT + ALT" else None
+
+        self.assertEqual(
+            "Received H + SHIFT + ALT",
+            wait_until(
+                received_modifier_chord,
+                timeout=2,
+                message="game did not observe H with SHIFT and ALT held",
+            ),
+        )
+
+        with self.assertRaises(AutomationBridgeApiError) as unknown_modifier:
+            self.bridge.request("POST", "/input/click", json_body={
+                "x": 1, "y": 1,
+                "modifiers": "KEY_BOGUS",
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("unsupported_key", unknown_modifier.exception.code)
+
+        with self.assertRaises(AutomationBridgeApiError) as chorded_text:
+            self.bridge.request("POST", "/input/key", json_body={
+                "text": "hello",
+                "modifiers": "KEY_LSHIFT",
+                "client_id": self.bridge.client_id,
+                "session_id": self.bridge.session_id,
+            })
+        self.assertEqual("bad_request", chorded_text.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(
@@ -3105,6 +4916,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
         return self.bridge.count(type="labelc", text=label)
 
     def parents_for_label(self, label):
+        self.arrange_items()
+
         def resolve_parents():
             parents = []
             elements = self.bridge.elements(type="labelc", text=label, limit=100)
@@ -3123,6 +4936,12 @@ class AutomationBridgeApiTest(unittest.TestCase):
             message=f"missing pair for {label}: {self.item_labels()}",
         )
         return parents
+
+    def arrange_items(self):
+        result = self.bridge.command("sample.arrange_items")
+        self.assertEqual("completed", result["state"], result)
+        self.bridge.wait_frames(1)
+        self.assertEqual(len(self.item_labels()), result["result"]["arranged"])
 
 
 class _ClientCloseFailure:

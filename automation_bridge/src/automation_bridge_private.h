@@ -22,6 +22,7 @@ namespace dmAutomationBridge
     static const uint32_t MAX_INPUT_EVENTS = 64;
     static const uint32_t MAX_INPUT_HISTORY = 256;
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;
+    static const uint32_t MAX_INPUT_MODIFIERS = 4;
     static const float MAX_INPUT_DURATION = 60.0f;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
     static const uint32_t MAX_APPLICATION_JSON_BYTES = 32768;
@@ -226,6 +227,7 @@ namespace dmAutomationBridge
         uint64_t    m_SceneSequence;
         InputDevice m_Device;
         uint32_t    m_PointerId;
+        uint8_t     m_ModifierCount;
     };
 
     struct InputEvent
@@ -245,6 +247,7 @@ namespace dmAutomationBridge
         bool               m_ReleaseOnCancel;
         bool               m_PointerOpen;
         uint64_t           m_LeaseDeadline;
+        uint64_t           m_CompletionDeadline;
         dmHID::MouseButton m_MouseButton;
         bool               m_Visualize;
 
@@ -252,6 +255,14 @@ namespace dmAutomationBridge
         uint32_t   m_KeyIndex;
         dmHID::Key m_ActiveKey;
         bool       m_ParseSpecialKeys;
+
+        // Chord modifiers held for the whole event (see UpdateMouseEvent/UpdateKeyEvent):
+        // re-asserted every update while the event plays, leading the primary action by
+        // one update and trailing its release by one (the engine's per-frame HID re-poll
+        // releases them automatically once assertion stops).
+        dmHID::Key m_Modifiers[MAX_INPUT_MODIFIERS];
+        uint8_t    m_ModifierCount;
+        bool       m_ModifierLeadDone;
     };
 
     struct InputVisualization
@@ -292,6 +303,13 @@ namespace dmAutomationBridge
     {
         char*                      m_Name;
         dmScript::LuaCallbackInfo* m_Callback;
+    };
+
+    struct ApplicationContract
+    {
+        char* m_Kind;
+        char* m_Name;
+        char* m_MetadataJson;
     };
 
     enum CommandState
@@ -365,6 +383,8 @@ namespace dmAutomationBridge
         Array<BridgeEvent>      m_Events;
         Array<PublishedState>   m_PublishedStates;
         Array<CommandHandler>   m_CommandHandlers;
+        Array<ApplicationContract> m_ApplicationContracts;
+        uint64_t                m_CatalogRevision;
         Array<CommandInvocation> m_CommandInvocations;
         Array<NodeAnnotation>   m_NodeAnnotations;
         uint32_t                m_EventCapacity;
@@ -568,10 +588,14 @@ namespace dmAutomationBridge
     void ReleaseInputController(const char* client_id, const char* session_id);
     bool AddMouseInput(const Array<InputPoint>* points, InputPathMode path_mode, float hold_before, float hold_after,
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
+                       const dmHID::Key* modifiers, uint32_t modifier_count,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt);
-    bool ValidateSpecialKeyInput(const char* keys, const char** error);
-    bool AddKeyInput(const char* keys, bool parse_special_keys,
+    bool ValidateSpecialKeyInput(const char* keys, const char** error, uint32_t* out_special_key_count);
+    bool ParseModifierList(const char* text, dmHID::Key* out_modifiers, uint32_t max_modifiers,
+                           uint32_t* out_count, const char** error);
+    bool AddKeyInput(const char* keys, bool parse_special_keys, float key_hold, float requested_duration,
+                     const dmHID::Key* modifiers, uint32_t modifier_count,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt);
     bool AppendPointerMove(uint64_t input_id, const InputPoint* point, float lease, const char** error);
@@ -603,6 +627,7 @@ namespace dmAutomationBridge
     uint32_t AppendEventPageJson(StringBuffer* out, uint64_t cursor, uint32_t limit, bool* overflow, uint64_t* next_cursor);
     uint64_t GetStateRevision();
     uint32_t AppendPublishedStatesJson(StringBuffer* out, const char* name, uint64_t after_revision);
+    void AppendApplicationCatalogJson(StringBuffer* out, const char* kind, const char* name, uint32_t offset, uint32_t limit);
     bool SubmitCommand(const char* name, const char* arguments_json, uint32_t timeout_ms, uint64_t* command_id, const char** error);
     bool AppendCommandJson(StringBuffer* out, uint64_t command_id);
     bool CancelCommand(uint64_t command_id, const char** error);

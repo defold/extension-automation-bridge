@@ -12,6 +12,20 @@ function init(self)
         return { loaded = data.name }
     end)
 
+    automation_bridge.describe("command", "example.load_fixture", {
+        description = "Load a named fixture and emit example.fixture_loaded.",
+        input_schema = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
+        output_schema = { type = "object", properties = { loaded = { type = "string" } }, required = { "loaded" } },
+    })
+    automation_bridge.describe("state", "example.ui", {
+        description = "Current workflow state; a busy value of false permits input.",
+        schema = { type = "object", properties = { busy = { type = "boolean" }, workflow_step = { type = "string" } } },
+    })
+    automation_bridge.describe("event", "example.fixture_loaded", {
+        description = "Emitted once a requested fixture is ready.",
+        schema = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
+    })
+
     automation_bridge.annotate("main:/ui#status", {
         automation_id = "operation_status",
         localization_key = "status_ready",

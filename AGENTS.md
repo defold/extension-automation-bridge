@@ -13,6 +13,7 @@
 - Public docstrings are the Python API reference. Start with
   `automation_bridge/automation-bridge-python/best_practices.py`; see the nearby
   `AGENTS.md` and `README.md` for wrapper rules and details.
+- Follow `DEVELOPMENT.md` for cross-layer, protocol, validation, and test changes.
 - Use the native API only for endpoint implementation or transport debugging.
   See `automation_bridge/AGENTS.md` and `automation_bridge/README.md`.
 - Run tests from the repository root:

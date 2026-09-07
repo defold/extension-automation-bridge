@@ -1,0 +1,65 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "Defold Editor HTTP Server", "version": "1.0"},
+  "components": {
+    "securitySchemes": {
+      "token": {"type": "http", "scheme": "bearer", "bearerFormat": "opaque"}
+    }
+  },
+  "paths": {
+    "/console": {"get": {}},
+    "/console/stream": {"get": {}},
+    "/prefs/{path}": {"get": {}, "post": {}},
+    "/ref": {"get": {}},
+    "/preview/{path}": {"get": {}},
+    "/eval": {"post": {}},
+    "/bob": {
+      "post": {
+        "summary": "Bundle or build the project with Bob options",
+        "description": "Does not launch. Output goes to /console. Option keys are Bob CLI options without --. Use arrays for repeatable options. Print help with options.help=true",
+        "security": [{"token": []}],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "options": {"type": "object"},
+                  "commands": {"type": "array", "items": {"type": "string"}}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"default": {"description": "Build result"}}
+      }
+    },
+    "/command/run": {
+      "post": {
+        "summary": "Compile and launch the project.",
+        "parameters": [
+          {"name": "focus", "in": "query", "description": "Whether the launched game takes focus.", "schema": {"type": "boolean", "default": true}}
+        ],
+        "responses": {"default": {"description": "Build result"}}
+      }
+    },
+    "/command/compile": {"post": {"summary": "Compile the project without launching or bundling.", "responses": {"default": {"description": "Build result"}}}},
+    "/command/clean-build": {"post": {"summary": "Clears build caches and rebuilds. Use only if builds fail oddly or miss changes.", "responses": {"default": {"description": "Build result"}}}},
+    "/command/build-html5": {"post": {"summary": "Build and launch HTML5 in a web browser.", "responses": {"default": {"description": "Build result"}}}},
+    "/command/hot-reload": {"post": {"summary": "Hot reload changed resources.", "responses": {"default": {"description": "Build result"}}}},
+    "/command/debugger-start": {"post": {"summary": "Start the debugger.", "responses": {"default": {"description": "Build result"}}}},
+    "/command/fetch-libraries": {"post": {"summary": "Fetch project libraries."}},
+    "/command/rebundle": {"post": {"summary": "Repeat the last bundle operation."}},
+    "/command/reload-extensions": {"post": {"summary": "Reload editor extensions."}},
+    "/command/reload-stylesheets": {"post": {"summary": "Reload editor stylesheets."}},
+    "/command/debugger-stop": {"post": {}},
+    "/command/debugger-break": {"post": {}},
+    "/command/debugger-continue": {"post": {}},
+    "/command/debugger-detach": {"post": {}},
+    "/command/debugger-step-into": {"post": {}},
+    "/command/debugger-step-out": {"post": {}},
+    "/command/debugger-step-over": {"post": {}},
+    "/command/documentation": {"post": {"summary": "Open documentation."}}
+  }
+}

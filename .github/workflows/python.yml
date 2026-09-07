@@ -1,0 +1,31 @@
+name: Python wrapper tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.10', '3.14']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run dependency-free Python and tooling tests
+        env:
+          PYTHONPATH: automation_bridge/automation-bridge-python
+        run: >-
+          python -m unittest
+          tests.test_automation_bridge_api.EngineClientUnitTest
+          tests.test_automation_bridge_api.EditorDiscoveryUnitTest
+          tests.test_automation_bridge_api.EditorCompatibilityUnitTest
+          tests.test_tooling
+      - name: Validate plugin and bundled Python source parity
+        run: python plugins/automation-bridge/scripts/validate_plugin.py --check-sync

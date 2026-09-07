@@ -36,6 +36,7 @@ namespace dmRender
     typedef uint32_t HRenderCamera;
 
     struct FrustumOptions;
+    const dmVMath::Matrix4& GetViewProjectionMatrix(HRenderContext render_context);
     void RenderListBegin(HRenderContext render_context);
     void RenderListEnd(HRenderContext render_context);
     void SetViewMatrix(HRenderContext render_context, const dmVMath::Matrix4& view);
@@ -143,28 +144,46 @@ namespace dmAutomationBridge
                    IsCloseDimension(actual_height, height, tolerance);
         }
 
-        static bool ScreenToDebugWorld(float x, float y, dmVMath::Point3* out)
+        static bool ScreenToDebugWorld(const dmVMath::Matrix4& inverse_view_projection, uint32_t window_width, uint32_t window_height, float x, float y, dmVMath::Point3* out)
         {
-            if (!g_AutomationBridge.m_GraphicsContext)
+            if (window_width == 0 || window_height == 0)
             {
                 return false;
             }
 
-            uint32_t window_height = dmGraphics::GetWindowHeight(g_AutomationBridge.m_GraphicsContext);
-            if (window_height == 0)
+            // HID coordinates address framebuffer pixels from the top-left. Aim
+            // at the center of the exact pixel delivered to HID, then unproject
+            // through the matrix DrawDebug3d will actually use. This also makes
+            // the overlay independent of a render camera left active by the
+            // user's render script.
+            float ndc_x = 2.0f * ((x + 0.5f) / (float)window_width) - 1.0f;
+            float ndc_y = 1.0f - 2.0f * ((y + 0.5f) / (float)window_height);
+            dmVMath::Vector4 world = inverse_view_projection * dmVMath::Vector4(ndc_x, ndc_y, 0.0f, 1.0f);
+            float w = world.getW();
+            if (!IsFiniteFloat(w) || fabsf(w) < 0.000001f)
             {
                 return false;
             }
 
-            *out = dmVMath::Point3(x, (float)window_height - y, 0.0f);
+            float inverse_w = 1.0f / w;
+            float world_x = world.getX() * inverse_w;
+            float world_y = world.getY() * inverse_w;
+            float world_z = world.getZ() * inverse_w;
+            if (!IsFiniteFloat(world_x) || !IsFiniteFloat(world_y) || !IsFiniteFloat(world_z))
+            {
+                return false;
+            }
+
+            *out = dmVMath::Point3(world_x, world_y, world_z);
             return true;
         }
 
-        static void DrawDebugLine(dmRender::HRenderContext render_context, float x1, float y1, float x2, float y2, const dmVMath::Vector4& color)
+        static void DrawDebugLine(dmRender::HRenderContext render_context, const dmVMath::Matrix4& inverse_view_projection, uint32_t window_width, uint32_t window_height, float x1, float y1, float x2, float y2, const dmVMath::Vector4& color)
         {
             dmVMath::Point3 start;
             dmVMath::Point3 end;
-            if (!ScreenToDebugWorld(x1, y1, &start) || !ScreenToDebugWorld(x2, y2, &end))
+            if (!ScreenToDebugWorld(inverse_view_projection, window_width, window_height, x1, y1, &start) ||
+                !ScreenToDebugWorld(inverse_view_projection, window_width, window_height, x2, y2, &end))
             {
                 return;
             }
@@ -172,7 +191,7 @@ namespace dmAutomationBridge
             dmRender::Line3D(render_context, start, end, color, color);
         }
 
-        static void DrawDebugCircle(dmRender::HRenderContext render_context, float x, float y, float radius, const dmVMath::Vector4& color)
+        static void DrawDebugCircle(dmRender::HRenderContext render_context, const dmVMath::Matrix4& inverse_view_projection, uint32_t window_width, uint32_t window_height, float x, float y, float radius, const dmVMath::Vector4& color)
         {
             static const uint32_t SEGMENTS = 32;
             static const float TAU = 6.28318530717958647692f;
@@ -184,7 +203,8 @@ namespace dmAutomationBridge
                 float angle = ((float)i / (float)SEGMENTS) * TAU;
                 float next_x = x + cosf(angle) * radius;
                 float next_y = y + sinf(angle) * radius;
-                DrawDebugLine(render_context, previous_x, previous_y, next_x, next_y, color);
+                DrawDebugLine(render_context, inverse_view_projection, window_width, window_height,
+                              previous_x, previous_y, next_x, next_y, color);
                 previous_x = next_x;
                 previous_y = next_y;
             }
@@ -342,30 +362,44 @@ namespace dmAutomationBridge
             return dmGraphics::GetWindow(g_AutomationBridge.m_GraphicsContext);
         }
 
+        static void SetGraphicsStateEnabled(dmGraphics::HContext graphics_context, dmGraphics::State state, bool enabled)
+        {
+            if (enabled)
+            {
+                dmGraphics::EnableState(graphics_context, state);
+            }
+            else
+            {
+                dmGraphics::DisableState(graphics_context, state);
+            }
+        }
+
         static void RestoreInputVisualizationGraphicsState(dmGraphics::HContext graphics_context, const dmGraphics::PipelineState& previous_state, int32_t viewport_x, int32_t viewport_y, uint32_t viewport_width, uint32_t viewport_height)
         {
-            if (previous_state.m_BlendEnabled)
-            {
-                dmGraphics::EnableState(graphics_context, dmGraphics::STATE_BLEND);
-            }
-            else
-            {
-                dmGraphics::DisableState(graphics_context, dmGraphics::STATE_BLEND);
-            }
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_BLEND, previous_state.m_BlendEnabled);
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_DEPTH_TEST, previous_state.m_DepthTestEnabled);
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_STENCIL_TEST, previous_state.m_StencilEnabled);
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_SCISSOR_TEST, previous_state.m_ScissorTestEnabled);
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_CULL_FACE, previous_state.m_CullFaceEnabled);
+            SetGraphicsStateEnabled(graphics_context, dmGraphics::STATE_POLYGON_OFFSET_FILL, previous_state.m_PolygonOffsetFillEnabled);
 
-            if (previous_state.m_DepthTestEnabled)
-            {
-                dmGraphics::EnableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
-            }
-            else
-            {
-                dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
-            }
-
-            dmGraphics::SetBlendFunc(
+            dmGraphics::SetBlendFuncSeparate(
                 graphics_context,
                 (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactor,
-                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactor);
+                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactor,
+                (dmGraphics::BlendFactor)previous_state.m_BlendSrcFactorAlpha,
+                (dmGraphics::BlendFactor)previous_state.m_BlendDstFactorAlpha);
+            dmGraphics::SetBlendEquationSeparate(
+                graphics_context,
+                (dmGraphics::BlendEquation)previous_state.m_BlendEquationColor,
+                (dmGraphics::BlendEquation)previous_state.m_BlendEquationAlpha);
+            dmGraphics::SetDepthMask(graphics_context, previous_state.m_WriteDepth);
+            dmGraphics::SetColorMask(
+                graphics_context,
+                (previous_state.m_WriteColorMask & (1 << 3)) != 0,
+                (previous_state.m_WriteColorMask & (1 << 2)) != 0,
+                (previous_state.m_WriteColorMask & (1 << 1)) != 0,
+                (previous_state.m_WriteColorMask & (1 << 0)) != 0);
             dmGraphics::SetViewport(graphics_context, viewport_x, viewport_y, viewport_width, viewport_height);
         }
 
@@ -374,13 +408,43 @@ namespace dmAutomationBridge
             dmGraphics::SetViewport(graphics_context, 0, 0, window_width, window_height);
             dmGraphics::EnableState(graphics_context, dmGraphics::STATE_BLEND);
             dmGraphics::DisableState(graphics_context, dmGraphics::STATE_DEPTH_TEST);
-            dmGraphics::SetBlendFunc(
+            dmGraphics::DisableState(graphics_context, dmGraphics::STATE_STENCIL_TEST);
+            dmGraphics::DisableState(graphics_context, dmGraphics::STATE_SCISSOR_TEST);
+            dmGraphics::DisableState(graphics_context, dmGraphics::STATE_CULL_FACE);
+            dmGraphics::DisableState(graphics_context, dmGraphics::STATE_POLYGON_OFFSET_FILL);
+            dmGraphics::SetColorMask(graphics_context, true, true, true, true);
+            dmGraphics::SetDepthMask(graphics_context, false);
+            dmGraphics::SetBlendFuncSeparate(
                 graphics_context,
                 dmGraphics::BLEND_FACTOR_SRC_ALPHA,
+                dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                dmGraphics::BLEND_FACTOR_ONE,
                 dmGraphics::BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+            dmGraphics::SetBlendEquationSeparate(
+                graphics_context,
+                dmGraphics::BLEND_EQUATION_ADD,
+                dmGraphics::BLEND_EQUATION_ADD);
 
             dmRender::SetViewMatrix(render_context, dmVMath::Matrix4::identity());
             dmRender::SetProjectionMatrix(render_context, dmVMath::Matrix4::orthographic(0.0f, (float)window_width, 0.0f, (float)window_height, 1.0f, -1.0f));
+        }
+
+        static bool ResolveInputVisualizationMatrix(dmRender::HRenderContext render_context, dmVMath::Matrix4* inverse_view_projection)
+        {
+            // DrawRenderList reapplies m_CurrentRenderCamera after explicit
+            // view/projection setup. An empty debug pass resolves that state
+            // without drawing, so the real pass can use matching screen points.
+            dmRender::RenderListBegin(render_context);
+            dmRender::RenderListEnd(render_context);
+            dmRender::Result result = dmRender::DrawDebug3d(render_context, 0);
+            dmRender::ClearRenderObjects(render_context);
+            if (result != dmRender::RESULT_OK)
+            {
+                return false;
+            }
+
+            *inverse_view_projection = dmVMath::Inverse(dmRender::GetViewProjectionMatrix(render_context));
+            return true;
         }
     }
 
@@ -484,28 +548,48 @@ namespace dmAutomationBridge
         float t = ClampFloat(visualization->m_Age / duration, 0.0f, 1.0f);
         float alpha = 1.0f - t;
         dmRender::HRenderContext render_context = (dmRender::HRenderContext)g_AutomationBridge.m_RenderContext;
+        dmVMath::Matrix4 previous_view = dmRender::GetViewMatrix(render_context);
+        dmVMath::Matrix4 previous_view_projection = dmRender::GetViewProjectionMatrix(render_context);
+        dmVMath::Matrix4 previous_projection = previous_view_projection * dmVMath::Inverse(previous_view);
 
-        dmRender::RenderListBegin(render_context);
+        // The visualization is a final screen overlay. Always bind the
+        // backbuffer in case the render script left an offscreen target active.
+        dmGraphics::SetRenderTarget(g_AutomationBridge.m_GraphicsContext, 0, 0);
         PrepareInputVisualizationRenderState(g_AutomationBridge.m_GraphicsContext, render_context, window_width, window_height);
 
+        dmVMath::Matrix4 inverse_view_projection;
+        if (!ResolveInputVisualizationMatrix(render_context, &inverse_view_projection))
+        {
+            dmRender::SetViewMatrix(render_context, previous_view);
+            dmRender::SetProjectionMatrix(render_context, previous_projection);
+            RestoreInputVisualizationGraphicsState(g_AutomationBridge.m_GraphicsContext, previous_state, previous_viewport_x, previous_viewport_y, previous_viewport_width, previous_viewport_height);
+            AdvanceInputVisualization(visualization);
+            return;
+        }
+
+        dmRender::RenderListBegin(render_context);
         if (visualization->m_Drag)
         {
             dmVMath::Vector4 color(1.0f, 0.72f, 0.12f, alpha);
             for (uint32_t i = 1; i < visualization->m_PointCount; ++i)
             {
-                DrawDebugLine(render_context,
+                DrawDebugLine(render_context, inverse_view_projection, window_width, window_height,
                               visualization->m_X[i - 1], visualization->m_Y[i - 1],
                               visualization->m_X[i], visualization->m_Y[i], color);
             }
             if (visualization->m_PointCount > 0)
             {
-                DrawDebugCircle(render_context, visualization->m_X[0], visualization->m_Y[0], 6.0f, color);
+                DrawDebugCircle(render_context, inverse_view_projection, window_width, window_height,
+                                visualization->m_X[0], visualization->m_Y[0], 6.0f, color);
                 uint32_t last = visualization->m_PointCount - 1;
-                DrawDebugCircle(render_context, visualization->m_X[last], visualization->m_Y[last], 6.0f, color);
+                DrawDebugCircle(render_context, inverse_view_projection, window_width, window_height,
+                                visualization->m_X[last], visualization->m_Y[last], 6.0f, color);
             }
             dmRender::RenderListEnd(render_context);
             dmRender::DrawDebug3d(render_context, 0);
             dmRender::ClearRenderObjects(render_context);
+            dmRender::SetViewMatrix(render_context, previous_view);
+            dmRender::SetProjectionMatrix(render_context, previous_projection);
             RestoreInputVisualizationGraphicsState(g_AutomationBridge.m_GraphicsContext, previous_state, previous_viewport_x, previous_viewport_y, previous_viewport_width, previous_viewport_height);
             AdvanceInputVisualization(visualization);
             return;
@@ -515,11 +599,14 @@ namespace dmAutomationBridge
         dmVMath::Vector4 color(0.15f, 0.85f, 1.0f, alpha);
         if (visualization->m_PointCount > 0)
         {
-            DrawDebugCircle(render_context, visualization->m_X[0], visualization->m_Y[0], radius, color);
+            DrawDebugCircle(render_context, inverse_view_projection, window_width, window_height,
+                            visualization->m_X[0], visualization->m_Y[0], radius, color);
         }
         dmRender::RenderListEnd(render_context);
         dmRender::DrawDebug3d(render_context, 0);
         dmRender::ClearRenderObjects(render_context);
+        dmRender::SetViewMatrix(render_context, previous_view);
+        dmRender::SetProjectionMatrix(render_context, previous_projection);
         RestoreInputVisualizationGraphicsState(g_AutomationBridge.m_GraphicsContext, previous_state, previous_viewport_x, previous_viewport_y, previous_viewport_width, previous_viewport_height);
 
         AdvanceInputVisualization(visualization);

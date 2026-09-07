@@ -1,4 +1,5 @@
 #include "automation_bridge_private.h"
+#include "fpng/fpng.h"
 
 #if defined(DM_DEBUG)
 
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <vector>
 
 #if defined(_WIN32)
 #include <direct.h>
@@ -161,11 +163,6 @@ namespace dmAutomationBridge
         return 0;
     }
 
-    static bool ByteArrayPush(ByteArray* array, uint8_t value)
-    {
-        return ArrayPush(array, &value);
-    }
-
     static bool ByteArrayPushBytes(ByteArray* array, const uint8_t* data, uint32_t count)
     {
         if (count == 0)
@@ -181,129 +178,30 @@ namespace dmAutomationBridge
         return true;
     }
 
-    static bool WriteBE32(ByteArray* out, uint32_t value)
-    {
-        return ByteArrayPush(out, (uint8_t)((value >> 24) & 0xff)) &&
-               ByteArrayPush(out, (uint8_t)((value >> 16) & 0xff)) &&
-               ByteArrayPush(out, (uint8_t)((value >> 8) & 0xff)) &&
-               ByteArrayPush(out, (uint8_t)(value & 0xff));
-    }
-
-    static uint32_t Crc32(const uint8_t* data, uint32_t size)
-    {
-        uint32_t crc = 0xffffffffU;
-        for (uint32_t i = 0; i < size; ++i)
-        {
-            crc ^= data[i];
-            for (uint32_t bit = 0; bit < 8; ++bit)
-            {
-                crc = (crc >> 1) ^ (0xedb88320U & (uint32_t)-(int32_t)(crc & 1));
-            }
-        }
-        return crc ^ 0xffffffffU;
-    }
-
-    static uint32_t Adler32(const uint8_t* data, uint32_t size)
-    {
-        uint32_t a = 1;
-        uint32_t b = 0;
-        for (uint32_t i = 0; i < size; ++i)
-        {
-            a = (a + data[i]) % 65521U;
-            b = (b + a) % 65521U;
-        }
-        return (b << 16) | a;
-    }
-
-    static bool AppendChunk(ByteArray* out, const char type[4], const ByteArray* data)
-    {
-        if (!WriteBE32(out, data->m_Count))
-        {
-            return false;
-        }
-
-        uint32_t type_offset = out->m_Count;
-        if (!ByteArrayPush(out, (uint8_t)type[0]) ||
-            !ByteArrayPush(out, (uint8_t)type[1]) ||
-            !ByteArrayPush(out, (uint8_t)type[2]) ||
-            !ByteArrayPush(out, (uint8_t)type[3]) ||
-            !ByteArrayPushBytes(out, data->m_Data, data->m_Count))
-        {
-            return false;
-        }
-
-        uint32_t crc = Crc32(out->m_Data + type_offset, 4 + data->m_Count);
-        return WriteBE32(out, crc);
-    }
-
     static bool EncodePngRgba(const ByteArray* rgba, uint32_t width, uint32_t height, ByteArray* png)
     {
-        if (rgba->m_Count != width * height * 4 || width == 0 || height == 0)
+        uint64_t rgba_size = (uint64_t)width * height * 4;
+        if (width == 0 || height == 0 || rgba_size != rgba->m_Count)
         {
             return false;
         }
 
-        ByteArray raw;
-        ArrayInit(&raw);
-        if (!ArrayReserve(&raw, ((width * 4 + 1) * height)))
+        static bool initialized = false;
+        if (!initialized)
+        {
+            fpng::fpng_init();
+            initialized = true;
+        }
+
+        std::vector<uint8_t> encoded;
+        if (!fpng::fpng_encode_image_to_memory(rgba->m_Data, width, height, 4, encoded) ||
+            encoded.size() > UINT32_MAX)
         {
             return false;
         }
-
-        for (uint32_t y = 0; y < height; ++y)
-        {
-            ByteArrayPush(&raw, 0);
-            const uint8_t* row = &rgba->m_Data[y * width * 4];
-            ByteArrayPushBytes(&raw, row, width * 4);
-        }
-
-        ByteArray zlib;
-        ArrayInit(&zlib);
-        ByteArrayPush(&zlib, 0x78);
-        ByteArrayPush(&zlib, 0x01);
-
-        uint32_t offset = 0;
-        while (offset < raw.m_Count)
-        {
-            uint32_t remaining = raw.m_Count - offset;
-            uint32_t block_size = remaining < 65535U ? remaining : 65535U;
-            bool final_block = offset + block_size == raw.m_Count;
-            ByteArrayPush(&zlib, final_block ? 1 : 0);
-            ByteArrayPush(&zlib, (uint8_t)(block_size & 0xff));
-            ByteArrayPush(&zlib, (uint8_t)((block_size >> 8) & 0xff));
-            uint16_t nlen = (uint16_t)~block_size;
-            ByteArrayPush(&zlib, (uint8_t)(nlen & 0xff));
-            ByteArrayPush(&zlib, (uint8_t)((nlen >> 8) & 0xff));
-            ByteArrayPushBytes(&zlib, raw.m_Data + offset, block_size);
-            offset += block_size;
-        }
-        WriteBE32(&zlib, Adler32(raw.m_Data, raw.m_Count));
 
         png->m_Count = 0;
-        const uint8_t signature[] = { 137, 80, 78, 71, 13, 10, 26, 10 };
-        ByteArrayPushBytes(png, signature, (uint32_t)sizeof(signature));
-
-        ByteArray ihdr;
-        ArrayInit(&ihdr);
-        WriteBE32(&ihdr, width);
-        WriteBE32(&ihdr, height);
-        ByteArrayPush(&ihdr, 8);
-        ByteArrayPush(&ihdr, 6);
-        ByteArrayPush(&ihdr, 0);
-        ByteArrayPush(&ihdr, 0);
-        ByteArrayPush(&ihdr, 0);
-
-        ByteArray empty;
-        ArrayInit(&empty);
-        bool ok = AppendChunk(png, "IHDR", &ihdr) &&
-                  AppendChunk(png, "IDAT", &zlib) &&
-                  AppendChunk(png, "IEND", &empty);
-
-        ArrayFree(&empty);
-        ArrayFree(&ihdr);
-        ArrayFree(&zlib);
-        ArrayFree(&raw);
-        return ok;
+        return ByteArrayPushBytes(png, encoded.data(), (uint32_t)encoded.size());
     }
 
     static bool CaptureScreenshotPng(ByteArray* png)

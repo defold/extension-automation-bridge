@@ -1,5 +1,6 @@
 {
   "openapi": "3.0.3",
+  "info": {"title": "Defold Editor HTTP Server", "version": "1.0"},
   "paths": {
     "/console": {"get": {}},
     "/console/stream": {"get": {}},
@@ -12,7 +13,10 @@
         "parameters": [
           {
             "name": "command",
+            "in": "path",
+            "required": true,
             "schema": {
+              "type": "string",
               "enum": [
                 "build",
                 "clean-build",

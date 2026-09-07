@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -23,7 +24,9 @@ from typing import Any, Iterator, Mapping, Optional, Sequence, TYPE_CHECKING, Un
 
 from .client import AutomationBridgeError, HttpError, request_json, request_raw
 from .preferences import PreferenceKey, Preferences
-from .waits import wait_until
+from .waits import WaitTimeoutError, wait_until
+from .diagnostics import DiagnosticCheck, DoctorReport
+from .cancellation import cancellable_sleep, check_cancelled
 
 if TYPE_CHECKING:
     from .client import Client as EngineClient
@@ -33,6 +36,7 @@ _AUTOMATION_BRIDGE_ENDPOINT_TEXT = "Automation Bridge endpoint registered"
 _AUTOMATION_BRIDGE_REPOSITORY = "https://github.com/defold/extension-automation-bridge"
 _AUTOMATION_BRIDGE_LATEST_RELEASE_API = "https://api.github.com/repos/defold/extension-automation-bridge/releases/latest"
 _AUTOMATION_BRIDGE_PYTHON_DIRECTORY = "automation-bridge-python"
+_EDITOR_ABSENCE_GRACE_PERIOD = 5.0
 _DEPENDENCY_LINE_PATTERN = re.compile(r"^(\s*dependencies#(\d+)\s*=\s*)(.*?)([ \t]*(?:\r\n|\n|\r)?)$")
 _SECTION_PATTERN = re.compile(r"^\s*\[([^]]+)\]\s*(?:\r\n|\n|\r)?$")
 _ENGINE_SERVICE_PORT_PATTERNS = (
@@ -41,13 +45,14 @@ _ENGINE_SERVICE_PORT_PATTERNS = (
 )
 _REMOTERY_URL_PATTERN = re.compile(r"Initialized Remotery \((ws://[^)\s]+)\)")
 _SUPPORTED_COMMANDS = frozenset({
-    "build", "clean-build", "build-html5", "fetch-libraries", "hot-reload",
+    "build", "run", "compile", "clean-build", "build-html5", "fetch-libraries", "hot-reload",
     "rebundle", "reload-extensions", "reload-stylesheets", "debugger-start",
     "debugger-stop", "debugger-break", "debugger-continue", "debugger-detach",
     "debugger-step-into", "debugger-step-out", "debugger-step-over",
 })
 _SUPPORTED_PATHS = frozenset({
     ("/command/{command}", "post"),
+    ("/bob", "post"),
     ("/console", "get"),
     ("/console/stream", "get"),
     ("/prefs/{path}", "get"),
@@ -62,6 +67,7 @@ _EXCLUDED_COMMANDS = frozenset({
     "show-curve-editor", "toggle-pane-bottom", "toggle-pane-left", "toggle-pane-right",
 })
 _EXCLUDED_PATHS = frozenset({("/eval", "post")})
+_COMMAND_MINIMUM_VERSIONS = {"compile": "1.13.2", "run": "1.13.2"}
 
 
 Error = AutomationBridgeError
@@ -78,6 +84,12 @@ class LaunchError(Error):
 class UnsupportedOperationError(Error):
     """Raised when the connected editor does not advertise an operation."""
 
+    def __init__(self, message: str, *, minimum_version: Optional[str] = None):
+        self.minimum_version = minimum_version
+        if minimum_version is not None:
+            message += f"; supported from Defold {minimum_version}. Upgrade the connected editor to use this feature"
+        super().__init__(message)
+
 
 class CommandError(Error):
     """Raised when an editor command is rejected or fails."""
@@ -88,10 +100,11 @@ class AutomationBridgeUpdateError(Error):
 
 
 class BuildError(CommandError):
-    """Raised when a build-and-run command reports compilation issues."""
+    """A build operation failed; ``issues`` and ``result`` retain diagnostics."""
 
-    def __init__(self, issues: Sequence["BuildIssue"]):
+    def __init__(self, issues: Sequence["BuildIssue"], *, result: Optional["BuildResult"] = None):
         self.issues = tuple(issues)
+        self.result = result
         super().__init__(f"Defold build failed: {list(self.issues)!r}")
 
 
@@ -247,6 +260,25 @@ def _automation_bridge_archive_path(project_root: Path, dependency_url: str) -> 
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
 
 
+def _read_project_configuration(root: Path) -> configparser.ConfigParser:
+    configuration = configparser.ConfigParser(interpolation=None)
+    try:
+        configuration.read_string((root / "game.project").read_text(encoding="utf-8"))
+    except configparser.Error as exc:
+        raise ValueError(f"invalid game.project: {exc}") from exc
+    return configuration
+
+
+def _bridge_dependency(configuration: configparser.ConfigParser) -> str:
+    values = configuration.items("project") if configuration.has_section("project") else ()
+    dependencies = [value.strip() for key, value in values if key.startswith("dependencies#") and _is_automation_bridge_dependency(value.strip())]
+    if not dependencies:
+        raise AutomationBridgeUpdateError("Automation Bridge dependency is missing; configure one dependency")
+    if len(dependencies) != 1:
+        raise AutomationBridgeUpdateError("Automation Bridge dependency is ambiguous; configure exactly one dependency")
+    return dependencies[0]
+
+
 def _replace_python_wrapper(archive_path: Path, destination: Path) -> None:
     transaction_root = Path(
         tempfile.mkdtemp(prefix=".automation-bridge-update-", dir=destination.parent)
@@ -335,6 +367,8 @@ class SourceRange:
 
 @dataclass(frozen=True)
 class BuildIssue:
+    """An editor diagnostic; source positions use zero-based LSP coordinates."""
+
     severity: str
     message: str
     resource: Optional[str] = None
@@ -342,22 +376,51 @@ class BuildIssue:
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any]) -> "BuildIssue":
+        for name in ("severity", "message"):
+            if not isinstance(raw.get(name), str):
+                raise ValueError(f"build issue {name} must be a string")
+        if "resource" in raw and not isinstance(raw["resource"], str):
+            raise ValueError("build issue resource must be a string")
         raw_range = raw.get("range")
         source_range = None
-        if isinstance(raw_range, Mapping):
-            start = raw_range.get("start")
-            end = raw_range.get("end")
-            if isinstance(start, Mapping) and isinstance(end, Mapping):
-                source_range = SourceRange(
-                    SourcePosition(int(start.get("line", 0)), int(start.get("character", 0))),
-                    SourcePosition(int(end.get("line", 0)), int(end.get("character", 0))),
-                )
+        if "range" in raw:
+            if not isinstance(raw_range, Mapping):
+                raise ValueError("build issue range must be an object")
+            positions = []
+            for name in ("start", "end"):
+                position = raw_range.get(name)
+                if not isinstance(position, Mapping) or any(
+                    type(position.get(key)) is not int or position[key] < 0
+                    for key in ("line", "character")
+                ):
+                    raise ValueError(f"build issue range.{name} requires non-negative integer line and character")
+                positions.append(SourcePosition(position["line"], position["character"]))
+            source_range = SourceRange(*positions)
         return cls(
-            severity=str(raw.get("severity", "error")),
-            message=str(raw.get("message", "")),
-            resource=str(raw["resource"]) if raw.get("resource") is not None else None,
+            severity=raw["severity"],
+            message=raw["message"],
+            resource=raw.get("resource"),
             range=source_range,
         )
+
+
+@dataclass(frozen=True)
+class BuildResult:
+    """Editor completion evidence for a build or command.
+
+    ``completed`` is true only when the editor returned a structured build
+    result. Legacy text/empty acknowledgements have ``completed=False`` and
+    ``success=None``. Warnings may accompany success. ``target_url`` is optional
+    even after a successful launch. ``raw`` preserves additional response fields.
+    """
+
+    command: str
+    status: int
+    completed: bool
+    success: Optional[bool]
+    issues: tuple[BuildIssue, ...]
+    target_url: Optional[str]
+    raw: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -449,9 +512,43 @@ class Installation:
     last_launched_at: str
 
 
+@dataclass(frozen=True)
+class CommandInfo:
+    """An advertised editor command supported by this wrapper.
+
+    ``parameters`` retains OpenAPI parameter descriptions and schemas. Legacy
+    command-enum metadata is normalized to a concrete ``path``; UI-only commands
+    outside this wrapper's supported surface are excluded from discovery.
+    """
+
+    name: str
+    path: str
+    summary: str
+    description: str
+    parameters: tuple[Mapping[str, Any], ...]
+    raw: Mapping[str, Any]
+
+
 class Commands:
     def __init__(self, client: "Client"):
         self._client = client
+
+    def catalog(self, *, refresh: bool = False) -> tuple[CommandInfo, ...]:
+        """List supported commands from either editor OpenAPI format.
+
+        The first call reads OpenAPI; later calls reuse it. Pass ``refresh=True``
+        after editor capabilities change. Discovery does not execute commands.
+        """
+        if refresh:
+            self._client._check_connection(timeout=10.0)
+        return tuple(info for name in sorted(_SUPPORTED_COMMANDS) if (info := self._client._command_info(name)) is not None)
+
+    def supports(self, command: str, *, parameter: Optional[str] = None) -> bool:
+        """Check advertisement of a supported command or one of its query parameters."""
+        info = self._client._command_info(command)
+        return info is not None and (parameter is None or any(
+            item.get("name") == parameter and item.get("in") == "query" for item in info.parameters
+        ))
 
     def fetch_libraries(self, timeout: float = 60.0) -> FetchLibrariesResult:
         status, response = self._client._json_command("fetch-libraries", timeout)
@@ -470,6 +567,11 @@ class Commands:
         return result
 
     def hot_reload(self, timeout: float = 60.0) -> None:
+        """Hot reload; inspect ``project.last_command_result`` for completion.
+
+        Defold 1.13.2 waits and reports build issues. Defold 1.13.1 only
+        acknowledges the request; acknowledgement does not establish completion.
+        """
         self._client._empty_command("hot-reload", timeout)
 
     def rebundle(self, timeout: float = 60.0) -> None:
@@ -490,6 +592,7 @@ class Debugger:
         self._client._empty_command(f"debugger-{name}", timeout)
 
     def start(self, timeout: float = 60.0) -> None:
+        """Start debugging; Defold 1.13.2 reports completion in last_command_result."""
         self._run("start", timeout)
 
     def stop(self, timeout: float = 10.0) -> None:
@@ -602,16 +705,15 @@ class Client:
     def __init__(self, root: Union[str, Path], port: Optional[int] = None):
         self.root = Path(root).resolve()
         if port is None:
-            port_path = self.root / ".internal" / "editor.port"
-            if not port_path.exists():
-                raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
-            port = int(port_path.read_text(encoding="utf-8").strip())
+            port = self._read_editor_port(self.root)
         self.port = int(port)
-        self.base_url = f"http://localhost:{self.port}"
+        self.base_url = f"http://127.0.0.1:{self.port}"
         self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
         self._cached_engine_identity = self._read_cached_engine_identity()
         self._remotery_url: Optional[str] = self._read_cached_remotery_url()
         self._last_build_had_engine_service_port: Optional[bool] = None
+        self._last_build_target_port: Optional[int] = None
+        self._last_command_result: Optional[BuildResult] = None
         self._lifecycle_events = []
         self._openapi_document: Optional[dict] = None
         self.commands = Commands(self)
@@ -620,6 +722,24 @@ class Client:
         self.reference = Reference(self)
         self.preview = Preview(self)
         self.preferences = Preferences(self)
+
+    @property
+    def last_command_result(self) -> Optional[BuildResult]:
+        """Latest build/command result, including failures; None before a response.
+
+        Build-and-run helpers still return an engine client. HTML5, hot reload,
+        and debugger helpers retain their existing None return. Read this
+        property immediately after those calls to inspect completion and issues.
+        It is cleared when the next command is sent, including transport failure.
+        """
+        return self._last_command_result
+
+    @staticmethod
+    def _read_editor_port(project_root: Path) -> int:
+        port_path = project_root / ".internal" / "editor.port"
+        if not port_path.exists():
+            raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
+        return int(port_path.read_text(encoding="utf-8").strip())
 
     def update_automation_bridge(
         self,
@@ -722,16 +842,23 @@ class Client:
         launcher: Optional[Union[str, Path]] = None,
     ) -> "Client":
         """Connect to this project's editor, launching Defold when necessary."""
+        check_cancelled()
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and greater than zero")
         project_root = Path(root).resolve()
         try:
-            client = cls(project_root)
-        except (FileNotFoundError, ValueError):
-            client = None
-        if client is not None and client._is_running(timeout=min(1.0, timeout)):
+            client = cls._wait_for_editor(
+                project_root,
+                timeout=timeout,
+                allow_absent=start_if_needed,
+                message=f"Could not connect to Defold editor for {project_root}",
+            )
+        except WaitTimeoutError as exc:
+            raise NotRunningError(str(exc)) from exc
+        if client is not None:
             client._record_lifecycle("editor_reused", port=client.port)
             return client
-        if not start_if_needed:
-            raise NotRunningError(f"Defold editor is not running for {project_root}")
 
         project_file = project_root / "game.project"
         if not project_file.is_file():
@@ -757,20 +884,12 @@ class Client:
         except OSError as exc:
             raise LaunchError(f"cannot launch Defold from {launcher_path}: {exc}") from exc
 
-        def ready() -> Optional["Client"]:
-            try:
-                candidate = cls(project_root)
-                return candidate if candidate._is_running(timeout=min(1.0, timeout)) else None
-            except (AutomationBridgeError, FileNotFoundError, OSError, ValueError):
-                return None
-
-        client = wait_until(
-            ready,
+        client = cls._wait_for_editor(
+            project_root,
             timeout=timeout,
-            interval=0.1,
             message=f"Defold editor did not start for {project_root}",
-            retry_exceptions=(AutomationBridgeError,),
         )
+        assert client is not None
         client._record_lifecycle(
             "editor_started",
             launcher=str(launcher_path),
@@ -778,6 +897,72 @@ class Client:
             port=client.port,
         )
         return client
+
+    @classmethod
+    def _wait_for_editor(
+        cls,
+        project_root: Path,
+        *,
+        timeout: float,
+        message: str,
+        allow_absent: bool = False,
+    ) -> Optional["Client"]:
+        """Wait for discovery; return None after consistent evidence of absence."""
+        started = time.monotonic()
+        deadline = started + timeout
+        absence_deadline = started + min(_EDITOR_ABSENCE_GRACE_PERIOD, timeout)
+        absent = object()
+        last_refused_port = None
+        unresolved_error = None
+
+        def ready():
+            nonlocal last_refused_port, unresolved_error
+            port = None
+            try:
+                # The editor can publish or replace its port while we wait.
+                port = cls._read_editor_port(project_root)
+                candidate = cls(project_root, port=port)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if allow_absent and unresolved_error is None and port == last_refused_port:
+                        return absent
+                    return None
+                candidate._check_connection(timeout=remaining)
+                return candidate
+            except (FileNotFoundError, ValueError) as exc:
+                failure = exc
+                if port is not None:
+                    unresolved_error = exc
+            except HttpError as exc:
+                failure = exc
+                cause = exc.__cause__
+                if isinstance(cause, urllib.error.URLError):
+                    cause = cause.reason
+                # Only a refused connection establishes that nobody is listening.
+                # A timeout, denied connection, or HTTP error may be a live editor.
+                if isinstance(cause, ConnectionRefusedError):
+                    last_refused_port = port
+                else:
+                    unresolved_error = exc
+            except OSError as exc:
+                failure = exc
+                unresolved_error = exc
+            # Keep the failure that prevents a launch, even if later probes only
+            # observe a missing file or a refused connection.
+            if unresolved_error is not None:
+                raise unresolved_error
+            if allow_absent and time.monotonic() >= absence_deadline:
+                return absent
+            raise failure
+
+        result = wait_until(
+            ready,
+            timeout=timeout,
+            interval=0.1,
+            message=message,
+            retry_exceptions=(HttpError, OSError, ValueError),
+        )
+        return None if result is absent else result
 
     @classmethod
     def _installations(cls) -> list[Installation]:
@@ -838,19 +1023,22 @@ class Client:
     def _is_running(self, timeout: float = 1.0) -> bool:
         """Return whether this project's recorded editor port serves the editor API."""
         try:
-            status, document = request_json(f"{self.base_url}/openapi.json", timeout=timeout)
-            if 200 <= status < 300:
-                self._openapi_document = document
-            return 200 <= status < 300
+            self._check_connection(timeout=timeout)
+            return True
         except AutomationBridgeError:
             return False
 
+    def _check_connection(self, *, timeout: float) -> None:
+        """Fetch the editor API, preserving the cause of failed discovery."""
+        url = f"{self.base_url}/openapi.json"
+        status, document = request_json(url, timeout=timeout)
+        if status < 200 or status >= 300:
+            raise HttpError("GET", url, f"HTTP {status}: {document}", status=status)
+        self._openapi_document = document
+
     def _openapi(self) -> dict:
         if self._openapi_document is None:
-            status, document = request_json(f"{self.base_url}/openapi.json", timeout=10.0)
-            if status < 200 or status >= 300:
-                raise HttpError("GET", f"{self.base_url}/openapi.json", str(document), status=status)
-            self._openapi_document = document
+            self._check_connection(timeout=10.0)
         return self._openapi_document
 
     def _require_operation(self, path: str, method: str) -> Mapping[str, Any]:
@@ -858,37 +1046,190 @@ class Client:
             raise UnsupportedOperationError(f"editor operation is outside the supported API: {method.upper()} {path}")
         operation = self._openapi().get("paths", {}).get(path, {}).get(method.lower())
         if not isinstance(operation, Mapping):
-            raise UnsupportedOperationError(f"editor does not advertise {method.upper()} {path}")
+            raise UnsupportedOperationError(
+                f"editor does not advertise {method.upper()} {path}",
+                minimum_version="1.13.2" if path == "/bob" else None,
+            )
         return operation
 
-    def _require_command(self, command: str) -> None:
-        operation = self._require_operation("/command/{command}", "post")
-        names = set()
-        for parameter in operation.get("parameters", ()):
-            if isinstance(parameter, Mapping) and parameter.get("name") == "command":
-                schema = parameter.get("schema", {})
-                if isinstance(schema, Mapping):
-                    names.update(str(value) for value in schema.get("enum", ()))
-        if command not in names:
-            raise UnsupportedOperationError(f"editor does not advertise command {command!r}")
+    def _command_info(self, command: str) -> Optional[CommandInfo]:
+        if not isinstance(command, str) or command not in _SUPPORTED_COMMANDS:
+            return None
+        paths = self._openapi().get("paths", {})
+        path = f"/command/{command}"
+        path_item = paths.get(path, {})
+        operation = path_item.get("post") if isinstance(path_item, Mapping) else None
+        if not isinstance(operation, Mapping):
+            path_item = paths.get("/command/{command}", {})
+            operation = path_item.get("post") if isinstance(path_item, Mapping) else None
+            if not isinstance(operation, Mapping):
+                return None
+            advertised = any(
+                isinstance(item, Mapping) and item.get("name") == "command"
+                and isinstance(item.get("schema"), Mapping)
+                and command in item["schema"].get("enum", ())
+                for item in (*path_item.get("parameters", ()), *operation.get("parameters", ()))
+            )
+            if not advertised:
+                return None
+        # Operation-level declarations override parameters shared by a path.
+        parameters = {
+            (item.get("name"), item.get("in")): dict(item)
+            for item in (*path_item.get("parameters", ()), *operation.get("parameters", ()))
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str) and item.get("name") != "command"
+        }
+        return CommandInfo(command, path, str(operation.get("summary", "")), str(operation.get("description", "")), tuple(parameters.values()), dict(operation))
+
+    def _require_command(self, command: str) -> CommandInfo:
+        info = self._command_info(command)
+        if info is None:
+            raise UnsupportedOperationError(
+                f"editor does not advertise supported command {command!r}",
+                minimum_version=_COMMAND_MINIMUM_VERSIONS.get(command),
+            )
+        return info
 
     def _empty_command(self, command: str, timeout: float) -> None:
+        check_cancelled()
         self._require_command(command)
         url = f"{self.base_url}/command/{command}"
+        self._last_command_result = None
         status, body = request_raw(url, method="POST", timeout=timeout)
-        if status < 200 or status >= 300:
-            raise CommandError(f"{command} failed with HTTP {status}: {body.decode('utf-8', 'replace')}")
+        if body.strip() in (b"", b"200 OK", b"202 Accepted"):
+            if status < 200 or status >= 300:
+                raise CommandError(f"{command} failed with HTTP {status}")
+            self._last_command_result = BuildResult(command, status, False, None, (), None, {})
+            return
+        try:
+            response = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as exc:
+            if status < 200 or status >= 300:
+                raise CommandError(f"{command} failed with HTTP {status}: {body.decode('utf-8', 'replace')}") from exc
+            raise HttpError("POST", url, "invalid command result JSON", status=status) from exc
+        self._accept_build_result(command, url, status, response)
+
+    def _accept_build_result(self, command: str, url: str, status: int, response: Any) -> BuildResult:
+        try:
+            if not isinstance(response, Mapping) or type(response.get("success")) is not bool:
+                raise ValueError("build result requires a boolean success")
+            raw_issues = response.get("issues", [])
+            if not isinstance(raw_issues, list) or any(not isinstance(item, Mapping) for item in raw_issues):
+                raise ValueError("build result issues must be an array of objects")
+            issues = tuple(BuildIssue.from_raw(item) for item in raw_issues)
+            target_url = None
+            if "target" in response:
+                target = response["target"]
+                if not isinstance(target, Mapping) or not isinstance(target.get("url"), str) or not target["url"]:
+                    raise ValueError("build result target requires a non-empty URL string")
+                target_url = target["url"]
+        except ValueError as exc:
+            raise HttpError("POST", url, str(exc), status=status) from exc
+        result = BuildResult(command, status, True, response["success"], issues, target_url, dict(response))
+        self._last_command_result = result
+        if status < 200 or status >= 300 or not result.success:
+            raise BuildError(issues, result=result)
+        return result
 
     def _json_command(self, command: str, timeout: float) -> tuple[int, dict]:
+        check_cancelled()
         self._require_command(command)
+        self._last_command_result = None
         return request_json(f"{self.base_url}/command/{command}", method="POST", timeout=timeout)
+
+    def compile(self, *, timeout: float = 60.0) -> BuildResult:
+        """Compile project resources and Lua without launching or bundling.
+
+        Supported from Defold 1.13.2. Older editors raise
+        UnsupportedOperationError; this never falls back to a launching command.
+        Return completion and diagnostics, or raise BuildError with the result.
+        Use build_and_run() directly when a runtime is needed; it compiles too.
+        """
+        status, response = self._json_command("compile", timeout)
+        return self._accept_build_result("compile", f"{self.base_url}/command/compile", status, response)
+
+    def bob(
+        self,
+        *,
+        options: Optional[Mapping[str, Any]] = None,
+        commands: Sequence[str] = (),
+        timeout: float = 300.0,
+    ) -> BuildResult:
+        """Build or bundle through the editor's Bob endpoint without launching.
+
+        Supported from Defold 1.13.2. ``options`` uses Bob CLI keys without
+        ``--``; repeatable values are arrays. For example, pass
+        ``options={"platform": "wasm-web", "archive": True}`` and
+        ``commands=("build", "bundle")`` to bundle HTML5. ``options={"help": True}``
+        prints available options to the editor console. Bob decides output paths
+        and defaults. Output is available through ``project.console.read()``.
+
+        Authentication reads ``.internal/editor.token`` on every call. Missing
+        or rejected credentials raise CommandError. Requests are not retried:
+        after a timeout, inspect the console before repeating a build. Return
+        completion and diagnostics, or raise BuildError with the result.
+        """
+        if options is not None and (not isinstance(options, Mapping) or any(not isinstance(key, str) for key in options)):
+            raise ValueError("Bob options must be an object with string keys")
+        if not isinstance(commands, Sequence) or isinstance(commands, (str, bytes)) or any(not isinstance(command, str) for command in commands):
+            raise ValueError("Bob commands must be a sequence of strings")
+        body = {"options": dict(options) if options is not None else {}, "commands": list(commands)}
+        # Validate before authentication or execution, including non-finite values.
+        try:
+            data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bob options must contain valid JSON values") from exc
+        check_cancelled()
+        self._require_operation("/bob", "post")
+        token_path = self.root / ".internal" / "editor.token"
+        try:
+            token = token_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            raise CommandError(f"cannot read editor authentication token at {token_path}; reopen the project in Defold 1.13.2 or later") from None
+        if not token or any(char.isspace() or not 33 <= ord(char) <= 126 for char in token):
+            raise CommandError(f"invalid editor authentication token at {token_path}; reopen the project")
+        self._last_command_result = None
+        url = f"{self.base_url}/bob"
+        try:
+            status, response = request_json(
+                url, method="POST", timeout=timeout, data=data,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            )
+        except HttpError as exc:
+            if exc.status not in (401, 403):
+                raise
+            raise CommandError("Bob authentication was rejected; reconnect to the editor and check .internal/editor.token") from None
+        if status in (401, 403):
+            raise CommandError("Bob authentication was rejected; reconnect to the editor and check .internal/editor.token")
+        return self._accept_build_result("bob", url, status, response)
+
+    def _run_focus(self, command: str, focus: Optional[bool]) -> Optional[bool]:
+        if focus is not None and type(focus) is not bool:
+            raise ValueError("focus must be a boolean or None")
+        self._require_command(command)
+        if self.commands.supports(command, parameter="focus"):
+            return False if focus is None else focus
+        if focus is False:
+            raise UnsupportedOperationError(
+                f"editor does not advertise focus control for {command!r}",
+                minimum_version="1.13.2",
+            )
+        # Legacy commands launch with focus. Do not send parameters they ignore.
+        return None
 
     def connect_engine(
         self,
         *,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Attach to the registered engine without taking lifecycle ownership.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
         return EngineClient._from_editor(
@@ -896,46 +1237,101 @@ class Client:
             build_command=None,
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
         )
+
 
     def build_and_run(
         self,
         *,
         timeout: float = 60.0,
+        focus: Optional[bool] = None,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Compile, launch, and return a client with owns_engine=True.
+
+        Uses ``run`` on Defold 1.13.2 and ``build`` on 1.13.1. Omitted focus
+        defaults to False when the editor advertises focus control, otherwise
+        preserves the legacy focused launch. Explicit ``focus=False`` requires
+        Defold 1.13.2. ``focus=True`` requests the native focused launch on both.
+        Unsupported requests fail before closing any engine. Build evidence is
+        available in ``last_command_result``; no separate compile is needed.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
+        if focus is not None and type(focus) is not bool:
+            raise ValueError("focus must be a boolean or None")
+        command = "run" if self.commands.supports("run") else "build"
+        negotiated_focus = self._run_focus(command, focus)
         return EngineClient._from_editor(
             self,
-            build_command="build",
+            build_command=command,
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
+            **({"focus": negotiated_focus} if negotiated_focus is not None else {}),
         )
+
 
     def clean_build_and_run(
         self,
         *,
         timeout: float = 60.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Clear build caches, rebuild, launch, and return an owned engine client.
+
+        Use only to recover from stale build caches. The native clean-build
+        command launches with focus on both Defold 1.13.1 and 1.13.2.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
+        self._require_command("clean-build")
         return EngineClient._from_editor(
             self,
             build_command="clean-build",
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
         )
 
+
     def build_and_run_html5(self, *, timeout: float = 60.0) -> None:
+        """Build and launch HTML5; inspect last_command_result for completion.
+
+        Defold 1.13.1 only acknowledges this request. Defold 1.13.2 waits for
+        completion and raises BuildError with source diagnostics on failure.
+        """
         self._empty_command("build-html5", timeout)
 
-    def _build_and_run_command(self, command: str, timeout: float = 60.0) -> None:
+    def _build_and_run_command(self, command: str, timeout: float = 60.0, *, focus: Optional[bool] = None) -> BuildResult:
         """Execute a desktop build-and-run command and await endpoint registration."""
-        if command not in {"build", "clean-build"}:
+        check_cancelled()
+        if command not in {"build", "run", "clean-build"}:
             raise ValueError(f"unsupported desktop build-and-run command: {command}")
         self._require_command(command)
+        self._last_build_target_port = None
+        self._last_build_had_engine_service_port = None
+        url = f"{self.base_url}/command/{command}"
+        if command == "run" or focus is not None:
+            negotiated_focus = self._run_focus(command, focus)
+            if negotiated_focus is not None:
+                url += "?" + urllib.parse.urlencode({"focus": "true" if negotiated_focus else "false"})
         self._record_lifecycle("editor_build_started")
         previous_lines = self._console_lines()
         previous_registration_count = self._endpoint_registered_count(previous_lines)
@@ -943,16 +1339,20 @@ class Client:
         previous_port = self._engine_service_port_value()
         if previous_port is not None:
             self._engine_service_port = previous_port
+        self._last_command_result = None
         try:
-            status, response = request_json(f"{self.base_url}/command/{command}", method="POST", timeout=timeout)
+            status, response = request_json(url, method="POST", timeout=timeout)
+            result = self._accept_build_result(command, url, status, response)
         except Exception as exc:
             self._record_lifecycle("editor_build_failed", error=str(exc))
             raise
-        if status >= 400 or not response.get("success"):
-            issues = tuple(BuildIssue.from_raw(item) for item in response.get("issues", ()) if isinstance(item, Mapping))
-            self._record_lifecycle("editor_build_failed", issues=issues)
-            raise BuildError(issues)
         self._record_lifecycle("editor_build_completed")
+
+        if result.target_url is not None:
+            self._last_build_target_port = self._local_target_port(result.target_url)
+            self._last_build_had_engine_service_port = True
+            self._record_lifecycle("editor_target_reported", port=self._last_build_target_port)
+            return result
 
         try:
             wait_until(
@@ -969,7 +1369,30 @@ class Client:
             raise AutomationBridgeError(str(exc)) from exc
         self._record_lifecycle("new_engine_registered")
         self._last_build_had_engine_service_port = self._latest_registration_has_engine_service_port()
-        time.sleep(0.2)
+        cancellable_sleep(0.2)
+        return result
+
+    @staticmethod
+    def _local_target_port(url: str) -> int:
+        """Accept only URLs representable by the IPv4 loopback engine client."""
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+            if (
+                parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost"}
+                and port is not None and 1 <= port <= 65535
+                and parsed.username is None and parsed.password is None
+                and parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+                and not any(char.isspace() for char in url)
+            ):
+                return port
+        except ValueError:
+            pass
+        raise UnsupportedOperationError(
+            "editor returned a target URL unsupported by the local engine client; "
+            "expected http://127.0.0.1:PORT or http://localhost:PORT. "
+            "Select a local engine target in Defold"
+        )
 
     def _console_lines(self) -> list:
         """Return current editor console lines."""
@@ -1046,33 +1469,55 @@ class Client:
         ports = self._engine_service_ports()
         return ports[0] if ports else None
 
-    def _engine_service_ports(self) -> list:
+    def _cached_engine_service_port_value(self) -> Optional[int]:
+        """Return a cached port only when it has enough identity data for validation."""
+        port = self._engine_service_port
+        cached = self._cached_engine_identity
+        if port is None or port <= 0 or not isinstance(cached, dict):
+            return None
+        if cached.get("port") != port:
+            return None
+        for key in ("engine_instance_id", "project_identity"):
+            value = cached.get(key)
+            if not isinstance(value, str) or not value:
+                return None
+        return port
+
+    def _engine_service_ports(self, lines: Optional[list] = None) -> list:
         """Return candidate engine service ports from current logs, then the cached port."""
-        candidates = self._current_registration_engine_service_ports()
+        candidates = self._current_registration_engine_service_ports(lines)
 
         if self._engine_service_port is not None:
             self._append_port_candidate(candidates, self._engine_service_port)
         return candidates
 
-    def _current_registration_engine_service_ports(self) -> list:
+    def _current_registration_engine_service_ports(self, lines: Optional[list] = None) -> list:
         """Return ports logged before the latest Automation Bridge endpoint registration only."""
-        return self._latest_registration_engine_service_ports(self._console_lines())
+        if lines is None:
+            lines = self._console_lines()
+        return self._latest_registration_engine_service_ports(lines)
 
-    def _remotery_url_value(self) -> Optional[str]:
+    def _cached_remotery_url_value(self) -> Optional[str]:
+        """Return the cached Remotery URL without reading the editor console."""
+        return self._remotery_url
+
+    def _remotery_url_value(self, lines: Optional[list] = None) -> Optional[str]:
         """Return the Remotery websocket URL from current logs, then the cached URL."""
-        urls = self._remotery_urls()
+        urls = self._remotery_urls(lines)
         return urls[0] if urls else None
 
-    def _remotery_urls(self) -> list:
+    def _remotery_urls(self, lines: Optional[list] = None) -> list:
         """Return candidate Remotery websocket URLs from current logs, then the cached URL."""
-        candidates = self._current_registration_remotery_urls()
+        candidates = self._current_registration_remotery_urls(lines)
         if self._remotery_url is not None:
             self._append_unique_candidate(candidates, self._remotery_url)
         return candidates
 
-    def _current_registration_remotery_urls(self) -> list:
+    def _current_registration_remotery_urls(self, lines: Optional[list] = None) -> list:
         """Return Remotery websocket URLs logged before the latest endpoint registration only."""
-        return self._latest_registration_remotery_urls(self._console_lines())
+        if lines is None:
+            lines = self._console_lines()
+        return self._latest_registration_remotery_urls(lines)
 
     @classmethod
     def _latest_registration_engine_service_ports(cls, lines: list) -> list:
@@ -1176,6 +1621,23 @@ class Client:
             return False
         return True
 
+    def _cached_engine_health_matches(self, port: int, health: dict) -> bool:
+        """Return whether health describes the exact engine identity stored for this port."""
+        cached = self._cached_engine_identity
+        identity = health.get("identity", {}) if isinstance(health, dict) else {}
+        if not isinstance(cached, dict) or not isinstance(identity, dict):
+            return False
+        if cached.get("port") != int(port):
+            return False
+        for key in ("engine_instance_id", "project_identity"):
+            cached_value = cached.get(key)
+            if not cached_value or identity.get(key) != cached_value:
+                return False
+        cached_process = cached.get("process_id")
+        if cached_process is not None and identity.get("process_id") != cached_process:
+            return False
+        return True
+
     def _record_lifecycle(self, stage: str, **details: object) -> None:
         """Record an observable editor/bootstrap lifecycle transition."""
         event = {"stage": stage, "state": "completed", "monotonic": time.monotonic()}
@@ -1259,11 +1721,46 @@ class Client:
 
 
 def is_running(root: Union[str, Path] = ".", *, timeout: float = 1.0) -> bool:
-    """Return whether the project's recorded editor endpoint is healthy."""
+    """Check the recorded editor endpoint once; use open_project for retries."""
     try:
         return Client(root)._is_running(timeout=timeout)
     except (AutomationBridgeError, FileNotFoundError, OSError, ValueError):
         return False
+
+
+def doctor(
+    project_path: Union[str, Path] = ".",
+    *,
+    required_capabilities: Sequence[str] = (),
+    timeout: float = 2.0,
+) -> DoctorReport:
+    """Inspect setup, versions, capabilities and connections without launching.
+
+    ``timeout`` bounds each network probe. No build, install, project edit,
+    input acquisition, background log collector or cache write is performed.
+    Inspect ``report.checks`` for actionable failures, or serialize with
+    ``report.as_dict()``. ``ready`` requires a compatible running engine.
+    """
+    from .diagnostics import inspect_project
+    return inspect_project(project_path, required_capabilities=required_capabilities, timeout=timeout)
+
+
+def update_python_wrapper(project_path: Union[str, Path] = ".") -> Path:
+    """Update the project's Python wrapper from its already-fetched dependency.
+
+    No editor or network connection is required. Fetch Libraries first, then
+    run this helper from an extension checkout or the standalone install.py.
+    It atomically replaces the complete managed automation-bridge-python
+    directory; keep project scripts elsewhere and restart Python afterward.
+    The dependency URL and other project settings remain unchanged.
+    """
+    root = Path(project_path).expanduser().resolve()
+    dependency = _bridge_dependency(_read_project_configuration(root))
+    destination = root / _AUTOMATION_BRIDGE_PYTHON_DIRECTORY
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise AutomationBridgeUpdateError(f"refusing to replace non-directory Python wrapper path: {destination}")
+    _replace_python_wrapper(_automation_bridge_archive_path(root, dependency), destination)
+    return destination
 
 
 def open_project(
@@ -1273,7 +1770,19 @@ def open_project(
     timeout: float = 30.0,
     launcher: Optional[Union[str, Path]] = None,
 ) -> Client:
-    """Open or reuse a Defold editor for one project."""
+    """Open or reuse a Defold editor for one project.
+
+    Discovery retries for up to ``timeout`` seconds, rereading the port file
+    between attempts. Each HTTP request can use the remaining discovery time.
+    ``timeout`` must be finite and greater than zero.
+
+    With ``start_if_needed=True``, a missing/invalid port file or refused
+    connection gets up to five seconds (bounded by ``timeout``) to recover
+    before launching Defold. Startup then has its own ``timeout`` budget.
+    Other connection failures are retried for the full discovery timeout and
+    raise ``NotRunningError`` with diagnostics instead of launching a duplicate.
+    ``start_if_needed=False`` always waits for discovery without launching.
+    """
     return Client._open_project(
         root,
         start_if_needed=start_if_needed,
@@ -1299,14 +1808,18 @@ __all__ = [
     "AutomationBridgeUpdateResult",
     "BuildError",
     "BuildIssue",
+    "BuildResult",
     "Client",
     "CommandError",
+    "CommandInfo",
     "Commands",
     "Console",
     "ConsoleRegion",
     "ConsoleSnapshot",
     "ConsoleStream",
     "Debugger",
+    "DiagnosticCheck",
+    "DoctorReport",
     "Error",
     "FetchLibrariesResult",
     "HttpError",
@@ -1324,8 +1837,10 @@ __all__ = [
     "SourceRange",
     "UnsupportedOperationError",
     "installation_registry_path",
+    "doctor",
     "installations",
     "is_running",
     "latest_installation",
     "open_project",
+    "update_python_wrapper",
 ]

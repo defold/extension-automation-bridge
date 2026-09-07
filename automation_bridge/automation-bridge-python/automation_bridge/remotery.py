@@ -10,6 +10,7 @@ import socket
 import struct
 import threading
 import time
+from .cancellation import check_cancelled
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -838,6 +839,7 @@ class RemoteryClient:
         """
         deadline = _deadline(self.timeout if timeout is None else timeout)
         while True:
+            check_cancelled()
             message_id, body = self._next_message(deadline)
             if message_id != "SMPL":
                 continue
@@ -898,6 +900,7 @@ class RemoteryClient:
         """Read and return one profiler property/counter snapshot."""
         deadline = _deadline(self.timeout if timeout is None else timeout)
         while True:
+            check_cancelled()
             message_id, body = self._next_message(deadline)
             if message_id != "PSNP":
                 continue
@@ -928,6 +931,7 @@ class RemoteryClient:
         property_frames: List[RemoteryPropertyFrame] = []
 
         while len(sample_frames) < frames:
+            check_cancelled()
             message_id, body = self._next_message(deadline)
             if message_id == "SMPL":
                 frame = parse_sample_frame(body, self._sample_names)

@@ -18,7 +18,8 @@ from .client import (
     UnsupportedCapabilityError,
 )
 from .events import CommandTimeout, Event, EventBufferOverflow, EventStream, StateSnapshot
-from .elements import Bounds, Element
+from .application import ApplicationCatalogPage, ApplicationEntry
+from .elements import Bounds, Element, ElementPage, ElementSelector
 from .profiler import *  # Re-export the focused profiler result and control types.
 from .recording import (
     VideoRecordingCapabilities,
@@ -32,6 +33,7 @@ from .receipts import ObservationReceipt, ScreenshotReceipt
 from .trace import TraceSession
 from .visual import VisualObservation
 from .waits import WaitTimeoutError, wait_until
+from .cancellation import CancellationToken, OperationCancelled, cancellation_scope
 
 
 def connect(

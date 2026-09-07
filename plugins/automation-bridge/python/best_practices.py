@@ -31,6 +31,14 @@ from automation_bridge import editor, engine
 ProjectPath = Union[str, Path]
 
 
+def diagnose_project(project_root: ProjectPath = ".") -> editor.DoctorReport:
+    """Inspect setup without launching or building, and retain actionable errors."""
+    report = editor.doctor(project_root, required_capabilities=("elements",))
+    for check in report.checks:
+        print(check.name, check.status, check.message, check.action or "")
+    return report
+
+
 def update_bridge(
     project: editor.Client,
     version: Optional[str] = None,
@@ -82,7 +90,7 @@ def inspect_editor_services(project: editor.Client) -> None:
 
 
 def build_owned_game(project: editor.Client) -> engine.Client:
-    """Build a fresh engine and declare the features required by the script."""
+    """Compile and launch directly; a separate compile call is unnecessary."""
     return project.build_and_run(
         required_capabilities=(
             "scene",
@@ -93,6 +101,11 @@ def build_owned_game(project: editor.Client) -> engine.Client:
             "screenshot",
         ),
     )
+
+
+def check_compilation(project: editor.Client) -> editor.BuildResult:
+    """Check resources and Lua without launching; requires Defold 1.13.2."""
+    return project.compile()
 
 
 def connect_to_existing_game(project: editor.Client) -> engine.Client:
@@ -153,6 +166,7 @@ def send_safe_input(game: engine.Client) -> None:
 
     game.type_text("literal {UTF-8} text")
     game.key("ENTER")
+    game.key("SPACE", hold=1.0, wait="released", timeout=2.0)
 
 
 def control_input_lifecycle(game: engine.Client) -> None:
@@ -298,6 +312,8 @@ def close_owned_game(game: engine.Client, owns_engine: bool) -> None:
     """Do not terminate a reused engine merely because a script is finished."""
     if owns_engine:
         game.close_engine()
+    else:
+        game.close()
 
 
 if __name__ == "__main__":

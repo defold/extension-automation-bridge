@@ -183,7 +183,23 @@ function init(self)
 			})
 			return { reset = true }
 		end)
+		automation_bridge.describe("command", "sample.reset", {
+			description = "Remove all items and close the win popup.",
+			input_schema = { type = "object", properties = { request_id = { type = "string" } } },
+			output_schema = { type = "object", properties = { reset = { type = "boolean" } }, required = { "reset" } },
+		})
+		automation_bridge.describe("state", "sample.game", {
+			description = "Current game status; published after reset, spawn, and merge.",
+			schema = { type = "object", properties = { busy = { type = "boolean" }, item_count = { type = "integer" } }, required = { "busy", "item_count" } },
+		})
+		automation_bridge.describe("event", "sample.reset_complete", {
+			description = "Emitted after reset with the caller's optional request_id.",
+			schema = { type = "object", properties = { request_id = { type = "string" } } },
+		})
 		publish_automation_state()
+		if sys.get_config_int("automation_bridge.test_contracts", 0) == 1 then
+			require("tests.application_contracts").register(function() return items end, item_bounds)
+		end
 	end
 end
 

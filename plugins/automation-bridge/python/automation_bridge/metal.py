@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Union
 
 from .waits import wait_until
+from .cancellation import OperationCancelled, check_cancelled
 
 
 class MetalCaptureError(RuntimeError):
@@ -71,6 +72,7 @@ class MetalCaptureClient:
         The running engine must use the Metal graphics adapter and must have
         been launched with ``METAL_CAPTURE_ENABLED=1``.
         """
+        check_cancelled()
         if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= 10000:
             raise ValueError("frames must be an integer from 1 through 10000")
         if wait and timeout < 0:
@@ -83,7 +85,7 @@ class MetalCaptureClient:
             self.bridge.request(
                 "POST",
                 "/metal",
-                params={"path": str(output), "frames": frames},
+                json_body={"path": str(output), "frames": frames},
             )
         )
         self.bridge._trace_record("metal_capture_started", capture.to_dict())
@@ -99,12 +101,19 @@ class MetalCaptureClient:
                 raise MetalCaptureError(capture.error or "Metal GPU trace capture failed")
             return capture if capture.terminal else None
 
-        capture = wait_until(
-            terminal,
-            timeout=timeout,
-            interval=interval,
-            message="Metal GPU trace capture did not finish",
-        )
+        try:
+            capture = wait_until(
+                terminal,
+                timeout=timeout,
+                interval=interval,
+                message="Metal GPU trace capture did not finish",
+            )
+        except OperationCancelled as exc:
+            try:
+                self.stop(wait=False)
+            except Exception as cleanup_error:
+                exc.cleanup_error = cleanup_error
+            raise
         self.bridge._trace_record("metal_capture_finished", capture.to_dict())
         return capture
 

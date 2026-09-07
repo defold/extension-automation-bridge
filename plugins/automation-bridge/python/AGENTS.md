@@ -9,6 +9,9 @@
   Never merge wrapper versions or store project code in the wrapper directory.
 - Probe a running editor with
   `editor.open_project(".", start_if_needed=False)` before launching one.
+- Use `editor.doctor(".")` for setup, version, capability and connection
+  diagnostics without launching or writing project files. Seed a wrapper with
+  `install.py PROJECT_PATH` after Fetch Libraries when it has not been copied yet.
 - macOS: a launch must run unsandboxed; an existing editor may be reused.
   Detached processes and `/usr/bin/open` do not escape the inherited sandbox.
 - Windows: if the sandbox blocks the JDK loopback connection, start Defold
@@ -20,6 +23,8 @@
   exposes the required native feature.
 - `elements()` is paginated; use `count()` when the complete match count is
   required.
+- Use `elements_page()` for continuation cursors, match counts and snapshot
+  evidence; see `engine.ElementSelector` for typed filters and their semantics.
 - `Element` objects are snapshots. Re-query after state or scene changes. Pass
   `Element` objects to `click()` and both ends of `drag()` for stale-identity
   protection; handle `engine.StaleElementError` by re-querying.
@@ -28,6 +33,11 @@
   validated special key.
 - Prefer events, published state, commands, acknowledgements, frame waits, and
   element waits over sleeps.
+- Discover game-specific operations with `game.application_catalog()`; command
+  argument/result and state/event schemas describe application-owned contracts.
+- Wrap interruptible work in `game.cancellation_scope(token)` using an
+  `engine.CancellationToken` per operation. Native cleanup remains authoritative;
+  inspect `OperationCancelled.cleanup_error` when a cleanup request is refused.
 - Use atomic receipts for screenshots and recordings. Start visual inspection at
   `resolution_multiplier=0.5`; use `project.preview.render()` for editor-side
   validation without running the game. Optional diagnostics live under

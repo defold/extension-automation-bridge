@@ -12,6 +12,22 @@ docstrings for details.
 
 ## Install or update Automation Bridge
 
+To copy or refresh the Python wrapper, run `install.py /absolute/path/to/project`
+from this directory after the target project's Fetch Libraries completes. It
+locates the archive for the configured dependency and atomically replaces the
+wrapper without launching Defold or rewriting the dependency. From an existing
+wrapper, the equivalent API is `editor.update_python_wrapper(project_path)`.
+Restart Python after replacing a wrapper. No project code should be stored in
+the managed directory.
+
+Use `editor.doctor(project_path, required_capabilities=("elements",))` to inspect
+project configuration, copied/loaded Python versions, editor installations,
+connection errors, native API compatibility, and required capabilities. It never
+launches or builds, acquires input, starts a log collector, or writes caches.
+Its `timeout` bounds each network probe; total time depends on how many candidate
+ports are inspected. Missing capabilities are failures; an unavailable launcher
+registry is a warning when an editor is already running.
+
 Once this helper directory is present, use the editor client to install or
 update the matching extension dependency and refresh the complete copied Python
 wrapper:
@@ -78,6 +94,27 @@ Use `game.close_engine()` only when the script intentionally owns engine cleanup
 
 ## Public API
 
+Use `engine.ElementSelector` as a typed dictionary of supported query keywords.
+Its docstring specifies substring versus exact matching, boolean filters, and
+pagination limits. Selectors reject malformed supplied values before a request.
+
+`game.elements()` still returns a list. Use `game.elements_page()` when the next
+cursor or complete match count matters:
+
+```python
+from automation_bridge import engine
+
+selector: engine.ElementSelector = {"type": "goc", "visible": True, "limit": 20}
+page = game.elements_page(**selector)
+print(page.count, page.matched, page.scene_sequence, page.engine_frame)
+if page.next_cursor is not None:
+    next_page = game.elements_page(**selector, cursor=page.next_cursor)
+```
+
+Pagination requires `scene.pagination`. Each page is a live snapshot; a cursor
+does not freeze the scene. `element()` and `maybe_element()` reject ambiguous
+selectors even when `limit=1` would hide additional matches.
+
 The package root exposes only `editor` and `engine`.
 
 - Bootstrap: `editor.open_project(...)`, `project.build_and_run()`,
@@ -103,9 +140,21 @@ The package root exposes only `editor` and `engine`.
 - Capture and diagnostics: screenshots, historical `game.logs`, live engine
   logs, profiling, visual comparison, tracing, `game.video_recording`, and
   `game.metal_capture` on supported macOS/Metal runtimes.
-- Raw engine escape hatch: `game.request(method, path, params=..., json=...)`.
+- Raw engine escape hatch: `game.request(method, path, params=..., json_body=...)`.
 
 ## Bootstrap
+
+Editor connection and build helpers accept optional `client_id` and `session_id`.
+Reuse both only for the same logical automation session; independent agents must
+use distinct identities. Builds return `game.owns_engine == True`; attachment
+through the editor or a known port returns `False`. `game.session_info()` exposes
+this information without another network request.
+
+`game.close()` (also called by the engine client's context manager) releases the
+background log collector and leaves Defold running. It is idempotent; reconnect
+before making further requests. Explicit streams/captures keep their own context
+managers. Flush this session's input before closing if cancellation is intended.
+Engine termination remains the separate, explicit `game.close_engine()` operation.
 
 ```python
 from automation_bridge import editor, engine
@@ -135,6 +184,19 @@ explicit.
 The editor bootstrap discovers `.internal/editor.port`, launches Defold when
 needed, rejects stale engine ports, and waits for Automation Bridge health.
 Pass `start_if_needed=False` to require an already-running editor.
+
+Editor discovery retries for up to `timeout` seconds (30 by default), rereading
+the port file between attempts. HTTP requests use the remaining discovery time,
+so a slow response can still reuse the editor. With automatic startup enabled,
+a missing/invalid port file or refused connection gets a five-second grace
+period (bounded by `timeout`) before launch; a newly launched editor then has its
+own `timeout` budget. Timeouts, permission failures, and HTTP/JSON errors raise
+`NotRunningError` with the underlying failure if discovery cannot recover.
+These failures do not trigger another editor launch.
+
+Use `editor.is_running(".", timeout=1)` for a single Boolean probe. A `False`
+result means the endpoint did not respond successfully; `open_project()` handles
+the retries and startup decision.
 
 ## Reliable game test loop
 
@@ -223,8 +285,10 @@ from automation_bridge import editor
 project = editor.open_project(".", start_if_needed=False)
 ```
 
-If this raises `NotRunningError`, the required launch procedure differs by
-platform:
+If this raises `NotRunningError`, inspect the included discovery failure first.
+A timeout or denied connection can mean the editor is already running but could
+not be reached. If the editor needs to be started, the launch procedure differs
+by platform:
 
 - **macOS:** Rerun the normal bootstrap with escalated/unsandboxed execution.
   Defold inherits the Python parent's sandbox and otherwise cannot register with
@@ -267,6 +331,52 @@ for preference in project.preferences.list(prefix="code"):
 
 ## Capabilities
 
+Editor command discovery supports Defold 1.13.1's command enum and 1.13.2's
+individual OpenAPI paths. Use `project.commands.catalog()` for descriptions and
+parameter schemas, and `project.commands.supports("run", parameter="focus")`
+to probe support. Pass `refresh=True` to `catalog()` after capabilities change.
+New-feature `editor.UnsupportedOperationError` messages identify Defold 1.13.2
+as the minimum version; their `minimum_version` attribute is available to hosts.
+
+`project.last_command_result` retains typed `editor.BuildResult` diagnostics after
+build/run, HTML5, hot reload, and debugger operations. It includes warnings,
+zero-based source ranges, completion status, and an optional `target_url`.
+`editor.BuildError.result` retains the same evidence on failure. Existing helpers
+keep their return values. On 1.13.1, HTML5, hot reload, and debugger acknowledgements
+have `completed=False` and `success=None`; 1.13.2 reports their build completion.
+
+Use `project.compile()` on Defold 1.13.2 to validate resources and Lua without
+launching or bundling. It returns a `BuildResult`; compilation failures raise
+`BuildError`. When runtime testing is needed, call `project.build_and_run()`
+directly: it compiles and launches through `run` on 1.13.2 or `build` on 1.13.1.
+The default avoids taking focus where supported and preserves the legacy launch
+on 1.13.1. Explicit `focus=False` requires advertised focus control (1.13.2);
+`focus=True` works on either version. Unsupported requests fail before engine
+cleanup. `clean_build_and_run()` still uses the native focused launch on both.
+
+Defold 1.13.2 also supports Bob builds and bundles without launching:
+
+```python
+result = project.bob(
+    options={"platform": "wasm-web", "archive": True},
+    commands=("build", "bundle"),
+)
+```
+
+Bob option keys omit `--`; arrays supply repeatable options. Use
+`project.bob(options={"help": True})` and `project.console.read()` for Bob help
+and output. The wrapper reads `.internal/editor.token` for each call and sends
+it as a bearer token. Missing or rejected credentials raise `CommandError`.
+Bob requests are never automatically retried after an uncertain transport failure.
+
+When a 1.13.2 build result includes a target URL, bootstrap connects to that
+target and validates native health, capabilities, and identity before caching it.
+The current engine transport supports `http://127.0.0.1:PORT` and
+`http://localhost:PORT`. Other targets raise `UnsupportedOperationError`; select
+a local engine in Defold. A reported target never falls back to historical ports
+or triggers an automatic rebuild. Results without a URL continue to use console
+registration and existing recovery behavior, including on Defold 1.13.1.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python
@@ -293,11 +403,13 @@ Capability declarations may use `name>=N`. Incompatible API versions raise
 ## Raw requests
 
 Named helpers are preferred. For endpoint-level debugging, use the single raw
-escape hatch:
+escape hatch. `params` are URL query fields; use `json_body` for `POST` and
+`PUT` payloads so Defold's request-resource limit does not constrain their
+size. The former `json` spelling remains accepted as a compatibility alias:
 
 ```python
 health = game.request("GET", "/health")
-result = game.request("POST", "/coordinates/convert", json={
+result = game.request("POST", "/coordinates/convert", json_body={
     "point": {"x": 0.5, "y": 0.5},
     "from_space": "normalized_viewport",
     "to_space": "window",
@@ -350,12 +462,17 @@ game.click(480, 320)
 game.drag(first, second, duration=0.2, easing="ease_in_out")
 game.type_text("Hello")
 game.key("SPACE")
+game.key("SPACE", hold=1.5, wait="released", timeout=3)
 ```
 
-`key()` accepts case-insensitive letters, digits, function keys, and common names
-such as `SPACE`, `ESCAPE`, and `ENTER`, with or without the `KEY_` prefix. Unknown
-names are rejected before input is queued. `type_text()` always treats braces and
-other characters as literal UTF-8 text.
+`key()` accepts case-insensitive letters, digits, and every named key in Defold's
+`dmHID::Key` enum, with or without the `KEY_` prefix. This includes function,
+punctuation, keypad, lock, modifier, navigation, and system keys such as
+`EQUALS`, `KP_0`, and `CAPS_LOCK`. Unknown names are rejected before input is
+queued. `hold` keeps the key pressed for `0..60` seconds; held input requires a
+native endpoint advertising `input.key>=2`. When waiting for release, set
+`timeout` above the requested hold. `type_text()` always treats braces and other
+characters as literal UTF-8 text.
 
 `click()`, `drag()`, and `drag_path()` wait for native release by default.
 `type_text()` and `key()` return after the request is accepted unless a `wait`
@@ -391,6 +508,51 @@ with game.pointer((100, 100), lease=10) as pointer:
 ```
 
 ## Synchronization and observation
+
+Discover game-specific operations before calling them:
+
+```python
+page = game.application_catalog(kind="command")
+for entry in page.entries:
+    print(entry.name, entry.description, entry.input_schema, entry.output_schema)
+if page.next_cursor is not None:
+    following = game.application_catalog(kind="command", cursor=page.next_cursor)
+    assert (following.engine_instance_id, following.revision) == (page.engine_instance_id, page.revision)
+```
+
+`engine.ApplicationCatalogPage` retains counts, cursor, revision and engine
+identity. `engine.ApplicationEntry` exposes descriptions and schemas; use
+`kind="state"` or `kind="event"` to discover value/data contracts via `.schema`.
+Games declare metadata with Lua `automation_bridge.describe()`; see
+`examples/application_sync.script` in the extension source. Old runtimes without
+`application.catalog` fail with `UnsupportedCapabilityError` before querying the
+endpoint. Schemas document application expectations; they do not validate payloads.
+
+Use a shared cancellation token when a host or another thread may stop an
+operation:
+
+```python
+token = engine.CancellationToken()
+# The controlling thread calls token.cancel("request cancelled").
+try:
+    with game.cancellation_scope(token):
+        game.key("SPACE", hold=5, wait=False)
+        game.wait_for_state("sample.game.ready", True)
+except engine.OperationCancelled as exc:
+    print(exc.reason, exc.cleanup_error)
+```
+
+Create one token per operation and enter the scope in the thread doing the work.
+Polling delays wake when cancelled; in-flight HTTP/profiler requests remain
+bounded by their transport timeouts. `game.cancellation_scope()` requests release
+of that client's queued input on cancellation. `engine.cancellation_scope()` also
+works without a client, including editor bootstrap. It cancels waits, with input
+receipt and Metal capture waits using their existing native cleanup paths.
+Pending commands receive a cancellation request; native code decides whether it
+can be honored. Running Lua callbacks cannot be preempted. Cleanup failures are
+retained in `OperationCancelled.cleanup_error`. Cancellation does not undo
+completed operations or terminate an engine. Use context managers for streams
+and recordings so they close when a scope is interrupted.
 
 Use application events and published state instead of sleeps:
 
@@ -634,3 +796,9 @@ them from the extension repository root with:
 PYTHONPATH=automation_bridge/automation-bridge-python \
 python3 -m unittest tests.test_automation_bridge_api tests.test_tooling
 ```
+
+CI explicitly runs the Python/tooling unit classes on Linux, macOS and Windows
+with Python 3.10 and 3.14. The complete suite also exercises a running Defold
+sample project. Set `AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1` for release checks so a
+missing editor/engine causes a failure instead of skipping runtime coverage.
+See the source repository's `DEVELOPMENT.md` for unit-only and runtime commands.

@@ -124,9 +124,9 @@ class VideoRecordingClient:
             raise ValueError("fps must be an integer between 1 and 60")
         if audio is not None and not isinstance(audio, bool):
             raise TypeError("audio must be a boolean or None")
-        params: Dict[str, Any] = {"fps": fps}
+        json_body: Dict[str, Any] = {"fps": fps}
         if audio is not None:
-            params["audio"] = audio
+            json_body["audio"] = audio
         if size is not None:
             if (
                 not isinstance(size, tuple)
@@ -135,12 +135,12 @@ class VideoRecordingClient:
                 or any(value < 1 or value > 16384 for value in size)
             ):
                 raise ValueError("size must be a (width, height) tuple with values between 1 and 16384")
-            params.update({"width": size[0], "height": size[1]})
+            json_body.update({"width": size[0], "height": size[1]})
 
         output = Path(path).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
-        params["path"] = str(output)
-        raw = self.bridge.request("POST", "/recording/start", json=params)
+        json_body["path"] = str(output)
+        raw = self.bridge.request("POST", "/recording/start", json_body=json_body)
         metadata = VideoRecordingMetadata.from_raw(raw)
         self.bridge._trace_record("video_recording_started", metadata.to_dict())
         return VideoRecordingSession(self, metadata)

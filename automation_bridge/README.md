@@ -50,11 +50,19 @@ Success responses use this envelope:
 { "ok": true, "data": {} }
 ```
 
-Error responses use this envelope and an appropriate HTTP status:
+Error responses use this envelope:
 
 ```json
-{ "ok": false, "error": { "code": "not_found", "message": "..." } }
+{ "ok": false, "error": { "status": 409, "code": "stale_scene", "message": "..." } }
 ```
+
+`error.status` is the logical API status. Defold's embedded DLIB HTTP server only
+supports reason phrases for `200`, `302`, `404`, and `500`; other logical
+error statuses are therefore transported as HTTP `500` to avoid an engine
+warning without turning a failure into a successful response. Existing `404`
+and `500` statuses remain unchanged. Clients should use `ok` and `error.status`
+for the precise result; older and generic clients still receive a non-2xx
+failure. See the repository-root `DEVELOPMENT.md` before changing this mapping.
 
 Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `unsupported_media_type`, `not_found`, `method_not_allowed`, `body_not_supported`,
@@ -211,7 +219,7 @@ curl -fsS "$BASE/lifecycle" | python3 -m json.tool
 
 Health and lifecycle are independent of scene, graphics, screenshots, windows, and
 HID. Capabilities are advertised only when their backing context exists. Calling an
-omitted route returns `501 unsupported_capability`, so CI can distinguish an unsupported
+omitted route returns logical status `501 unsupported_capability`, so CI can distinguish an unsupported
 backend from a transient runtime failure. True `DM_HEADLESS` registration still needs
 the public Defold debug transport proposed in the specification linked above.
 
@@ -280,6 +288,11 @@ curl -fsS "$BASE/scene?visible=1&include=bounds,properties" | python3 -m json.to
 
 Searches elements with simple filters. This is the main discovery endpoint for automation clients.
 
+Pagination values are validated: `limit` must be an integer from 0 through 500;
+`offset` and `cursor` must be unsigned 32-bit integers. Malformed supplied values
+return `bad_request`. A valid cursor takes precedence over a valid offset. Pages
+are independent live snapshots; compare their frame and scene metadata.
+
 Query parameters:
 
 - `id`: exact element id.
@@ -328,7 +341,7 @@ All click, drag, path, pointer, and key actions share one FIFO. Only the first a
 Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch.
 
 When resolving an element id, pass `expected_scene_sequence` to reject a changed
-snapshot with HTTP 409 `stale_scene`. Input receipts include the scene sequence
+snapshot with logical status 409 `stale_scene`. Input receipts include the scene sequence
 and engine frame used for resolution.
 
 ```sh
@@ -368,17 +381,17 @@ Lifecycle terms are exact: `accepted` means queued, `started` means the first do
 
 Use `GET /input/status?input_id=42` for current/bounded-history status and `GET /input/pending` for the FIFO. `POST /input/cancel?input_id=42&release=1&client_id=...&session_id=...` cancels one action. `POST /input/flush?release=1&client_id=...&session_id=...` cancels the owning session's active and later actions. `release=1` releases mouse/key state or emits a cancelled touch contact. A pointer or controller lease expiry performs the same safe cleanup.
 
-Element-targeted input accepts `expected_scene_sequence`. A mismatch returns HTTP 409 with `stale_scene` before resolving a snapshot/path element id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
+Element-targeted input accepts `expected_scene_sequence`. A mismatch returns logical status 409 with `stale_scene` before resolving a snapshot/path element id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
 
 For protection that survives ordinary frame/snapshot advancement, element-targeted
 clicks also accept `expected_logical_id`; element-targeted drags accept
 `expected_from_logical_id` and `expected_to_logical_id`. If a path-derived element id
-now belongs to a different runtime instance, the request returns HTTP 409 with
+now belongs to a different runtime instance, the request returns logical status 409 with
 `stale_element` before input is queued.
 
 ### `POST /automation-bridge/v2/input/click`
 
-Use `id`, or finite `x`/`y`. Optional common fields are `device`, `pointer_id`, `visualize`, `expected_scene_sequence`, and the ownership/correlation fields above.
+Use `id`, or finite `x`/`y`. Optional common fields are `device`, `pointer_id`, `visualize`, `expected_scene_sequence`, and the ownership/correlation fields above. `modifiers` holds up to four comma-separated key names (e.g. `modifiers=KEY_LSHIFT` for shift-click) as a chord for the whole gesture: pressed one engine update before the pointer goes down and released one update after it comes up, re-asserted every update while the event plays. Accepted names are the same as the `keys` parameter's special keys; unknown names, an empty list, or more than four return an error instead of silently tapping unmodified.
 
 ```sh
 curl -fsS -X POST "$BASE/input/click?id=e:0123456789abcdef&client_id=runner&session_id=test&request_id=click-1"
@@ -386,7 +399,7 @@ curl -fsS -X POST "$BASE/input/click?id=e:0123456789abcdef&client_id=runner&sess
 
 ### `POST /automation-bridge/v2/input/drag`
 
-Use `from_id`/`to_id`, or `x1`/`y1`/`x2`/`y2`. `duration`, `hold_before`, and `hold_after` are seconds in `0..60`; their total must not exceed 60. `easing` is `linear`, `ease_in`, `ease_out`, or `ease_in_out`.
+Use `from_id`/`to_id`, or `x1`/`y1`/`x2`/`y2`. `duration`, `hold_before`, and `hold_after` are seconds in `0..60`; their total must not exceed 60. `easing` is `linear`, `ease_in`, `ease_out`, or `ease_in_out`. `modifiers` works as on `/input/click` (e.g. `modifiers=KEY_LCTRL` for ctrl-drag), held across the whole down/move/up.
 
 ```sh
 curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=.35&easing=ease_in_out&client_id=runner&session_id=test"
@@ -394,7 +407,7 @@ curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=.35&eas
 
 ### `POST /automation-bridge/v2/input/drag_path`
 
-Runs exactly one down, a continuous native path, and one up. `points` contains `x,y` pairs separated by semicolons. For `path=sampled` or `linear`, `durations` and `easing` have one comma-separated value per segment. `path=quadratic` requires three control points and one duration/easing; `path=cubic` requires four. Paths contain 2–128 points, the encoded point list is limited to 8192 bytes, and total duration including holds is at most 60 seconds. Visualization records and draws positions actually injected on engine updates, including the sampled curve, rather than drawing only a start/end chord.
+Runs exactly one down, a continuous native path, and one up. `points` contains `x,y` pairs separated by semicolons. For `path=sampled` or `linear`, `durations` and `easing` have one comma-separated value per segment. `path=quadratic` requires three control points and one duration/easing; `path=cubic` requires four. Paths contain 2–128 points, the encoded point list is limited to 8192 bytes, and total duration including holds is at most 60 seconds. Visualization records and draws positions actually injected on engine updates, including the sampled curve, rather than drawing only a start/end chord. `modifiers` works as on `/input/click`, held across the whole gesture.
 
 ```sh
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -404,11 +417,11 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ### Low-level pointer sessions
 
-`POST /input/pointer/open?x=...&y=...&pointer_lease=2...` creates a leased pointer receipt. Append continuous work with `/input/pointer/move?input_id=...&x=...&y=...&duration=...&easing=...` and `/input/pointer/hold?input_id=...&duration=...`; finish with `/input/pointer/up?input_id=...`. Every command includes the same client/session identity and renews `pointer_lease`. If the client disappears, expiry emits a safe release/cancel. `POST /input/cancel` closes a session immediately.
+`POST /input/pointer/open?x=...&y=...&pointer_lease=2...` creates a leased pointer receipt. `modifiers` works as on `/input/click`, held for the whole session until the pointer releases. Append continuous work with `/input/pointer/move?input_id=...&x=...&y=...&duration=...&easing=...` and `/input/pointer/hold?input_id=...&duration=...`; finish with `/input/pointer/up?input_id=...`. Every command includes the same client/session identity and renews `pointer_lease`. If the client disappears, expiry emits a safe release/cancel. `POST /input/cancel` closes a session immediately.
 
 ### `POST /automation-bridge/v2/input/key`
 
-Use `text` for literal UTF-8 or `keys` for a brace-wrapped special key such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names include arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, and `KEY_0`–`KEY_9`. Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key.
+Use `text` for literal UTF-8 or `keys` for one or more brace-wrapped special keys such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names cover every named key in the engine's `dmHID::Key` enum: arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, `KEY_0`–`KEY_9`, punctuation and symbol keys (`KEY_EQUALS`, `KEY_MINUS`, `KEY_COMMA`, `KEY_PERIOD`, `KEY_SLASH`, brackets, and the rest), keypad keys (`KEY_KP_0`–`KEY_KP_9`, `KEY_KP_ADD`, ...), and lock/system keys (`KEY_CAPS_LOCK`, `KEY_PAUSE`, `KEY_LSUPER`, ...). Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. `hold` keeps each special key pressed for that many seconds (`0..60`, default `0` -- a single-update tap) before releasing it; it applies per `{KEY_...}` token, the combined hold across all tokens must stay within 60 seconds, and it requires at least one special key (literal text cannot be held). While held, the key is re-asserted every engine update, so bindings receive the same continuous per-frame actions a physically held key produces; progressing key events keep controller ownership through their bounded release without an indefinitely renewable hold, and the receipt's `requested_duration` reports the total requested hold. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key. `modifiers` holds up to four comma-separated key names as a chord across the press (e.g. `keys=%7BKEY_Z%7D&modifiers=KEY_LCTRL` for ctrl-Z), pressed one update before the first key and released one update after the last; it composes with `hold`, requires at least one special key (literal text cannot be chorded), and is advertised as the `input.modifiers` capability. The receipt echoes `modifier_count` so a client can tell a chord was honoured. `GET /health` advertises `input.key` capability version `2` for full named-key and hold support; clients must negotiate `input.key>=2` before sending `hold`.
 
 ### `GET /automation-bridge/v2/screenshot`
 
@@ -487,6 +500,49 @@ The application channel is optional. Core scene inspection and native input work
 
 Application JSON is limited to 32 KiB and 16 nested array/object levels. Commands call registered functions only; there is no endpoint for arbitrary Lua evaluation.
 
+### Application catalog
+
+`GET /application/catalog` requires `application.catalog` (version 1), advertised
+only when `application_api = 1`. It lists all registered commands, published
+states, and explicitly declared state/event contracts. Undocumented registrations
+have an empty `contract`. Declare metadata from Lua after registering a command:
+
+```lua
+automation_bridge.describe("command", "my_game.load_fixture", {
+    description = "Load a fixture and return its name when ready.",
+    input_schema = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
+    output_schema = { type = "object", properties = { loaded = { type = "string" } } },
+})
+automation_bridge.describe("state", "my_game.ui", {
+    description = "Current workflow state; published whenever the step changes.",
+    schema = { type = "object", properties = { busy = { type = "boolean" } } },
+})
+automation_bridge.describe("event", "my_game.operation_complete", {
+    description = "Emitted after completion with the caller's operation_id.",
+    schema = { type = "object", properties = { operation_id = { type = "string" } } },
+})
+```
+
+The kind is `command`, `state`, or `event`. Metadata accepts only `description`
+(1-4096 bytes), command `input_schema`/`output_schema`, or state/event `schema`.
+Schema roots must be objects with string keys or booleans. They are application
+documentation: the bridge does not validate payloads against JSON Schema or fetch
+schema references. The existing JSON size/depth limits apply to each complete
+contract, with at most 256 declarations per engine instance. Repeating a kind/name
+replaces its complete metadata. Metadata is cleared with the Lua application
+lifecycle. An event declaration does not emit an event; a state may be described
+before its first publication. Document timing and correlation rules in descriptions.
+
+The endpoint accepts exact `kind`/`name` filters, `limit` (default 50, range 0-100),
+`offset` (default 0), and a decimal string `cursor` that takes precedence over
+offset. Invalid supplied pagination values return logical `400 bad_request`.
+The response data is `{entries: [{kind, name, contract}], count, matched, offset,
+next_cursor, revision, engine_instance_id}`. A zero limit returns only metadata
+and counts. `next_cursor` is null when there is no continuation. Each page is
+consistent; restart pagination when revision or engine identity changes.
+Revision changes on registration, first state publication, metadata replacement,
+or Lua teardown, rather than on every state value update.
+
 ### Structured events and cursors
 
 Applications emit typed JSON from Lua:
@@ -522,7 +578,22 @@ automation_bridge.command("my_game.load_fixture", function(data)
 end)
 ```
 
-Submit strict JSON with `POST /commands?name=my_game.load_fixture&data=<url-encoded-json>&timeout_ms=30000`. The HTTP 200 response contains a command id. Poll `GET /commands?id=<id>` for `pending`, `running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua callbacks run on the engine update thread and cannot be safely preempted; a running cancellation returns `409 command_not_cancellable`.
+Submit commands in a JSON body. The `data` field is itself a string containing
+strict JSON:
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"name":"my_game.load_fixture","data":"{\"name\":\"standard\"}","timeout_ms":30000}' \
+  "$BASE/commands" | python3 -m json.tool
+```
+
+Query parameters remain supported for short curl requests, but clients should
+use the body because Defold bounds the complete request resource. The HTTP 200
+response contains a command id. Poll `GET /commands?id=<id>` for `pending`,
+`running`, `completed`, `failed`, `cancelled`, or `timed_out`, plus the JSON
+result or error. `DELETE /commands?id=<id>` cancels only pending work. Lua
+callbacks run on the engine update thread and cannot be safely preempted; a
+running cancellation returns logical status `409 command_not_cancellable`.
 
 ### Native delivery and application acknowledgement
 
@@ -553,11 +624,18 @@ Annotations are copied into matching scene snapshots and can be queried with the
 
 ### Timeline markers
 
-`POST /markers?name=workflow_started&data=<url-encoded-json>&recording_timestamp_us=...`
-inserts a `marker` event. Native monotonic time is always recorded. The optional
-recording timestamp is caller-supplied, allowing a client to correlate markers
-with its own media or trace clock. Native video recording does not add this
-correlation automatically.
+Use a JSON body to insert a `marker` event without constraining marker data to
+the request-resource limit:
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"name":"workflow_started","data":"{\"case\":7}","recording_timestamp_us":1234}' \
+  "$BASE/markers" | python3 -m json.tool
+```
+
+Native monotonic time is always recorded. The optional recording timestamp is
+caller-supplied, allowing a client to correlate markers with its own media or
+trace clock. Native video recording does not add this correlation automatically.
 
 ## Metal GPU trace capture (macOS)
 
@@ -568,17 +646,16 @@ Captures complete rendered frames to a Metal `.gputrace` on macOS when Defold is
 Schedule a one-frame capture:
 
 ```sh
-curl -fsS -X POST --get \
-  --data-urlencode "path=/tmp/fontgen.gputrace" \
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/fontgen.gputrace"}' \
   "$BASE/metal" | python3 -m json.tool
 ```
 
 Use `frames` to capture more than one frame:
 
 ```sh
-curl -fsS -X POST --get \
-  --data-urlencode "path=/tmp/fontgen.gputrace" \
-  --data-urlencode "frames=60" \
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/fontgen.gputrace","frames":60}' \
   "$BASE/metal" | python3 -m json.tool
 ```
 
