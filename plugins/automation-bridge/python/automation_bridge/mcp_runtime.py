@@ -435,13 +435,13 @@ def _words(text: str) -> Tuple[str, ...]:
 
 _OWNER_GROUPS = (
     ("automation_bridge.editor", editor, "function", _words(
-        "open_project is_running installations latest_installation installation_registry_path"
+        "open_project is_running installations latest_installation installation_registry_path doctor update_python_wrapper"
     )),
     ("automation_bridge.editor.Client", editor.Client, "method", _words(
-        "update_automation_bridge connect_engine build_and_run clean_build_and_run build_and_run_html5"
+        "update_automation_bridge connect_engine build_and_run clean_build_and_run build_and_run_html5 compile bob"
     )),
     ("automation_bridge.editor.Commands", editor.Commands, "method", _words(
-        "fetch_libraries hot_reload rebundle reload_extensions reload_stylesheets"
+        "fetch_libraries hot_reload rebundle reload_extensions reload_stylesheets catalog supports"
     )),
     ("automation_bridge.editor.Debugger", editor.Debugger, "method", _words(
         "start stop break_ continue_ detach step_into step_out step_over"
@@ -451,9 +451,10 @@ _OWNER_GROUPS = (
     ("automation_bridge.editor.Reference", editor.Reference, "method", _words("search")),
     ("automation_bridge.editor.Preview", editor.Preview, "method", _words("render")),
     ("automation_bridge.editor.Preferences", editor.Preferences, "method", _words("get set list describe")),
-    ("automation_bridge.engine", engine, "function", _words("connect wait_until")),
+    ("automation_bridge.engine", engine, "function", _words("connect wait_until cancellation_scope")),
     ("automation_bridge.engine.Client", engine.Client, "method", _words(
         "wait_ready request health lifecycle require supports trace_metadata screen scene elements element "
+        "elements_page application_catalog session_info close cancellation_scope "
         "maybe_element element_by_id parent count click drag drag_path pointer type_text key events "
         "wait_for_input_acknowledgement states state wait_for_state start_command command_status "
         "cancel_command wait_for_command command mark screenshot convert_point engine_info engine_log_port "
@@ -463,6 +464,7 @@ _OWNER_GROUPS = (
     ("automation_bridge.engine.InputController", engine.InputController, "method", _words(
         "configure pending status wait cancel flush interruption_scope"
     )),
+    ("automation_bridge.engine.CancellationToken", engine.CancellationToken, "method", _words("cancel raise_if_cancelled")),
     ("automation_bridge.engine.PointerSession", engine.PointerSession, "method", _words("move hold up cancel")),
     ("automation_bridge.engine.EngineLogStream", engine.EngineLogStream, "method", _words("readline close")),
     ("automation_bridge.engine.RuntimeLogs", engine.RuntimeLogs, "method", _words("start tail close")),
@@ -506,12 +508,13 @@ _OWNER_GROUPS = (
 
 _PROPERTY_GROUPS = (
     ("automation_bridge.editor.Client", editor.Client, _words(
-        "root port base_url lifecycle_events commands debugger console reference preview preferences"
+        "root port base_url lifecycle_events commands debugger console reference preview preferences last_command_result"
     )),
     ("automation_bridge.engine.Client", engine.Client, _words(
         "port timeout base_url client_id session_id input logs engine_instance_id profiler gestures visual "
-        "video_recording metal_capture profiler_url last_window_size"
+        "video_recording metal_capture profiler_url last_window_size owns_engine closed"
     )),
+    ("automation_bridge.engine.CancellationToken", engine.CancellationToken, _words("cancelled")),
     ("automation_bridge.engine.PointerSession", engine.PointerSession, _words("receipt lease closed input_id")),
     ("automation_bridge.engine.EngineLogStream", engine.EngineLogStream, _words("host port closed")),
     ("automation_bridge.engine.EventStream", engine.EventStream, _words("cursor")),
@@ -587,7 +590,21 @@ _ADAPTATIONS: Dict[str, Dict[str, Any]] = {
 }
 
 
+for _cancellation_member in (
+    "automation_bridge.engine.cancellation_scope",
+    "automation_bridge.engine.Client.cancellation_scope",
+    "automation_bridge.engine.CancellationToken.cancel",
+    "automation_bridge.engine.CancellationToken.raise_if_cancelled",
+    "automation_bridge.engine.CancellationToken.cancelled",
+):
+    _ADAPTATIONS[_cancellation_member] = {
+        "availability": "restricted", "adapter": "mcp_request_cancellation",
+        "reason": "Cancellation tokens and scopes belong to each MCP request. Use the host cancellation notification; Python scopes cannot span MCP worker threads.",
+    }
+
+
 _READ_ONLY_MEMBERS = {
+    "doctor", "catalog", "elements_page", "application_catalog", "session_info",
     "is_running", "installations", "latest_installation", "installation_registry_path",
     "read", "search", "get", "list", "describe", "health", "lifecycle", "supports",
     "trace_metadata", "screen", "scene", "elements", "element", "maybe_element",
@@ -604,6 +621,7 @@ _DESTRUCTIVE = {
     "automation_bridge.engine.Client.close_engine",
     "automation_bridge.engine.Client.request",
     "automation_bridge.editor.Client.update_automation_bridge",
+    "automation_bridge.editor.update_python_wrapper",
 }
 
 
@@ -846,6 +864,11 @@ class BridgeRuntime:
             "defold_find_elements": self._focused_find_elements,
             "defold_get_element": self._focused_get_element,
             "defold_health": self._focused_health,
+            "defold_doctor": self._focused_doctor,
+            "defold_update_python_wrapper": self._focused_update_python_wrapper,
+            "defold_application_catalog": self._focused_application_catalog,
+            "defold_session_info": self._focused_session_info,
+            "defold_close": self._focused_close,
             "defold_key": self._focused_key,
             "defold_open_project": self._focused_open_project,
             "defold_screenshot": self._focused_screenshot,
@@ -979,6 +1002,8 @@ class BridgeRuntime:
     ) -> Any:
         if not isinstance(arguments, Mapping):
             raise ToolFailure("invalid_arguments", "operation arguments must be an object")
+        if spec.adapter == "mcp_request_cancellation":
+            raise ToolFailure("request_cancellation", spec.reason, {"operation": spec.id})
         kwargs = deserialize(dict(arguments), self.handles)
         if not isinstance(kwargs, dict):
             raise ToolFailure("invalid_arguments", "operation arguments must be an object")
@@ -1269,6 +1294,18 @@ class BridgeRuntime:
         unknown = set(value) - _SELECTOR_KEYS
         if unknown:
             raise ToolFailure("invalid_selector", "selector contains unknown fields", {"fields": sorted(unknown)})
+        for key, item in value.items():
+            if key in {"enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive"}:
+                valid = isinstance(item, bool)
+            elif key in {"limit", "offset"}:
+                maximum = 500 if key == "limit" else 4294967295
+                valid = isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= maximum
+            elif key == "include":
+                valid = isinstance(item, str) or (isinstance(item, list) and all(isinstance(part, str) for part in item))
+            else:
+                valid = isinstance(item, str)
+            if not valid:
+                raise ToolFailure("invalid_selector", "invalid selector value", {"field": key})
         return dict(value)
 
     def _focused_open_project(self, arguments: Mapping[str, Any]) -> Any:
@@ -1368,13 +1405,45 @@ class BridgeRuntime:
             raise ToolFailure("wrong_target_type", "engine must be an engine.Client handle")
         return game
 
+    def _focused_doctor(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project_path",), optional=("required_capabilities",))
+        return editor.doctor(self._project_path(arguments["project_path"]),
+                             required_capabilities=arguments.get("required_capabilities", ()))
+
+    @staticmethod
+    def _project_path(value: Any) -> Path:
+        if not isinstance(value, str) or not value or not Path(value).expanduser().is_absolute():
+            raise ToolFailure("invalid_project_path", "project_path must be a non-empty absolute path")
+        return Path(value).expanduser().resolve()
+
+    def _focused_update_python_wrapper(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project_path",))
+        return editor.update_python_wrapper(self._project_path(arguments["project_path"]))
+
+    def _focused_application_catalog(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("engine",), optional=("kind", "name", "limit", "offset", "cursor"))
+        kwargs = dict(arguments)
+        kwargs.pop("engine")
+        kwargs.setdefault("limit", 20)
+        return self._engine_target(arguments).application_catalog(**kwargs)
+
+    def _focused_session_info(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("engine",))
+        return self._engine_target(arguments).session_info()
+
+    def _focused_close(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("engine",))
+        game = self._engine_target(arguments)
+        game.close()
+        return game.session_info()
+
     def _focused_health(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("engine",))
         return self._engine_target(arguments).health()
 
     def _focused_find_elements(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("engine",), optional=("selector",))
-        return self._engine_target(arguments).elements(**self._selector(arguments.get("selector", {})))
+        return self._engine_target(arguments).elements_page(**self._selector(arguments.get("selector", {})))
 
     def _focused_get_element(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("engine", "selector"), optional=("optional",))
@@ -1390,7 +1459,7 @@ class BridgeRuntime:
             required=("engine", "target"),
             optional=(
                 "y", "wait", "visualize", "device", "pointer_id", "expected_scene_sequence",
-                "timeout", "cancel_on_interrupt", "flush_on_interrupt",
+                "timeout", "cancel_on_interrupt", "flush_on_interrupt", "modifiers",
             ),
         )
         game = self._engine_target(arguments)
@@ -1406,7 +1475,7 @@ class BridgeRuntime:
             optional=(
                 "duration", "wait", "visualize", "easing", "hold_before", "hold_after", "device",
                 "pointer_id", "expected_scene_sequence", "timeout", "cancel_on_interrupt",
-                "flush_on_interrupt",
+                "flush_on_interrupt", "modifiers",
             ),
         )
         game = self._engine_target(arguments)
@@ -1431,7 +1500,7 @@ class BridgeRuntime:
         self._expect_keys(
             arguments,
             required=("engine", "key"),
-            optional=("wait", "expected_scene_sequence", "timeout", "cancel_on_interrupt", "flush_on_interrupt"),
+            optional=("wait", "expected_scene_sequence", "timeout", "cancel_on_interrupt", "flush_on_interrupt", "hold", "modifiers"),
         )
         game = self._engine_target(arguments)
         kwargs = dict(arguments)
@@ -1517,8 +1586,35 @@ class BridgeRuntime:
         wait_predicate = _object_schema(
             {"operator": {"type": "string", "enum": ["truthy", "equals", "not_equals", "exists"]}, "value": _ANY_JSON}
         )
-        selector_schema = _object_schema({key: _ANY_JSON for key in sorted(_SELECTOR_KEYS)})
+        selector_schema = _object_schema({key: _STRING for key in sorted(_SELECTOR_KEYS)})
+        selector_schema["properties"].update({
+            **{key: _BOOLEAN for key in ("enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive")},
+            "include": {"anyOf": [_STRING, {"type": "array", "items": _STRING}]},
+            "limit": {"type": "integer", "minimum": 0, "maximum": 500},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        })
+        modifiers_schema = {"anyOf": [_STRING, {"type": "array", "items": _STRING, "maxItems": 4}]}
         definitions = {
+            "defold_doctor": (
+                "Diagnose Defold automation", "Inspect project setup, editor, bridge versions and capabilities without launching or writing files.",
+                _object_schema({"project_path": _STRING, "required_capabilities": {"type": "array", "items": _STRING}}, ("project_path",)), True, False, True,
+            ),
+            "defold_update_python_wrapper": (
+                "Update the project Python wrapper", "Copy the fetched extension's Python wrapper into the explicit target project.",
+                _object_schema({"project_path": _STRING}, ("project_path",)), False, True, True,
+            ),
+            "defold_application_catalog": (
+                "Discover application contracts", "Page through the connected game's registered command, state and event contracts.",
+                _object_schema({"engine": _HANDLE_VALUE, "kind": {"type": "string", "enum": ["command", "state", "event"]}, "name": _STRING, "limit": {"type": "integer", "minimum": 0, "maximum": 100}, "offset": _INTEGER, "cursor": _STRING}, ("engine",)), True, False, True,
+            ),
+            "defold_session_info": (
+                "Inspect engine session", "Read client and session identities, engine ownership and local closed state.",
+                _object_schema({"engine": _HANDLE_VALUE}, ("engine",)), True, False, True,
+            ),
+            "defold_close": (
+                "Close the local engine client", "Release client resources while leaving the engine process running.",
+                _object_schema({"engine": _HANDLE_VALUE}, ("engine",)), False, False, True,
+            ),
             "automation_bridge_catalog": (
                 "Catalog Automation Bridge APIs",
                 "List the complete allowlisted public editor and engine API catalog, including signatures and MCP adaptations.",
@@ -1586,7 +1682,7 @@ class BridgeRuntime:
             ),
             "defold_find_elements": (
                 "Find Defold elements",
-                "Query a page of runtime scene elements with a validated semantic selector.",
+                "Query a page of elements including matched count, next_cursor, scene_sequence and engine_frame. Each page is a live snapshot.",
                 _object_schema({"engine": _HANDLE_VALUE, "selector": selector_schema}, ("engine",)), True, False, True,
             ),
             "defold_get_element": (
@@ -1597,12 +1693,12 @@ class BridgeRuntime:
             "defold_click": (
                 "Click a Defold target",
                 "Click an Element snapshot, element id, or screen point through the engine input queue.",
-                _object_schema({"engine": _HANDLE_VALUE, "target": _ANY_JSON, "y": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "target")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "target": _ANY_JSON, "y": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "target")), False, False, False,
             ),
             "defold_drag": (
                 "Drag between Defold targets",
                 "Drag between stale-safe Element snapshots, element ids, or screen points.",
-                _object_schema({"engine": _HANDLE_VALUE, "from_target": _ANY_JSON, "to_target": _ANY_JSON, "duration": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "easing": _STRING, "hold_before": _NUMBER, "hold_after": _NUMBER, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "from_target", "to_target")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "from_target": _ANY_JSON, "to_target": _ANY_JSON, "duration": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "easing": _STRING, "hold_before": _NUMBER, "hold_after": _NUMBER, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "from_target", "to_target")), False, False, False,
             ),
             "defold_type_text": (
                 "Type text in Defold",
@@ -1612,7 +1708,7 @@ class BridgeRuntime:
             "defold_key": (
                 "Press a Defold key",
                 "Queue a validated special key input for a running Defold engine.",
-                _object_schema({"engine": _HANDLE_VALUE, "key": _STRING, "wait": _ANY_JSON, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "key")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "key": _STRING, "hold": {"type": "number", "minimum": 0, "maximum": 60}, "wait": _ANY_JSON, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "key")), False, False, False,
             ),
             "defold_wait_for_element": (
                 "Wait for a Defold element",

@@ -50,15 +50,15 @@ from automation_bridge.preferences import BUILTIN_PREFERENCES  # noqa: E402
 EDITOR_OPERATIONS = {
     "automation_bridge.editor": {
         "open_project", "is_running", "installations", "latest_installation",
-        "installation_registry_path",
+        "installation_registry_path", "doctor", "update_python_wrapper",
     },
     "automation_bridge.editor.Client": {
         "update_automation_bridge", "connect_engine", "build_and_run",
-        "clean_build_and_run", "build_and_run_html5",
+        "clean_build_and_run", "build_and_run_html5", "compile", "bob",
     },
     "automation_bridge.editor.Commands": {
         "fetch_libraries", "hot_reload", "rebundle", "reload_extensions",
-        "reload_stylesheets",
+        "reload_stylesheets", "catalog", "supports",
     },
     "automation_bridge.editor.Debugger": {
         "start", "stop", "break_", "continue_", "detach", "step_into",
@@ -74,7 +74,7 @@ EDITOR_OPERATIONS = {
 EDITOR_PROPERTIES = {
     "automation_bridge.editor.Client": {
         "root", "port", "base_url", "lifecycle_events", "commands", "debugger",
-        "console", "reference", "preview", "preferences",
+        "console", "reference", "preview", "preferences", "last_command_result",
     },
 }
 
@@ -92,6 +92,7 @@ ENGINE_OPERATIONS = {
         "set_portrait", "set_landscape", "reboot", "close_engine", "dump_scene",
         "format_elements", "wait_for_element", "wait_for_count", "wait_frames",
         "observe_element", "wait_for_disappearance",
+        "elements_page", "application_catalog", "session_info", "close",
     },
     "automation_bridge.engine.InputController": {
         "configure", "pending", "status", "wait", "cancel", "flush",
@@ -143,7 +144,7 @@ ENGINE_PROPERTIES = {
     "automation_bridge.engine.Client": {
         "port", "timeout", "base_url", "client_id", "session_id", "input", "logs",
         "engine_instance_id", "profiler", "gestures", "visual", "video_recording",
-        "metal_capture", "profiler_url", "last_window_size",
+        "metal_capture", "profiler_url", "last_window_size", "owns_engine", "closed",
     },
     "automation_bridge.engine.PointerSession": {"receipt", "lease", "closed", "input_id"},
     "automation_bridge.engine.EngineLogStream": {"host", "port", "closed"},
@@ -239,6 +240,17 @@ EXPECTED_ADAPTATIONS = {
 }
 
 NONLITERAL_API_CLASSIFICATIONS = {
+    **{name: {
+        "availability": "restricted", "adapter": "mcp_request_cancellation",
+        "purpose": "Per-request tokens are controlled by MCP cancellation notifications",
+    } for name in (
+        "automation_bridge.engine.cancellation_scope",
+        "automation_bridge.engine.Client.cancellation_scope",
+        "automation_bridge.engine.CancellationToken.cancel",
+        "automation_bridge.engine.CancellationToken.raise_if_cancelled",
+        "automation_bridge.engine.CancellationToken.cancelled",
+    )},
+
     "automation_bridge.engine.wait_until": {
         "availability": "adapted",
         "adapter": "declarative_operation_predicate",
@@ -255,6 +267,10 @@ NONLITERAL_API_CLASSIFICATIONS = {
 # not exposed as meaningless constructor/accessor RPCs. Keep this list explicit
 # so a newly exported operational class cannot silently bypass catalog coverage.
 SERIALIZED_RESULT_TYPES = {
+    "automation_bridge.editor.BuildResult", "automation_bridge.editor.CommandInfo",
+    "automation_bridge.editor.DiagnosticCheck", "automation_bridge.editor.DoctorReport",
+    "automation_bridge.engine.ElementPage", "automation_bridge.engine.ElementSelector",
+    "automation_bridge.engine.ApplicationCatalogPage", "automation_bridge.engine.ApplicationEntry",
     "automation_bridge.editor.AutomationBridgeUpdateResult",
     "automation_bridge.editor.BuildIssue",
     "automation_bridge.editor.ConsoleRegion",
@@ -1070,6 +1086,7 @@ class RuntimeDescriptorAndCatalogTest(unittest.TestCase):
             # This concrete context is returned by interruption_scope and is
             # manipulated through automation_bridge_enter/exit.
             "automation_bridge.engine.InputInterruptionScope",
+            "automation_bridge.engine.CancellationToken",
         }
 
         for module in (editor, engine):
@@ -1546,7 +1563,10 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
             def __init__(self):
                 self.requests = []
 
-            def request(self, method, path, *, json=None, **kwargs):
+            def request(self, method, path, *, json_body=None, **kwargs):
+                json = json_body
+                if path == "/recording/stop":
+                    return {"active": False, "finalized": True}
                 self.requests.append((method, path, json, kwargs))
                 return {
                     "path": json["path"],
