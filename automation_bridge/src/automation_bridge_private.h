@@ -305,6 +305,13 @@ namespace dmAutomationBridge
         dmScript::LuaCallbackInfo* m_Callback;
     };
 
+    struct ApplicationContract
+    {
+        char* m_Kind;
+        char* m_Name;
+        char* m_MetadataJson;
+    };
+
     enum CommandState
     {
         COMMAND_PENDING,
@@ -376,6 +383,8 @@ namespace dmAutomationBridge
         Array<BridgeEvent>      m_Events;
         Array<PublishedState>   m_PublishedStates;
         Array<CommandHandler>   m_CommandHandlers;
+        Array<ApplicationContract> m_ApplicationContracts;
+        uint64_t                m_CatalogRevision;
         Array<CommandInvocation> m_CommandInvocations;
         Array<NodeAnnotation>   m_NodeAnnotations;
         uint32_t                m_EventCapacity;
@@ -618,6 +627,7 @@ namespace dmAutomationBridge
     uint32_t AppendEventPageJson(StringBuffer* out, uint64_t cursor, uint32_t limit, bool* overflow, uint64_t* next_cursor);
     uint64_t GetStateRevision();
     uint32_t AppendPublishedStatesJson(StringBuffer* out, const char* name, uint64_t after_revision);
+    void AppendApplicationCatalogJson(StringBuffer* out, const char* kind, const char* name, uint32_t offset, uint32_t limit);
     bool SubmitCommand(const char* name, const char* arguments_json, uint32_t timeout_ms, uint64_t* command_id, const char** error);
     bool AppendCommandJson(StringBuffer* out, uint64_t command_id);
     bool CancelCommand(uint64_t command_id, const char** error);

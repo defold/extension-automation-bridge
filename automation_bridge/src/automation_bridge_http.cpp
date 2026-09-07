@@ -792,6 +792,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "application.events");
             AppendCapability(&names, &versions, &first, "application.state");
             AppendCapability(&names, &versions, &first, "application.commands");
+            AppendCapability(&names, &versions, &first, "application.catalog");
             AppendCapability(&names, &versions, &first, "application.acknowledgements");
             AppendCapability(&names, &versions, &first, "application.annotations");
         }
@@ -2455,6 +2456,44 @@ namespace dmAutomationBridge
         RequestSendJson(ctx, 200, &response);
     }
 
+    static void HandleApplicationCatalog(RequestContext* ctx)
+    {
+        if (!g_AutomationBridge.m_ApplicationApiEnabled)
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "application.catalog requires application_api = 1");
+            return;
+        }
+        const char* kind = RequestGetParam(ctx, "kind");
+        const char* name = RequestGetParam(ctx, "name");
+        if (kind && !(StringsEqual(kind, "command") || StringsEqual(kind, "state") || StringsEqual(kind, "event")))
+        {
+            RequestSendError(ctx, 400, "bad_request", "kind must be command, state, or event");
+            return;
+        }
+        if (name && (IsEmpty(name) || strlen(name) > MAX_APPLICATION_NAME_BYTES))
+        {
+            RequestSendError(ctx, 400, "bad_request", "name must be a non-empty application identifier");
+            return;
+        }
+        uint32_t limit = 50;
+        uint32_t offset = 0;
+        uint32_t cursor = 0;
+        if ((RequestGetParam(ctx, "limit") && !RequestGetUIntParamAllowZero(ctx, "limit", &limit, 100)) ||
+            (RequestGetParam(ctx, "offset") && !RequestGetUIntParamAllowZero(ctx, "offset", &offset)) ||
+            (RequestGetParam(ctx, "cursor") && !RequestGetUIntParamAllowZero(ctx, "cursor", &cursor)))
+        {
+            RequestSendError(ctx, 400, "bad_request", "limit must be 0-100; offset and cursor must be unsigned 32-bit integers");
+            return;
+        }
+        if (RequestGetParam(ctx, "cursor")) offset = cursor;
+        StringBuffer response;
+        StringBufferInit(&response);
+        StringBufferAppend(&response, "{\"ok\":true,\"data\":");
+        AppendApplicationCatalogJson(&response, kind, name, offset, limit);
+        StringBufferAppend(&response, "}\n");
+        RequestSendJson(ctx, 200, &response);
+    }
+
     static void HandleState(RequestContext* ctx)
     {
         StringBuffer page;
@@ -2794,6 +2833,7 @@ namespace dmAutomationBridge
         {"/events/cursor", "GET", HandleEventCursor},
         {"/events", "GET", HandleEvents},
         {"/state", "GET", HandleState},
+        {"/application/catalog", "GET", HandleApplicationCatalog},
         {"/state/wait", "GET", HandleStateWait},
         {"/commands", "POST", HandleCommandSubmit},
         {"/commands", "GET", HandleCommandStatus},

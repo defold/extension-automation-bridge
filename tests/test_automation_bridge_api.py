@@ -168,6 +168,40 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_application_catalog_retains_contracts_and_pagination(self):
+        bridge = EngineClient(12345)
+        bridge._last_health = {"capabilities": ["application.catalog"]}
+        response = {
+            "entries": [{"kind": "command", "name": "test.reset", "contract": {
+                "description": "Reset the test.", "input_schema": False, "output_schema": {"type": "object"},
+            }}],
+            "count": 1, "matched": 3, "offset": 1, "next_cursor": "2",
+            "revision": 7, "engine_instance_id": "engine:test",
+        }
+        with mock.patch.object(bridge, "_request", return_value=response) as request:
+            page = bridge.application_catalog(kind="command", limit=1, cursor="1")
+        self.assertIsInstance(page, engine.ApplicationCatalogPage)
+        self.assertEqual((1, 3, 1, "2", 7, "engine:test"), (page.count, page.matched, page.offset, page.next_cursor, page.revision, page.engine_instance_id))
+        self.assertEqual("Reset the test.", page.entries[0].description)
+        self.assertIs(False, page.entries[0].input_schema)
+        self.assertEqual({"type": "object"}, page.entries[0].output_schema)
+        self.assertIsNone(page.entries[0].schema)
+        self.assertEqual("/application/catalog", request.call_args.args[1])
+        self.assertEqual("1", request.call_args.args[2]["cursor"])
+
+    def test_application_catalog_requires_capability_before_query(self):
+        bridge = FakeEngineClient()
+        with self.assertRaises(UnsupportedCapabilityError):
+            bridge.application_catalog()
+        self.assertEqual(["/health"], [path for _, path, _ in bridge.api_requests])
+
+    def test_application_catalog_rejects_malformed_filters_before_io(self):
+        bridge = EngineClient(12345)
+        for options in ({"kind": "commands"}, {"name": ""}, {"name": 5}, {"name": "a" * 129}, {"limit": True}, {"limit": 101}, {"offset": -1}, {"cursor": 1}, {"cursor": "x"}):
+            with self.subTest(options=options), mock.patch.object(bridge, "_request") as request:
+                with self.assertRaises((TypeError, ValueError)):
+                    bridge.application_catalog(**options)
+                request.assert_not_called()
     def test_cancellation_interrupts_long_poll_delay_from_another_thread(self):
         token = engine.CancellationToken()
         observed = threading.Event()
@@ -3527,6 +3561,26 @@ class AutomationBridgeApiTest(unittest.TestCase):
         for params in ({"limit": "invalid"}, {"limit": 501}, {"cursor": "invalid"}, {"offset": -1}):
             with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
                 self.bridge.request("GET", "/elements", params=params)
+            self.assertEqual(400, error.exception.status)
+
+    def test_application_catalog_discovers_command_and_state_event_contracts(self):
+        self.ensure_running_bridge()
+        command = self.bridge.application_catalog(kind="command", name="sample.reset")
+        self.assertEqual(1, command.matched)
+        self.assertIn("Remove all items", command.entries[0].description)
+        self.assertEqual("string", command.entries[0].input_schema["properties"]["request_id"]["type"])
+        state = self.bridge.application_catalog(kind="state", name="sample.game")
+        self.assertEqual("integer", state.entries[0].schema["properties"]["item_count"]["type"])
+        event = self.bridge.application_catalog(kind="event", name="sample.reset_complete")
+        self.assertEqual("object", event.entries[0].schema["type"])
+        first = self.bridge.application_catalog(limit=1)
+        second = self.bridge.application_catalog(limit=1, cursor=first.next_cursor)
+        self.assertEqual((first.revision, first.engine_instance_id), (second.revision, second.engine_instance_id))
+        self.assertNotEqual(first.entries[0].name, second.entries[0].name)
+        self.assertEqual(0, self.bridge.application_catalog(limit=0).count)
+        for params in ({"kind": "unknown"}, {"name": ""}, {"limit": "invalid"}, {"limit": 101}, {"offset": -1}, {"cursor": ""}):
+            with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
+                self.bridge.request("GET", "/application/catalog", params=params)
             self.assertEqual(400, error.exception.status)
 
     def test_session_ownership_and_detach_leave_engine_available(self):

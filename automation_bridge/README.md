@@ -500,6 +500,49 @@ The application channel is optional. Core scene inspection and native input work
 
 Application JSON is limited to 32 KiB and 16 nested array/object levels. Commands call registered functions only; there is no endpoint for arbitrary Lua evaluation.
 
+### Application catalog
+
+`GET /application/catalog` requires `application.catalog` (version 1), advertised
+only when `application_api = 1`. It lists all registered commands, published
+states, and explicitly declared state/event contracts. Undocumented registrations
+have an empty `contract`. Declare metadata from Lua after registering a command:
+
+```lua
+automation_bridge.describe("command", "my_game.load_fixture", {
+    description = "Load a fixture and return its name when ready.",
+    input_schema = { type = "object", properties = { name = { type = "string" } }, required = { "name" } },
+    output_schema = { type = "object", properties = { loaded = { type = "string" } } },
+})
+automation_bridge.describe("state", "my_game.ui", {
+    description = "Current workflow state; published whenever the step changes.",
+    schema = { type = "object", properties = { busy = { type = "boolean" } } },
+})
+automation_bridge.describe("event", "my_game.operation_complete", {
+    description = "Emitted after completion with the caller's operation_id.",
+    schema = { type = "object", properties = { operation_id = { type = "string" } } },
+})
+```
+
+The kind is `command`, `state`, or `event`. Metadata accepts only `description`
+(1-4096 bytes), command `input_schema`/`output_schema`, or state/event `schema`.
+Schema roots must be objects with string keys or booleans. They are application
+documentation: the bridge does not validate payloads against JSON Schema or fetch
+schema references. The existing JSON size/depth limits apply to each complete
+contract, with at most 256 declarations per engine instance. Repeating a kind/name
+replaces its complete metadata. Metadata is cleared with the Lua application
+lifecycle. An event declaration does not emit an event; a state may be described
+before its first publication. Document timing and correlation rules in descriptions.
+
+The endpoint accepts exact `kind`/`name` filters, `limit` (default 50, range 0-100),
+`offset` (default 0), and a decimal string `cursor` that takes precedence over
+offset. Invalid supplied pagination values return logical `400 bad_request`.
+The response data is `{entries: [{kind, name, contract}], count, matched, offset,
+next_cursor, revision, engine_instance_id}`. A zero limit returns only metadata
+and counts. `next_cursor` is null when there is no continuation. Each page is
+consistent; restart pagination when revision or engine identity changes.
+Revision changes on registration, first state publication, metadata replacement,
+or Lua teardown, rather than on every state value update.
+
 ### Structured events and cursors
 
 Applications emit typed JSON from Lua:

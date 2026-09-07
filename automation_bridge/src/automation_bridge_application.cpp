@@ -224,6 +224,24 @@ namespace dmAutomationBridge
         memset(state, 0, sizeof(*state));
     }
 
+    static void FreeApplicationContract(ApplicationContract* contract)
+    {
+        FreeString(&contract->m_Kind);
+        FreeString(&contract->m_Name);
+        FreeString(&contract->m_MetadataJson);
+    }
+
+    // Caller holds m_ApplicationMutex for all catalog reads and mutations.
+    static ApplicationContract* FindApplicationContract(const char* kind, const char* name)
+    {
+        for (uint32_t i = 0; i < g_AutomationBridge.m_ApplicationContracts.m_Count; ++i)
+        {
+            ApplicationContract* contract = &g_AutomationBridge.m_ApplicationContracts.m_Data[i];
+            if (StringsEqual(contract->m_Kind, kind) && StringsEqual(contract->m_Name, name)) return contract;
+        }
+        return 0;
+    }
+
     static void FreeCommandInvocation(CommandInvocation* command)
     {
         FreeString(&command->m_Name);
@@ -249,6 +267,7 @@ namespace dmAutomationBridge
         g_AutomationBridge.m_NextEventSequence = 1;
         g_AutomationBridge.m_NextStateRevision = 1;
         g_AutomationBridge.m_NextCommandId = 1;
+        g_AutomationBridge.m_CatalogRevision = 0;
         g_AutomationBridge.m_ApplicationMutex = dmMutex::New();
         if (IsEmpty(g_AutomationBridge.m_EngineInstanceId))
         {
@@ -258,6 +277,8 @@ namespace dmAutomationBridge
 
     void FinalizeApplicationLua()
     {
+        if (!g_AutomationBridge.m_ApplicationMutex) return;
+        dmMutex::ScopedLock lock(g_AutomationBridge.m_ApplicationMutex);
         for (uint32_t i = 0; i < g_AutomationBridge.m_CommandHandlers.m_Count; ++i)
         {
             CommandHandler* handler = &g_AutomationBridge.m_CommandHandlers.m_Data[i];
@@ -269,6 +290,10 @@ namespace dmAutomationBridge
             FreeString(&handler->m_Name);
         }
         ArrayFree(&g_AutomationBridge.m_CommandHandlers);
+        for (uint32_t i = 0; i < g_AutomationBridge.m_ApplicationContracts.m_Count; ++i)
+            FreeApplicationContract(&g_AutomationBridge.m_ApplicationContracts.m_Data[i]);
+        ArrayFree(&g_AutomationBridge.m_ApplicationContracts);
+        ++g_AutomationBridge.m_CatalogRevision;
     }
 
     void FreeApplicationBridge()
@@ -416,6 +441,7 @@ namespace dmAutomationBridge
                     return false;
                 }
                 state = &g_AutomationBridge.m_PublishedStates.m_Data[g_AutomationBridge.m_PublishedStates.m_Count - 1];
+                ++g_AutomationBridge.m_CatalogRevision;
             }
             if (!SetString(&state->m_ValueJson, value_json)) return false;
             state->m_Revision = g_AutomationBridge.m_NextStateRevision++;
@@ -471,6 +497,56 @@ namespace dmAutomationBridge
             if (StringsEqual(g_AutomationBridge.m_CommandHandlers.m_Data[i].m_Name, name)) return &g_AutomationBridge.m_CommandHandlers.m_Data[i];
         }
         return 0;
+    }
+
+    static void AppendCatalogEntry(StringBuffer* out, const char* kind, const char* name,
+                                   const char* filter_kind, const char* filter_name,
+                                   uint32_t offset, uint32_t limit, uint32_t* matched, uint32_t* count)
+    {
+        if (filter_kind && !StringsEqual(kind, filter_kind)) return;
+        if (filter_name && !StringsEqual(name, filter_name)) return;
+        uint32_t index = (*matched)++;
+        if (index < offset || *count >= limit) return;
+        ApplicationContract* contract = FindApplicationContract(kind, name);
+        if ((*count)++) StringBufferAppendChar(out, ',');
+        StringBufferAppend(out, "{\"kind\":"); AppendJsonString(out, kind);
+        StringBufferAppend(out, ",\"name\":"); AppendJsonString(out, name);
+        StringBufferAppend(out, ",\"contract\":");
+        StringBufferAppend(out, contract ? contract->m_MetadataJson : "{}");
+        StringBufferAppendChar(out, '}');
+    }
+
+    void AppendApplicationCatalogJson(StringBuffer* out, const char* kind, const char* name, uint32_t offset, uint32_t limit)
+    {
+        dmMutex::ScopedLock lock(g_AutomationBridge.m_ApplicationMutex);
+        uint32_t matched = 0;
+        uint32_t count = 0;
+        StringBufferAppend(out, "{\"entries\":[");
+        for (uint32_t i = 0; i < g_AutomationBridge.m_CommandHandlers.m_Count; ++i)
+            AppendCatalogEntry(out, "command", g_AutomationBridge.m_CommandHandlers.m_Data[i].m_Name, kind, name, offset, limit, &matched, &count);
+        for (uint32_t i = 0; i < g_AutomationBridge.m_PublishedStates.m_Count; ++i)
+            AppendCatalogEntry(out, "state", g_AutomationBridge.m_PublishedStates.m_Data[i].m_Name, kind, name, offset, limit, &matched, &count);
+        for (uint32_t i = 0; i < g_AutomationBridge.m_ApplicationContracts.m_Count; ++i)
+        {
+            const ApplicationContract* contract = &g_AutomationBridge.m_ApplicationContracts.m_Data[i];
+            if (StringsEqual(contract->m_Kind, "command")) continue;
+            if (StringsEqual(contract->m_Kind, "state") && FindPublishedState(contract->m_Name)) continue;
+            AppendCatalogEntry(out, contract->m_Kind, contract->m_Name, kind, name, offset, limit, &matched, &count);
+        }
+        StringBufferAppend(out, "],\"count\":"); AppendNumber(out, count);
+        StringBufferAppend(out, ",\"matched\":"); AppendNumber(out, matched);
+        StringBufferAppend(out, ",\"offset\":"); AppendNumber(out, offset);
+        StringBufferAppend(out, ",\"next_cursor\":");
+        if (count && (uint64_t)offset + count < matched)
+        {
+            char cursor[32];
+            dmSnPrintf(cursor, sizeof(cursor), "%llu", (unsigned long long)offset + count);
+            AppendJsonString(out, cursor);
+        }
+        else StringBufferAppend(out, "null");
+        StringBufferAppend(out, ",\"revision\":"); AppendNumber(out, (double)g_AutomationBridge.m_CatalogRevision);
+        StringBufferAppend(out, ",\"engine_instance_id\":"); AppendJsonString(out, g_AutomationBridge.m_EngineInstanceId);
+        StringBufferAppendChar(out, '}');
     }
 
     static CommandInvocation* FindCommandInvocation(uint64_t id)
@@ -802,6 +878,127 @@ namespace dmAutomationBridge
         return 0;
     }
 
+    static bool IsLuaObject(lua_State* L, int index)
+    {
+        if (!lua_istable(L, index)) return false;
+        if (index < 0) index += lua_gettop(L) + 1;
+        lua_pushnil(L);
+        while (lua_next(L, index))
+        {
+            if (lua_type(L, -2) != LUA_TSTRING || lua_objlen(L, -2) != strlen(lua_tostring(L, -2)))
+            {
+                lua_pop(L, 2);
+                return false;
+            }
+            lua_pop(L, 1);
+        }
+        return true;
+    }
+
+    static bool ValidateApplicationContract(lua_State* L, const char* kind)
+    {
+        if (!IsLuaObject(L, 3)) return false;
+        lua_pushnil(L);
+        while (lua_next(L, 3))
+        {
+            const char* key = lua_tostring(L, -2);
+            bool valid = false;
+            if (StringsEqual(key, "description"))
+                valid = lua_type(L, -1) == LUA_TSTRING && lua_objlen(L, -1) > 0 && lua_objlen(L, -1) <= 4096;
+            else if (StringsEqual(kind, "command") ? (StringsEqual(key, "input_schema") || StringsEqual(key, "output_schema")) : StringsEqual(key, "schema"))
+                valid = lua_isboolean(L, -1) || IsLuaObject(L, -1);
+            if (!valid)
+            {
+                lua_pop(L, 2);
+                return false;
+            }
+            lua_pop(L, 1);
+        }
+        return true;
+    }
+
+    static bool StoreApplicationContract(const char* kind, const char* name, const char* json, const char** error)
+    {
+        dmMutex::ScopedLock lock(g_AutomationBridge.m_ApplicationMutex);
+        if (StringsEqual(kind, "command") && !FindCommandHandler(name))
+        {
+            *error = "register the command before describing it";
+            return false;
+        }
+        ApplicationContract* existing = FindApplicationContract(kind, name);
+        if (existing)
+        {
+            if (!SetString(&existing->m_MetadataJson, json)) { *error = "out of memory"; return false; }
+        }
+        else
+        {
+            if (g_AutomationBridge.m_ApplicationContracts.m_Count >= 256)
+            {
+                *error = "at most 256 application contracts can be declared";
+                return false;
+            }
+            ApplicationContract contract;
+            contract.m_Kind = DuplicateString(kind);
+            contract.m_Name = DuplicateString(name);
+            contract.m_MetadataJson = DuplicateString(json);
+            if (!contract.m_Kind || !contract.m_Name || !contract.m_MetadataJson || !ArrayPush(&g_AutomationBridge.m_ApplicationContracts, &contract))
+            {
+                FreeApplicationContract(&contract);
+                *error = "out of memory";
+                return false;
+            }
+        }
+        ++g_AutomationBridge.m_CatalogRevision;
+        return true;
+    }
+
+    static int LuaDescribe(lua_State* L)
+    {
+        DM_LUA_STACK_CHECK(L, 0);
+        luaL_checktype(L, 1, LUA_TSTRING);
+        luaL_checktype(L, 2, LUA_TSTRING);
+        luaL_checktype(L, 3, LUA_TTABLE);
+        const char* kind = lua_tostring(L, 1);
+        const char* name = lua_tostring(L, 2);
+        if (lua_objlen(L, 1) != strlen(kind) || !(StringsEqual(kind, "command") || StringsEqual(kind, "state") || StringsEqual(kind, "event")))
+            return luaL_error(L, "kind must be command, state, or event");
+        if (lua_objlen(L, 2) != strlen(name) || !IsValidApplicationName(name, false))
+            return luaL_error(L, "contract name must be an identifier such as app.ready");
+        if (!ValidateApplicationContract(L, kind))
+            return luaL_error(L, "contract fields must be description (1-4096 bytes) and schema objects or booleans; commands use input_schema/output_schema, states/events use schema");
+        char* json = 0;
+        const char* error = 0;
+        if (!EncodeLuaJson(L, 3, &json, &error)) return luaL_error(L, "%s", error);
+        bool ok = StoreApplicationContract(kind, name, json, &error);
+        free(json);
+        if (!ok) return luaL_error(L, "%s", error);
+        return 0;
+    }
+
+    static bool RegisterCommandCallback(const char* name, dmScript::LuaCallbackInfo* callback)
+    {
+        dmMutex::ScopedLock lock(g_AutomationBridge.m_ApplicationMutex);
+        CommandHandler* handler = FindCommandHandler(name);
+        if (handler)
+        {
+            dmScript::DestroyCallback(handler->m_Callback);
+            handler->m_Callback = callback;
+        }
+        else
+        {
+            CommandHandler new_handler;
+            new_handler.m_Name = DuplicateString(name);
+            new_handler.m_Callback = callback;
+            if (!new_handler.m_Name || !ArrayPush(&g_AutomationBridge.m_CommandHandlers, &new_handler))
+            {
+                free(new_handler.m_Name);
+                return false;
+            }
+        }
+        ++g_AutomationBridge.m_CatalogRevision;
+        return true;
+    }
+
     static int LuaCommand(lua_State* L)
     {
         DM_LUA_STACK_CHECK(L, 0);
@@ -811,20 +1008,8 @@ namespace dmAutomationBridge
         if (!IsValidApplicationName(name, false)) return luaL_error(L, "command name must be an identifier, preferably namespaced such as app.load_fixture");
         dmScript::LuaCallbackInfo* callback = dmScript::CreateCallback(L, 2);
         if (!callback) return luaL_error(L, "command callback must be registered from a script instance");
-        dmMutex::ScopedLock lock(g_AutomationBridge.m_ApplicationMutex);
-        CommandHandler* handler = FindCommandHandler(name);
-        if (handler)
+        if (!RegisterCommandCallback(name, callback))
         {
-            dmScript::DestroyCallback(handler->m_Callback);
-            handler->m_Callback = callback;
-            return 0;
-        }
-        CommandHandler new_handler;
-        new_handler.m_Name = DuplicateString(name);
-        new_handler.m_Callback = callback;
-        if (!new_handler.m_Name || !ArrayPush(&g_AutomationBridge.m_CommandHandlers, &new_handler))
-        {
-            free(new_handler.m_Name);
             dmScript::DestroyCallback(callback);
             return luaL_error(L, "failed to retain command callback");
         }
@@ -909,6 +1094,7 @@ namespace dmAutomationBridge
             {"emit", LuaEmit},
             {"publish", LuaPublish},
             {"command", LuaCommand},
+            {"describe", LuaDescribe},
             {"acknowledge_input", LuaAcknowledgeInput},
             {"annotate", LuaAnnotate},
             {0, 0}

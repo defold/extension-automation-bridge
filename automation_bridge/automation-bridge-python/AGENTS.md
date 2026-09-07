@@ -33,6 +33,8 @@
   validated special key.
 - Prefer events, published state, commands, acknowledgements, frame waits, and
   element waits over sleeps.
+- Discover game-specific operations with `game.application_catalog()`; command
+  argument/result and state/event schemas describe application-owned contracts.
 - Wrap interruptible work in `game.cancellation_scope(token)` using an
   `engine.CancellationToken` per operation. Native cleanup remains authoritative;
   inspect `OperationCancelled.cleanup_error` when a cleanup request is refused.

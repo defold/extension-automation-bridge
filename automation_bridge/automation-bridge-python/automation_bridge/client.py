@@ -23,6 +23,7 @@ from .elements import Element, ElementPage, ElementSelector
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .waits import RetryExceptions, WaitTimeoutError, wait_until
 from .events import CommandTimeout, Event, EventStream, StateSnapshot, select_state_path
+from .application import ApplicationCatalogPage
 from .cancellation import (
     CancellationToken, OperationCancelled, cancellation_scope,
     cancellable_sleep, cancellation_active, check_cancelled,
@@ -1667,6 +1668,40 @@ class Client:
                 selected = candidate
                 if candidate.value == expected and candidate.revision > (after_revision or 0):
                     return candidate
+
+    def application_catalog(
+        self,
+        *,
+        kind: Optional[str] = None,
+        name: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        cursor: Optional[str] = None,
+    ) -> ApplicationCatalogPage:
+        """Discover application commands, states, events, and their contracts.
+
+        Requires ``application.catalog``. ``kind`` is command, state, or event;
+        ``name`` filters an exact name. All registered commands and published
+        states are listed, including those without metadata. Unpublished states
+        and events appear after Lua ``automation_bridge.describe()`` declarations.
+        Schemas are descriptive metadata and do not enforce payload validation.
+
+        ``limit`` is 0-100 (zero requests only the match count). Pass the returned
+        string ``next_cursor`` with the same filters to continue. Cursor takes
+        precedence over ``offset``; both must be valid unsigned 32-bit values.
+        Restart pagination if the catalog revision or engine identity changes.
+        """
+        if kind is not None and kind not in ("command", "state", "event"):
+            raise ValueError("kind must be command, state, or event")
+        if name is not None and (not isinstance(name, str) or not name or "\0" in name or len(name.encode("utf-8")) > 128):
+            raise ValueError("name must be a non-empty string of at most 128 UTF-8 bytes")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 100:
+            raise ValueError("limit must be an integer from 0 through 100")
+        pagination = {"limit": limit, "offset": offset, "cursor": cursor}
+        self._validate_selector(pagination)
+        self._require_cached_capability("application.catalog")
+        data = self._request("GET", "/application/catalog", {"kind": kind, "name": name, **pagination})
+        return ApplicationCatalogPage.from_raw(data)
 
     def start_command(self, name: str, data: Any = None, timeout: float = 30.0) -> JsonDict:
         """Submit a registered named Lua command and return its pending id."""

@@ -462,6 +462,25 @@ with game.pointer((100, 100), lease=10) as pointer:
 
 ## Synchronization and observation
 
+Discover game-specific operations before calling them:
+
+```python
+page = game.application_catalog(kind="command")
+for entry in page.entries:
+    print(entry.name, entry.description, entry.input_schema, entry.output_schema)
+if page.next_cursor is not None:
+    following = game.application_catalog(kind="command", cursor=page.next_cursor)
+    assert (following.engine_instance_id, following.revision) == (page.engine_instance_id, page.revision)
+```
+
+`engine.ApplicationCatalogPage` retains counts, cursor, revision and engine
+identity. `engine.ApplicationEntry` exposes descriptions and schemas; use
+`kind="state"` or `kind="event"` to discover value/data contracts via `.schema`.
+Games declare metadata with Lua `automation_bridge.describe()`; see
+`examples/application_sync.script` in the extension source. Old runtimes without
+`application.catalog` fail with `UnsupportedCapabilityError` before querying the
+endpoint. Schemas document application expectations; they do not validate payloads.
+
 Use a shared cancellation token when a host or another thread may stop an
 operation:
 
