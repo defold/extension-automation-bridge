@@ -168,6 +168,37 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_editor_workflows_forward_explicit_session_identity(self):
+        project = EditorApiClient(".", port=1234)
+        with mock.patch.object(EngineClient, "_from_editor") as connect:
+            for method in (project.connect_engine, project.build_and_run, project.clean_build_and_run):
+                method(client_id="agent-a", session_id="task-1")
+                self.assertEqual("agent-a", connect.call_args.kwargs["client_id"])
+                self.assertEqual("task-1", connect.call_args.kwargs["session_id"])
+
+    def test_client_close_releases_local_resources_without_native_mutations(self):
+        bridge = EngineClient(1234, client_id="agent-a", session_id="task-1")
+        with mock.patch.object(bridge._logs, "close") as close, \
+             mock.patch.object(bridge, "_post_engine_message") as post:
+            with bridge:
+                self.assertFalse(bridge.owns_engine)
+                self.assertFalse(bridge.closed)
+                self.assertEqual("task-1", bridge.session_info()["session_id"])
+            bridge.close()
+        close.assert_called_once()
+        post.assert_not_called()
+        self.assertTrue(bridge.closed)
+        with self.assertRaisesRegex(AutomationBridgeError, "closed"):
+            bridge.health()
+
+    def test_invalid_session_identity_is_rejected_before_build(self):
+        project = EditorApiClient(".", port=1234)
+        with mock.patch.object(project, "_build_and_run_command") as build:
+            for value in (False, "", 1):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    project.build_and_run(session_id=value)
+        build.assert_not_called()
+
     def test_element_page_retains_cursor_counts_and_snapshot_metadata(self):
         bridge = EngineClient(1234)
         bridge._last_health = {"version": "2", "capabilities": ["scene.pagination"]}
@@ -3394,6 +3425,14 @@ class AutomationBridgeApiTest(unittest.TestCase):
             with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
                 self.bridge.request("GET", "/elements", params=params)
             self.assertEqual(400, error.exception.status)
+
+    def test_session_ownership_and_detach_leave_engine_available(self):
+        self.ensure_running_bridge()
+        attached = engine.connect(self.bridge.port, client_id="observer", session_id="detach-test")
+        self.assertFalse(attached.owns_engine)
+        attached.close()
+        self.assertTrue(attached.closed)
+        self.assertEqual(self.bridge.engine_instance_id, self.bridge.health()["engine_instance_id"])
 
     def test_automation_bridge_api_end_to_end(self):
         previous_port = None

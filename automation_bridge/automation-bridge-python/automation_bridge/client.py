@@ -725,6 +725,9 @@ class Client:
         required_capabilities: Sequence[str] = (),
     ):
         """Create a correlated client for an already-known engine service port."""
+        for name, value in (("client_id", client_id), ("session_id", session_id)):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         self.port = int(port)
         self.timeout = timeout
         self.base_url = f"http://127.0.0.1:{self.port}/automation-bridge/v2"
@@ -740,6 +743,62 @@ class Client:
         self._active_traces: List[Any] = []
         self._required_capabilities = set(required_capabilities)
         self._last_health: Optional[JsonDict] = None
+        self._owns_engine = False
+        self._project_root: Optional[Path] = None
+        self._closed = False
+
+    @property
+    def owns_engine(self) -> bool:
+        """Whether this client built the engine rather than attaching to it.
+
+        This describes lifecycle intent, not permission. ``close()`` leaves
+        the process running; ``close_engine()`` explicitly exits it, including
+        when deliberately called on an attached client.
+        """
+        return self._owns_engine
+
+    @property
+    def closed(self) -> bool:
+        """Whether this client's local resources have been released."""
+        return self._closed
+
+    def session_info(self) -> JsonDict:
+        """Return session identity and lifecycle ownership without native requests."""
+        return {
+            "client_id": self.client_id,
+            "session_id": self.session_id,
+            "engine_instance_id": self.engine_instance_id,
+            "project_path": str(self._project_root) if self._project_root else None,
+            "port": self.port,
+            "owns_engine": self.owns_engine,
+            "closed": self.closed,
+        }
+
+    def close(self) -> None:
+        """Release the background collector without sending native mutations.
+
+        Closing is idempotent and prevents further requests through this client.
+        Explicit streams and captures retain their own context-manager lifecycle.
+        Use ``input.flush()`` before closing to cancel this session's input, and
+        ``close_engine()`` only when engine termination is intended.
+        """
+        if not self._closed:
+            self._logs.close()
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise AutomationBridgeError("engine client is closed; reconnect to continue")
+
+    def __enter__(self) -> "Client":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            _cleanup_without_masking(self.close)
 
     @property
     def input(self) -> InputController:
@@ -758,9 +817,15 @@ class Client:
         build_command: Optional[str] = None,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
         fresh_build = build_command is not None
+        session_identity = {key: value for key, value in (("client_id", client_id), ("session_id", session_id)) if value is not None}
+        for name, value in session_identity.items():
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string when supplied")
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
             time.sleep(0.5)
@@ -778,6 +843,7 @@ class Client:
                     service_port,
                     profiler_url=profiler_url,
                     required_capabilities=required_capabilities,
+                    **session_identity,
                 )
                 health = bridge.health()
                 if not editor._validate_cached_engine_health(
@@ -809,6 +875,8 @@ class Client:
             if profiler_url:
                 editor._remember_remotery_url(profiler_url)
             bridge.logs.start()
+            bridge._owns_engine = fresh_build
+            bridge._project_root = Path(editor.root)
             return bridge
 
         if not fresh_build:
@@ -1905,6 +1973,13 @@ class Client:
 
     def close_engine(self, timeout: float = 2.0) -> None:
         """Ask the running Defold engine to exit, falling back to the local listener PID."""
+        self._ensure_open()
+        try:
+            self._close_engine(timeout)
+        finally:
+            self.close()
+
+    def _close_engine(self, timeout: float) -> None:
         self._logs.close()
         url = f"http://127.0.0.1:{self.port}/post/@system/exit"
         try:
@@ -2258,6 +2333,7 @@ class Client:
         json_body: Optional[Mapping[str, Any]] = None,
     ) -> JsonDict:
         url = self.base_url + path
+        self._ensure_open()
         encoded_params = self._encoded_params(params)
         if encoded_params:
             url += "?" + urllib.parse.urlencode(encoded_params)
@@ -2287,6 +2363,7 @@ class Client:
         return data
 
     def _request_json(self, method: str, path: str, payload: Mapping[str, Any]) -> JsonDict:
+        self._ensure_open()
         url = self.base_url + path
         compact_payload = {key: value for key, value in payload.items() if value is not None}
         data = json.dumps(compact_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -2387,6 +2464,7 @@ class Client:
             trace.record(kind, payload)
 
     def _post_engine_message(self, path: str, payload: bytes, timeout: Optional[float] = None) -> bytes:
+        self._ensure_open()
         url = f"http://127.0.0.1:{self.port}{path}"
         status, body = request_bytes(url, payload, timeout=self.timeout if timeout is None else timeout)
         if status < 200 or status >= 300:

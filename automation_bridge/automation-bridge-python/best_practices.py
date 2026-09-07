@@ -307,6 +307,8 @@ def close_owned_game(game: engine.Client, owns_engine: bool) -> None:
     """Do not terminate a reused engine merely because a script is finished."""
     if owns_engine:
         game.close_engine()
+    else:
+        game.close()
 
 
 if __name__ == "__main__":

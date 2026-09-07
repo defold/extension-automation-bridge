@@ -143,6 +143,18 @@ The package root exposes only `editor` and `engine`.
 
 ## Bootstrap
 
+Editor connection and build helpers accept optional `client_id` and `session_id`.
+Reuse both only for the same logical automation session; independent agents must
+use distinct identities. Builds return `game.owns_engine == True`; attachment
+through the editor or a known port returns `False`. `game.session_info()` exposes
+this information without another network request.
+
+`game.close()` (also called by the engine client's context manager) releases the
+background log collector and leaves Defold running. It is idempotent; reconnect
+before making further requests. Explicit streams/captures keep their own context
+managers. Flush this session's input before closing if cancellation is intended.
+Engine termination remains the separate, explicit `game.close_engine()` operation.
+
 ```python
 from automation_bridge import editor, engine
 

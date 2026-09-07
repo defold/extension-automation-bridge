@@ -981,7 +981,15 @@ class Client:
         *,
         timeout: float = 20.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Attach to the registered engine without taking lifecycle ownership.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
         return EngineClient._from_editor(
@@ -989,14 +997,25 @@ class Client:
             build_command=None,
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
         )
+
 
     def build_and_run(
         self,
         *,
         timeout: float = 60.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Build a new engine and return a client with owns_engine=True.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
         return EngineClient._from_editor(
@@ -1004,14 +1023,25 @@ class Client:
             build_command="build",
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
         )
+
 
     def clean_build_and_run(
         self,
         *,
         timeout: float = 60.0,
         required_capabilities: Sequence[str] = (),
+        client_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> EngineClient:
+        """Build a new engine and return a client with owns_engine=True.
+
+        Explicit client/session IDs let one logical automation session reconnect.
+        Use distinct IDs for independent agents; the native input lease remains
+        exclusive. Closing the client leaves the engine running.
+        """
         from .client import Client as EngineClient
 
         return EngineClient._from_editor(
@@ -1019,7 +1049,10 @@ class Client:
             build_command="clean-build",
             timeout=timeout,
             required_capabilities=required_capabilities,
+            client_id=client_id,
+            session_id=session_id,
         )
+
 
     def build_and_run_html5(self, *, timeout: float = 60.0) -> None:
         self._empty_command("build-html5", timeout)
