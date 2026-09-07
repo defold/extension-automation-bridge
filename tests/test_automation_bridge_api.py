@@ -368,6 +368,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_editor_workflows_forward_explicit_session_identity(self):
         project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
         with mock.patch.object(EngineClient, "_from_editor") as connect:
             for method in (project.connect_engine, project.build_and_run, project.clean_build_and_run):
                 method(client_id="agent-a", session_id="task-1")
@@ -391,6 +392,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_invalid_session_identity_is_rejected_before_build(self):
         project = EditorApiClient(".", port=1234)
+        project._openapi_document = EDITOR_OPENAPI
         with mock.patch.object(project, "_build_and_run_command") as build:
             for value in (False, "", 1):
                 with self.subTest(value=value), self.assertRaises(ValueError):
@@ -1515,6 +1517,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
     def test_editor_build_workflows_delegate_with_explicit_command_names(self):
         project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
         sentinel = object()
         with mock.patch.object(EngineClient, "_from_editor", return_value=sentinel) as connect:
             self.assertIs(sentinel, project.build_and_run(timeout=12, required_capabilities=("scene",)))
@@ -1523,6 +1526,78 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual("build", connect.call_args_list[0].kwargs["build_command"])
         self.assertEqual("clean-build", connect.call_args_list[1].kwargs["build_command"])
         self.assertIsNone(connect.call_args_list[2].kwargs["build_command"])
+
+    def test_editor_compile_never_enters_engine_lifecycle(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/compile": {"post": {}}}}
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+             mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch.object(project, "_console_lines") as console:
+            result = project.compile(timeout=12)
+        self.assertIs(project.last_command_result, result)
+        self.assertTrue(result.completed)
+        self.assertEqual("compile", result.command)
+        request.assert_called_once_with(project.base_url + "/command/compile", method="POST", timeout=12)
+        bootstrap.assert_not_called()
+        console.assert_not_called()
+
+    def test_editor_compile_and_focus_reject_legacy_before_mutation(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap, \
+             mock.patch("automation_bridge.editor.request_json") as request:
+            for operation in (project.compile, lambda: project.build_and_run(focus=False)):
+                with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                    operation()
+        request.assert_not_called()
+        bootstrap.assert_not_called()
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            project.build_and_run(focus=True)
+        self.assertEqual("build", bootstrap.call_args.kwargs["build_command"])
+        self.assertNotIn("focus", bootstrap.call_args.kwargs)
+
+    def test_editor_run_negotiates_focus_and_prefers_new_command(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {"/command/run": {"post": {"parameters": [
+            {"name": "focus", "in": "query", "schema": {"type": "boolean"}},
+        ]}}, "/command/build": {"post": {}}}}
+        for supplied, expected in ((None, False), (False, False), (True, True)):
+            with self.subTest(focus=supplied), mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                project.build_and_run(focus=supplied)
+            self.assertEqual("run", bootstrap.call_args.kwargs["build_command"])
+            self.assertIs(expected, bootstrap.call_args.kwargs["focus"])
+            with mock.patch.object(project, "_console_lines", return_value=[]), \
+                 mock.patch.object(project, "_engine_service_port_value", return_value=None), \
+                 mock.patch.object(project, "_has_fresh_endpoint_registration", return_value=True), \
+                 mock.patch.object(project, "_latest_registration_has_engine_service_port", return_value=True), \
+                 mock.patch("automation_bridge.editor.cancellable_sleep"), \
+                 mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request:
+                project._build_and_run_command("run", focus=expected)
+            self.assertEqual(project.base_url + "/command/run?focus=" + str(expected).lower(), request.call_args.args[0])
+            self.assertEqual(1, request.call_count)
+
+    def test_editor_run_validates_focus_and_clean_build_before_bootstrap(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {}}
+        with mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+            for focus in (0, 1, "false", [], {}):
+                with self.subTest(focus=focus), self.assertRaisesRegex(ValueError, "focus"):
+                    project.build_and_run(focus=focus)
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.clean_build_and_run()
+            with self.assertRaises(editor.UnsupportedOperationError):
+                project.build_and_run()
+        bootstrap.assert_not_called()
+
+    def test_editor_run_keeps_focus_during_stale_build_recovery(self):
+        project = EditorApiClient(".", port=12345)
+        sentinel = object()
+        with mock.patch.object(EngineClient, "_close_candidate_engine_ports"), \
+             mock.patch("automation_bridge.client.cancellable_sleep"), \
+             mock.patch.object(EngineClient, "_wait_for_bridge", return_value=sentinel), \
+             mock.patch.object(project, "_build_and_run_command") as build:
+            self.assertIs(sentinel, EngineClient._recover_after_stale_build(project, lambda: None, 5, "run", focus=False))
+        build.assert_called_once_with("run", timeout=5, focus=False)
 
     def test_editor_preferences_catalog_and_custom_paths(self):
         project = EditorApiClient(".", port=12345)

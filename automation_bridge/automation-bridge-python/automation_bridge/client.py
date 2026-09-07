@@ -864,6 +864,7 @@ class Client:
         required_capabilities: Sequence[str] = (),
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        focus: Optional[bool] = None,
     ) -> "Client":
         """Private editor-owned bootstrap hook for engine discovery."""
         check_cancelled()
@@ -875,7 +876,7 @@ class Client:
         if fresh_build:
             cls._close_candidate_engine_ports(editor)
             cancellable_sleep(0.5)
-            editor._build_and_run_command(build_command, timeout=timeout)
+            editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
 
         def connect_candidate(
             service_port: int,
@@ -957,7 +958,7 @@ class Client:
             return None
 
         if fresh_build and cls._last_build_missing_engine_service_port(editor):
-            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+            return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
         try:
             return cls._wait_for_bridge(
@@ -970,7 +971,7 @@ class Client:
             if not fresh_build:
                 raise
 
-        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command)
+        return cls._recover_after_stale_build(editor, bridge_after_build, timeout, build_command, focus=focus)
 
     @classmethod
     def _recover_after_stale_build(
@@ -979,12 +980,14 @@ class Client:
         bridge_after_build: Any,
         timeout: float,
         build_command: Optional[str],
+        *,
+        focus: Optional[bool] = None,
     ) -> "Client":
         if build_command is None:
             raise RuntimeError("stale-build recovery requires a build command")
         cls._close_candidate_engine_ports(editor)
         cancellable_sleep(0.5)
-        editor._build_and_run_command(build_command, timeout=timeout)
+        editor._build_and_run_command(build_command, timeout=timeout, **({"focus": focus} if focus is not None else {}))
         return cls._wait_for_bridge(
             bridge_after_build,
             timeout=timeout,

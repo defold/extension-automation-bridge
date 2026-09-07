@@ -345,6 +345,15 @@ zero-based source ranges, completion status, and an optional `target_url`.
 keep their return values. On 1.13.1, HTML5, hot reload, and debugger acknowledgements
 have `completed=False` and `success=None`; 1.13.2 reports their build completion.
 
+Use `project.compile()` on Defold 1.13.2 to validate resources and Lua without
+launching or bundling. It returns a `BuildResult`; compilation failures raise
+`BuildError`. When runtime testing is needed, call `project.build_and_run()`
+directly: it compiles and launches through `run` on 1.13.2 or `build` on 1.13.1.
+The default avoids taking focus where supported and preserves the legacy launch
+on 1.13.1. Explicit `focus=False` requires advertised focus control (1.13.2);
+`focus=True` works on either version. Unsupported requests fail before engine
+cleanup. `clean_build_and_run()` still uses the native focused launch on both.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

@@ -1131,6 +1131,31 @@ class Client:
         self._last_command_result = None
         return request_json(f"{self.base_url}/command/{command}", method="POST", timeout=timeout)
 
+    def compile(self, *, timeout: float = 60.0) -> BuildResult:
+        """Compile project resources and Lua without launching or bundling.
+
+        Supported from Defold 1.13.2. Older editors raise
+        UnsupportedOperationError; this never falls back to a launching command.
+        Return completion and diagnostics, or raise BuildError with the result.
+        Use build_and_run() directly when a runtime is needed; it compiles too.
+        """
+        status, response = self._json_command("compile", timeout)
+        return self._accept_build_result("compile", f"{self.base_url}/command/compile", status, response)
+
+    def _run_focus(self, command: str, focus: Optional[bool]) -> Optional[bool]:
+        if focus is not None and type(focus) is not bool:
+            raise ValueError("focus must be a boolean or None")
+        self._require_command(command)
+        if self.commands.supports(command, parameter="focus"):
+            return False if focus is None else focus
+        if focus is False:
+            raise UnsupportedOperationError(
+                f"editor does not advertise focus control for {command!r}",
+                minimum_version="1.13.2",
+            )
+        # Legacy commands launch with focus. Do not send parameters they ignore.
+        return None
+
     def connect_engine(
         self,
         *,
@@ -1161,11 +1186,19 @@ class Client:
         self,
         *,
         timeout: float = 60.0,
+        focus: Optional[bool] = None,
         required_capabilities: Sequence[str] = (),
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> EngineClient:
-        """Build a new engine and return a client with owns_engine=True.
+        """Compile, launch, and return a client with owns_engine=True.
+
+        Uses ``run`` on Defold 1.13.2 and ``build`` on 1.13.1. Omitted focus
+        defaults to False when the editor advertises focus control, otherwise
+        preserves the legacy focused launch. Explicit ``focus=False`` requires
+        Defold 1.13.2. ``focus=True`` requests the native focused launch on both.
+        Unsupported requests fail before closing any engine. Build evidence is
+        available in ``last_command_result``; no separate compile is needed.
 
         Explicit client/session IDs let one logical automation session reconnect.
         Use distinct IDs for independent agents; the native input lease remains
@@ -1173,13 +1206,18 @@ class Client:
         """
         from .client import Client as EngineClient
 
+        if focus is not None and type(focus) is not bool:
+            raise ValueError("focus must be a boolean or None")
+        command = "run" if self.commands.supports("run") else "build"
+        negotiated_focus = self._run_focus(command, focus)
         return EngineClient._from_editor(
             self,
-            build_command="build",
+            build_command=command,
             timeout=timeout,
             required_capabilities=required_capabilities,
             client_id=client_id,
             session_id=session_id,
+            **({"focus": negotiated_focus} if negotiated_focus is not None else {}),
         )
 
 
@@ -1191,7 +1229,10 @@ class Client:
         client_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> EngineClient:
-        """Build a new engine and return a client with owns_engine=True.
+        """Clear build caches, rebuild, launch, and return an owned engine client.
+
+        Use only to recover from stale build caches. The native clean-build
+        command launches with focus on both Defold 1.13.1 and 1.13.2.
 
         Explicit client/session IDs let one logical automation session reconnect.
         Use distinct IDs for independent agents; the native input lease remains
@@ -1199,6 +1240,7 @@ class Client:
         """
         from .client import Client as EngineClient
 
+        self._require_command("clean-build")
         return EngineClient._from_editor(
             self,
             build_command="clean-build",
@@ -1217,12 +1259,17 @@ class Client:
         """
         self._empty_command("build-html5", timeout)
 
-    def _build_and_run_command(self, command: str, timeout: float = 60.0) -> BuildResult:
+    def _build_and_run_command(self, command: str, timeout: float = 60.0, *, focus: Optional[bool] = None) -> BuildResult:
         """Execute a desktop build-and-run command and await endpoint registration."""
         check_cancelled()
-        if command not in {"build", "clean-build"}:
+        if command not in {"build", "run", "clean-build"}:
             raise ValueError(f"unsupported desktop build-and-run command: {command}")
         self._require_command(command)
+        url = f"{self.base_url}/command/{command}"
+        if command == "run" or focus is not None:
+            negotiated_focus = self._run_focus(command, focus)
+            if negotiated_focus is not None:
+                url += "?" + urllib.parse.urlencode({"focus": "true" if negotiated_focus else "false"})
         self._record_lifecycle("editor_build_started")
         previous_lines = self._console_lines()
         previous_registration_count = self._endpoint_registered_count(previous_lines)
@@ -1231,7 +1278,6 @@ class Client:
         if previous_port is not None:
             self._engine_service_port = previous_port
         self._last_command_result = None
-        url = f"{self.base_url}/command/{command}"
         try:
             status, response = request_json(url, method="POST", timeout=timeout)
             result = self._accept_build_result(command, url, status, response)
