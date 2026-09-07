@@ -19,12 +19,16 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from contextlib import ExitStack
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from automation_bridge import editor, engine
+from automation_bridge.cancellation import check_cancelled, cancellable_sleep
 from automation_bridge.elements import Element
 from automation_bridge.gestures import GestureGenerator
 from automation_bridge.visual import VisualClient
@@ -64,16 +68,31 @@ class ToolFailure(Exception):
         return result
 
 
+@dataclass
+class RequestContext:
+    request_id: Any
+    token: engine.CancellationToken = field(default_factory=engine.CancellationToken)
+    created: list = field(default_factory=list)
+    engines: set = field(default_factory=set)
+    scopes: ExitStack = field(default_factory=ExitStack)
+
+
+_request_context: ContextVar[Optional[RequestContext]] = ContextVar("mcp_request", default=None)
+
+
 class HandleRegistry:
     """Thread-safe opaque handles with stable identity and explicit release."""
 
     def __init__(self) -> None:
         self._values: Dict[str, Any] = {}
         self._identity: Dict[int, str] = {}
+        self._closed = False
         self._lock = threading.RLock()
 
     def put(self, value: Any) -> str:
         with self._lock:
+            if self._closed:
+                raise ToolFailure("runtime_closed", "cannot retain objects after runtime shutdown")
             identity = id(value)
             existing = self._identity.get(identity)
             if existing is not None and self._values.get(existing) is value:
@@ -81,6 +100,9 @@ class HandleRegistry:
             token = "h_" + uuid.uuid4().hex
             self._values[token] = value
             self._identity[identity] = token
+            context = _request_context.get()
+            if context is not None:
+                context.created.append((token, value))
             return token
 
     def get(self, token: str) -> Any:
@@ -119,6 +141,7 @@ class HandleRegistry:
 
     def cleanup(self) -> None:
         with self._lock:
+            self._closed = True
             self._values.clear()
             self._identity.clear()
 
@@ -847,7 +870,8 @@ class BridgeRuntime:
             for spec in OPERATION_SPECS
         }
         self._entered: set = set()
-        self._cancelled: set = set()
+        self._requests: Dict[Any, RequestContext] = {}
+        self.cleanup_errors = deque(maxlen=50)
         self._lock = threading.RLock()
         self._closed = False
         self.tool_handlers: Dict[str, Callable[[Mapping[str, Any]], Any]] = {
@@ -944,30 +968,101 @@ class BridgeRuntime:
             "next_cursor": next_cursor if next_cursor < len(items) else None,
         }
 
-    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> JsonObject:
-        if not isinstance(name, str) or name not in self.tool_handlers:
-            failure = ToolFailure("unknown_tool", "unknown Automation Bridge tool", {"name": name})
-            return {"ok": False, "error": failure.as_dict()}
-        if not isinstance(arguments, Mapping):
-            failure = ToolFailure("invalid_arguments", "tool arguments must be an object")
-            return {"ok": False, "error": failure.as_dict()}
-        if self._closed:
-            failure = ToolFailure("runtime_closed", "the Automation Bridge MCP runtime is closed")
-            return {"ok": False, "error": failure.as_dict()}
+    def prepare_request(self, request_id: Any) -> None:
+        """Register before starting a worker so immediate cancellation is retained."""
+        with self._lock:
+            if request_id not in self._requests:
+                context = RequestContext(request_id)
+                if self._closed:
+                    context.token.cancel("MCP runtime closed")
+                self._requests[request_id] = context
+
+    def finish_request(self, request_id: Any) -> None:
+        with self._lock:
+            context = self._requests.pop(request_id, None)
+        if context is not None and (context.token.cancelled or self._closed):
+            for token, value in reversed(context.created):
+                self._cleanup_value(token, value, failure=True)
+                try:
+                    self.handles.release(token)
+                except ToolFailure:
+                    pass
+
+    def call_tool_request(self, request_id: Any, name: str, arguments: Mapping[str, Any]) -> JsonObject:
+        with self._lock:
+            owned = request_id not in self._requests
+            self.prepare_request(request_id)
+            context = self._requests[request_id]
+        previous = _request_context.set(context)
+        result = None
         try:
-            result = self.tool_handlers[name](dict(arguments))
-            return {"ok": True, "data": serialize(result, self.handles)}
+            if not isinstance(name, str) or name not in self.tool_handlers:
+                raise ToolFailure("unknown_tool", "unknown Automation Bridge tool", {"name": name})
+            if not isinstance(arguments, Mapping):
+                raise ToolFailure("invalid_arguments", "tool arguments must be an object")
+            if self._closed:
+                raise ToolFailure("runtime_closed", "the Automation Bridge MCP runtime is closed")
+            with engine.cancellation_scope(context.token), context.scopes:
+                result = self.tool_handlers[name](dict(arguments))
+                check_cancelled()
+                with self._lock:
+                    check_cancelled()
+                    if self._closed:
+                        raise engine.OperationCancelled("MCP runtime closed")
+                    data = serialize(result, self.handles)
+            return {"ok": True, "data": data}
         except Exception as error:
+            if isinstance(error, engine.OperationCancelled):
+                self._discard_unretained(result)
+                self._record_cleanup_error(request_id, error)
             read_only = next((tool["annotations"]["readOnlyHint"] for tool in self._tools if tool["name"] == name), False)
-            if name in {"automation_bridge_call", "automation_bridge_destructive_call"}:
+            if name in {"automation_bridge_call", "automation_bridge_destructive_call"} and isinstance(arguments, Mapping):
                 spec = self._operation_specs.get(arguments.get("operation"))
                 read_only = bool(spec and spec.read_only)
             failure = _exception_failure(error, read_only=read_only)
             return {"ok": False, "error": failure.as_dict()}
+        finally:
+            _request_context.reset(previous)
+            if owned:
+                self.finish_request(request_id)
+
+    def call_tool(self, name: str, arguments: Mapping[str, Any]) -> JsonObject:
+        return self.call_tool_request(uuid.uuid4().hex, name, arguments)
 
     def cancel(self, request_id: Any) -> None:
         with self._lock:
-            self._cancelled.add(str(request_id))
+            context = self._requests.get(request_id)
+            if context is not None:
+                context.token.cancel("MCP request cancelled")
+
+    def _record_cleanup_error(self, request_id: Any, error: Exception) -> None:
+        with self._lock:
+            self.cleanup_errors.append({"request_id": request_id, "error": _exception_failure(error).as_dict()})
+
+    def _discard_unretained(self, value: Any) -> None:
+        if isinstance(value, Mapping):
+            for item in value.values():
+                self._discard_unretained(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._discard_unretained(item)
+        elif value is not None and self.handles.token_for(value) is None:
+            self._cleanup_value("", value, failure=True)
+
+    def _bind_engine(self, value: Any) -> None:
+        context = _request_context.get()
+        if context is None:
+            return
+        seen = set()
+        while value is not None and id(value) not in seen:
+            seen.add(id(value))
+            if isinstance(value, engine.Client):
+                if id(value) not in context.engines:
+                    context.scopes.enter_context(value.cancellation_scope(context.token))
+                    context.engines.add(id(value))
+                return
+            attributes = vars(value) if hasattr(value, "__dict__") else {}
+            value = next((attributes[key] for key in ("_bridge", "bridge", "_client", "client") if key in attributes), None)
 
     def _expect_keys(
         self,
@@ -993,7 +1088,8 @@ class BridgeRuntime:
     def _resolve_target(self, wire: Any) -> Any:
         value = deserialize(wire, self.handles)
         if isinstance(value, str) and value.startswith("h_"):
-            return self.handles.get(value)
+            value = self.handles.get(value)
+        self._bind_engine(value)
         return value
 
     @staticmethod
@@ -1279,6 +1375,7 @@ class BridgeRuntime:
         attempts = 0
         last = None
         while True:
+            check_cancelled()
             attempts += 1
             last = self.operation_handlers[spec.qualified_name](arguments.get("target"), nested_arguments)
             observed = self._extract_path(last, path)
@@ -1293,7 +1390,7 @@ class BridgeRuntime:
                     retryable=True,
                     error_type="WaitTimeoutError",
                 )
-            time.sleep(min(float(interval), remaining))
+            cancellable_sleep(min(float(interval), remaining))
 
     def _tool_wait(self, arguments: Mapping[str, Any]) -> Any:
         return self._wait_declarative(arguments)
@@ -1859,19 +1956,18 @@ class BridgeRuntime:
             elif isinstance(value, (editor.ConsoleStream, engine.EngineLogStream, engine.EventStream, engine.RuntimeLogs)):
                 value.close()
             elif isinstance(value, engine.Client):
-                # Releasing a borrowed engine must never terminate its process.
-                try:
-                    value.logs.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                value.close()
+        except Exception as error:
+            context = _request_context.get()
+            self._record_cleanup_error(context.request_id if context else None, error)
 
     def cleanup(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            for context in self._requests.values():
+                context.token.cancel("MCP runtime closed")
         for token, value in reversed(self.handles.snapshot()):
             self._cleanup_value(token, value, failure=True)
         self.handles.cleanup()

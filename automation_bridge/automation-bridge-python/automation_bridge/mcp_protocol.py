@@ -191,7 +191,7 @@ class McpProtocol:
             if notification:
                 self._handle_notification(method, params)
                 return None
-            result, modern = self._dispatch(method, params)
+            result, modern = self._dispatch(method, params, request_id)
             response = self._success_response(request_id, result, modern)
             encode_message(response)
             return response
@@ -282,7 +282,7 @@ class McpProtocol:
         # notifications are ignored without executing handlers or side effects.
 
     def _dispatch(
-        self, method: str, params: Dict[str, Any]
+        self, method: str, params: Dict[str, Any], request_id: Any = None
     ) -> Tuple[Dict[str, Any], bool]:
         if method == "initialize":
             return self._initialize(params), False
@@ -307,7 +307,7 @@ class McpProtocol:
         if method == "tools/list":
             return self._list_tools(params), modern
         if method == "tools/call":
-            return self._call_tool(params), modern
+            return self._call_tool(params, request_id), modern
         if method == "resources/list":
             return self._list_resources(params), modern
         if method == "resources/read":
@@ -429,7 +429,7 @@ class McpProtocol:
         tools = self._runtime_descriptors("tool_descriptors", "tools")
         return {"tools": tools, "ttlMs": 300_000, "cacheScope": "public"}
 
-    def _call_tool(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_tool(self, params: Dict[str, Any], request_id: Any = None) -> Dict[str, Any]:
         self._validate_keys(params, required=("name",), optional=("arguments", "_meta"))
         name = params["name"]
         arguments = params.get("arguments", {})
@@ -446,7 +446,8 @@ class McpProtocol:
         if not callable(call_tool):
             raise ProtocolError(INTERNAL_ERROR, "Internal error")
         try:
-            envelope = call_tool(name, arguments)
+            request_call = getattr(self.runtime, "call_tool_request", None)
+            envelope = request_call(request_id, name, arguments) if callable(request_call) else call_tool(name, arguments)
         except Exception as error:
             envelope = {"ok": False, "error": self._tool_error(error)}
         if not isinstance(envelope, dict):
@@ -633,6 +634,7 @@ class StdioServer:
                     self._write(error_response(None, PARSE_ERROR, "Parse error"))
                     continue
                 self._accept(message)
+            self._cancel_active()
             self._drain_workers()
             return 0
         finally:
@@ -644,18 +646,26 @@ class StdioServer:
                 return
             self._cleaned = True
             self._closing = True
-            for state in self._active.values():
-                state.cancelled.set()
+        self._cancel_active()
         cleanup = getattr(self.protocol.runtime, "cleanup", None)
         if callable(cleanup):
             try:
                 cleanup()
+                for entry in getattr(self.protocol.runtime, "cleanup_errors", ()):
+                    self.stderr.write("automation-bridge MCP cleanup: %s\n" % json.dumps(entry))
+                self.stderr.flush()
             except Exception as error:
                 try:
                     self.stderr.write("automation-bridge MCP cleanup failed: %s\n" % error)
                     self.stderr.flush()
                 except Exception:
                     pass
+
+    def _cancel_active(self) -> None:
+        with self._state_lock:
+            for request_id, state in self._active.items():
+                state.cancelled.set()
+                self.protocol.cancel(request_id)
 
     def cancel(self, request_id: Any) -> bool:
         with self._state_lock:
@@ -687,6 +697,7 @@ class StdioServer:
                 existing = self._active.get(request_id)
                 if existing is not None:
                     existing.cancelled.set()
+                    self.protocol.cancel(request_id)
                     self._write(
                         error_response(request_id, INVALID_REQUEST, "Duplicate request id")
                     )
@@ -694,6 +705,9 @@ class StdioServer:
         if is_request and method in self._CONCURRENT_METHODS:
             with self._state_lock:
                 state = _RequestState(method)
+                prepare = getattr(self.protocol.runtime, "prepare_request", None)
+                if callable(prepare):
+                    prepare(request_id)
                 self._active[request_id] = state
                 thread = threading.Thread(
                     target=self._run_request,
@@ -746,7 +760,12 @@ class StdioServer:
                 if self._active.get(request_id) is state:
                     del self._active[request_id]
         finally:
+            finish = getattr(self.protocol.runtime, "finish_request", None)
+            if callable(finish):
+                finish(request_id)
             with self._state_lock:
+                if self._active.get(request_id) is state:
+                    del self._active[request_id]
                 self._threads.discard(threading.current_thread())
 
     def _drain_workers(self) -> None:

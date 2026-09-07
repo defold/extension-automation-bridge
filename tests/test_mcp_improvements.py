@@ -119,3 +119,101 @@ class EditorToolsTest(unittest.TestCase):
                 else:
                     self.assertFalse(details['result']['success'])
                     self.assertEqual(4, details['result']['issues'][0]['range']['end']['character'])
+
+
+class CancellationTest(unittest.TestCase):
+    def test_wait_cancellation_stops_polling_and_requests_native_cleanup(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        observed = threading.Event()
+        responses = []
+        def health():
+            observed.set()
+            return {'ready': False}
+        with mock.patch.object(game, 'health', side_effect=health) as query, mock.patch.object(game.input, 'flush', return_value={}) as flush:
+            worker = threading.Thread(target=lambda: responses.append(runtime.call_tool_request('wait', 'automation_bridge_wait', {
+                'operation': 'automation_bridge.engine.Client.health', 'target': wire,
+                'path': 'ready', 'interval': 60, 'timeout': 120,
+            })))
+            worker.start()
+            self.assertTrue(observed.wait(1))
+            runtime.cancel('wait')
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(1, query.call_count)
+            flush.assert_called_once_with(release=True)
+            self.assertEqual('operation_cancelled', responses[0]['error']['code'])
+        runtime.cleanup()
+
+    def test_cancel_before_worker_starts_and_id_reuse(self):
+        runtime = BridgeRuntime(ROOT)
+        runtime.prepare_request(1)
+        runtime.cancel(1)
+        result = runtime.call_tool_request(1, 'automation_bridge_catalog', {})
+        self.assertEqual('operation_cancelled', result['error']['code'])
+        runtime.finish_request(1)
+        self.assertTrue(runtime.call_tool_request(1, 'automation_bridge_catalog', {})['ok'])
+        runtime.cancel(1)
+        self.assertFalse(runtime._requests)
+        runtime.cleanup()
+
+    def test_cleanup_failure_is_inspectable_after_cancelled_response_is_suppressed(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        def health():
+            runtime.cancel('cancel')
+            return {'ready': False}
+        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native refused cleanup')):
+            response = runtime.call_tool_request('cancel', 'defold_health', {'engine': wire})
+        self.assertIn('native refused cleanup', response['error']['data']['cleanup_error']['message'])
+        self.assertEqual('cancel', runtime.cleanup_errors[-1]['request_id'])
+        runtime.cleanup()
+
+    def test_shutdown_discards_late_client_without_allocating_a_handle(self):
+        runtime = BridgeRuntime(ROOT)
+        started, release = threading.Event(), threading.Event()
+        game = engine.Client(54321)
+        def connect(**kwargs):
+            started.set()
+            release.wait(2)
+            return game
+        responses = []
+        with mock.patch.object(editor, 'open_project', side_effect=connect):
+            worker = threading.Thread(target=lambda: responses.append(runtime.call_tool_request('late', 'defold_open_project', {'project_path': str(ROOT)})))
+            worker.start()
+            self.assertTrue(started.wait(1))
+            runtime.cleanup()
+            release.set()
+            worker.join(1)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(responses[0]['ok'])
+        self.assertTrue(game.closed)
+        self.assertEqual([], runtime.handles.snapshot())
+
+    def test_stdio_cancellation_suppresses_response_and_stops_real_wait(self):
+        from automation_bridge.mcp_protocol import McpProtocol, StdioServer
+        runtime = BridgeRuntime(ROOT)
+        protocol = McpProtocol(runtime)
+        protocol.handle({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-11-25', 'clientInfo': {'name': 'test', 'version': '1'}, 'capabilities': {}}})
+        output = io.StringIO()
+        server = StdioServer(protocol, stdout=output, stderr=io.StringIO())
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        started = threading.Event()
+        def health():
+            started.set()
+            return False
+        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', return_value={}) as flush:
+            server._accept({'jsonrpc': '2.0', 'id': 'cancel-me', 'method': 'tools/call', 'params': {
+                'name': 'automation_bridge_wait', 'arguments': {
+                    'operation': 'automation_bridge.engine.Client.health', 'target': wire, 'interval': 60, 'timeout': 120}}})
+            self.assertTrue(started.wait(1))
+            server.cancel('cancel-me')
+            server._drain_workers()
+            flush.assert_called_once_with(release=True)
+        self.assertEqual('', output.getvalue())
+        self.assertFalse(runtime._requests)
+        server.close()
