@@ -269,12 +269,13 @@ class EngineLogStream:
                         raise
 
 
-def _cleanup_without_masking(cleanup: Any) -> None:
-    """Run best-effort cleanup while preserving an already-active exception."""
+def _cleanup_without_masking(cleanup: Any, interrupted: Optional[BaseException] = None) -> None:
+    """Preserve the original exception and retain cancellation cleanup evidence."""
     try:
         cleanup()
-    except BaseException:
-        pass
+    except BaseException as cleanup_error:
+        if isinstance(interrupted, OperationCancelled) and interrupted.cleanup_error is None:
+            interrupted.cleanup_error = cleanup_error
 
 
 class RuntimeLogs:
@@ -359,7 +360,10 @@ class RuntimeLogs:
 
 
 class InputInterruptionScope:
-    """Flush this client's input session if an enclosed operation is interrupted."""
+    """Flush this client's input session if an enclosed operation is interrupted.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, controller: "InputController", flush: bool, release: bool):
         self._controller = controller
@@ -373,7 +377,7 @@ class InputInterruptionScope:
         if exc_type is None:
             return
         if self.flush:
-            _cleanup_without_masking(lambda: self._controller.flush(release=self.release))
+            _cleanup_without_masking(lambda: self._controller.flush(release=self.release), exc)
 
 
 class InputController:
@@ -491,7 +495,10 @@ class InputController:
 
 
 class PointerSession:
-    """Leased low-level pointer that guarantees up/cancel cleanup in a context manager."""
+    """Leased low-level pointer with up/cancel cleanup in a context manager.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, bridge: "Client", receipt: InputReceipt, lease: float):
         self._bridge = bridge
@@ -510,7 +517,7 @@ class PointerSession:
         if self.closed:
             return
         if exc_type is not None:
-            _cleanup_without_masking(self.cancel)
+            _cleanup_without_masking(self.cancel, exc)
             return
         self.up()
 
@@ -813,12 +820,21 @@ class Client:
         if self._closed:
             raise AutomationBridgeError("engine client is closed; reconnect to continue")
 
+    def _flush_owned_input(self) -> None:
+        """Request cleanup only when native receipts belong to this session."""
+        # Flushing acquires a controller lease, even when the queue is empty.
+        # An idle observer must not take control merely because it is closing.
+        if any(receipt.get("client_id") == self.client_id and receipt.get("session_id") == self.session_id
+               for receipt in self.input.pending()):
+            self.input.flush(release=True)
+
     @contextmanager
     def cancellation_scope(self, token: CancellationToken):
         """Cancel waits and request release of this session's input on cancellation.
 
         One token belongs to one operation. Use separate clients/identities for
         independent operations; cleanup only targets this client's native lease.
+        Idle observers do not acquire control during cancellation cleanup.
         A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
         """
         entered = False
@@ -829,7 +845,7 @@ class Client:
         except OperationCancelled as exc:
             if entered:
                 try:
-                    self.input.flush(release=True)
+                    self._flush_owned_input()
                 except Exception as cleanup_error:
                     if exc.cleanup_error is None:
                         exc.cleanup_error = cleanup_error

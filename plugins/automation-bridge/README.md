@@ -187,7 +187,10 @@ execution within existing authorization; it does not impose a fresh user prompt.
 Enter/exit, next, release, and declarative wait tools adapt Python contexts,
 iterators, and predicates. Callback and exception-class parameters have explicit
 restrictions. Python cancellation scopes are managed per MCP request and cannot
-be retained across worker threads. Password preference values are never returned.
+be retained across worker threads. Reads of password preferences and groups
+containing them are rejected before contacting the editor; read non-secret leaf
+preferences separately. Bare handle strings are resolved in handle arguments,
+while ordinary application strings remain literal.
 
 `defold_find_elements` returns `elements`, match counts, `next_cursor`, and
 frame/scene evidence. Preserve the complete Element wire values when passing
@@ -231,7 +234,10 @@ MCP cancellation stops cooperative polling and requests native input/command
 cleanup. It cannot forcibly interrupt an HTTP request or a running Lua callback.
 Cancelled requests emit no response. Inspect bounded cleanup diagnostics through
 `automation_bridge_session(action="info")`; shutdown also reports them to stderr.
-A cleanup failure is preserved rather than silently reported as success.
+A cleanup failure is preserved rather than silently reported as success. Failed
+pointer and input-scope exits retain their handles for inspection or retry and
+appear in the session's cleanup diagnostics. Cancelling an idle observer does not
+acquire a native input controller lease.
 
 ### Python scripts
 

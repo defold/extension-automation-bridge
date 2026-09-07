@@ -327,7 +327,8 @@ class EngineClientUnitTest(unittest.TestCase):
     def test_client_scope_releases_its_input_when_scene_wait_is_cancelled(self):
         bridge = FakeInputClient()
         token = engine.CancellationToken()
-        with self.assertRaises(engine.OperationCancelled):
+        pending = [{'input_id': 42, 'client_id': bridge.client_id, 'session_id': bridge.session_id}]
+        with mock.patch.object(bridge.input, 'pending', return_value=pending), self.assertRaises(engine.OperationCancelled):
             with bridge.cancellation_scope(token):
                 bridge.key("SPACE", hold=1, wait=False)
                 wait_until(lambda: token.cancel())

@@ -478,10 +478,19 @@ def serialize(
     return _wire_handle(value, registry)
 
 
-def deserialize(value: Any, registry: HandleRegistry) -> Any:
-    """Resolve handles and lossless special wire values recursively."""
+def deserialize(value: Any, registry: HandleRegistry, schema: Optional[Mapping[str, Any]] = None) -> Any:
+    """Resolve wire values, interpreting bare handle strings only where declared."""
+    schema = schema if isinstance(schema, Mapping) else {}
+    if isinstance(value, str) and schema.get("anyOf") == mcp_schema.HANDLE["anyOf"]:
+        return registry.get(value)
+    for candidate in schema.get("anyOf", ()):
+        try:
+            mcp_schema.validate(value, candidate)
+        except ValueError:
+            continue
+        return deserialize(value, registry, candidate)
     if isinstance(value, list):
-        return [deserialize(item, registry) for item in value]
+        return [deserialize(item, registry, schema.get("items")) for item in value]
     if not isinstance(value, dict):
         return value
     marker = value.get("$automation_bridge")
@@ -502,7 +511,7 @@ def deserialize(value: Any, registry: HandleRegistry) -> Any:
         except Exception as error:
             raise ToolFailure("invalid_bytes", "invalid base64 byte envelope") from error
     return {
-        key: deserialize(item, registry)
+        key: deserialize(item, registry, schema.get("properties", {}).get(key, schema.get("additionalProperties")))
         for key, item in value.items()
     }
 
@@ -663,7 +672,7 @@ _ADAPTATIONS: Dict[str, Dict[str, Any]] = {
     },
     "automation_bridge.editor.Preferences.get": {
         "availability": "restricted",
-        "reason": "Password preference values are never returned over MCP; all non-secret preferences remain readable.",
+        "reason": "Password preferences and groups containing them cannot be read over MCP. Read non-secret leaf preferences separately.",
     },
     "automation_bridge.engine.Client.require": {
         "availability": "adapted", "adapter": "capabilities_array_to_varargs"
@@ -1266,14 +1275,15 @@ class BridgeRuntime:
                 spec.reason or "the parameter cannot be represented over MCP",
                 {"operation": spec.qualified_name, "parameters": prohibited},
             )
+        arguments_schema = spec.arguments_schema()
         try:
-            mcp_schema.validate(dict(arguments), spec.arguments_schema(), "$.arguments")
+            mcp_schema.validate(dict(arguments), arguments_schema, "$.arguments")
         except ValueError as error:
             raise ToolFailure("invalid_arguments", str(error)) from error
         if spec.adapter == "declarative_operation_predicate":
             # The nested operation validates and resolves its own wire values.
             return self._wait_declarative(arguments)
-        kwargs = deserialize(dict(arguments), self.handles)
+        kwargs = deserialize(dict(arguments), self.handles, arguments_schema)
         if spec.qualified_name in {
             "automation_bridge.engine.connect", "automation_bridge.editor.Client.connect_engine",
             "automation_bridge.editor.Client.build_and_run", "automation_bridge.editor.Client.clean_build_and_run",
@@ -1282,10 +1292,21 @@ class BridgeRuntime:
         if spec.qualified_name == "automation_bridge.editor.Preferences.get":
             preference = kwargs.get("preference")
             path = getattr(preference, "path", preference)
-            if isinstance(path, str) and "password" in path.casefold():
+            # Group reads contain their descendants' values. Reject secret
+            # groups before any editor I/O, using the wrapper's metadata.
+            from automation_bridge.preferences import BUILTIN_PREFERENCES
+
+            normalized = "/".join(part for part in path.split("/") if part) if isinstance(path, str) else None
+            if normalized is not None and (
+                "password" in normalized.casefold()
+                or getattr(preference, "type", None) == "password"
+                or any(item.type == "password" and (
+                    not normalized or item.path == normalized or item.path.startswith(normalized + "/")
+                ) for item in BUILTIN_PREFERENCES)
+            ):
                 raise ToolFailure(
                     "sensitive_preference",
-                    "password preference values are not returned over MCP",
+                    "password preferences and groups containing them are not returned over MCP; read non-secret leaf preferences separately",
                     {"path": path},
                 )
         if spec.kind == "function":
@@ -1434,8 +1455,12 @@ class BridgeRuntime:
         if error_text is None:
             suppressed = exit_method(None, None, None)
         else:
-            error = RuntimeError(error_text)
-            suppressed = exit_method(RuntimeError, error, None)
+            # Python context exits preserve the original exception. Use their
+            # cancellation evidence to surface a refused cleanup over MCP.
+            error = engine.OperationCancelled(error_text)
+            suppressed = exit_method(type(error), error, None)
+            if error.cleanup_error is not None:
+                raise error.cleanup_error
         with self._lock:
             self._entered.discard(token)
         return bool(suppressed)
@@ -1447,7 +1472,13 @@ class BridgeRuntime:
             raise ToolFailure("invalid_error", "error must be a string")
         target = self._resolve_target(arguments["target"])
         token = self.handles.token_for(target) or self.handles.put(target)
-        suppressed = self._exit_context(token, target, error_text)
+        try:
+            suppressed = self._exit_context(token, target, error_text)
+        except Exception as error:
+            context = _request_context.get()
+            self._record_cleanup_error(context.request_id if context else None, error)
+            raise ToolFailure("cleanup_failed", "context cleanup failed; the handle is retained for inspection or retry",
+                              {"handle": token, "cause": _exception_failure(error).as_dict()}) from error
         return {"exited": True, "suppressed": suppressed}
 
     def _tool_next(self, arguments: Mapping[str, Any]) -> Any:
@@ -2010,7 +2041,7 @@ class BridgeRuntime:
             if child is not game:
                 self._cleanup_value(child_token, child, failure=False)
                 self.handles.release(child_token)
-        self._flush_owned_input(game)
+        game._flush_owned_input()
         try:
             game.close_engine(timeout=arguments.get("timeout", 2.0))
         finally:
@@ -2278,14 +2309,6 @@ class BridgeRuntime:
             text = path.read_text(encoding="utf-8") if path.is_file() else "Plugin guide is unavailable in this source layout."
         return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
 
-    @staticmethod
-    def _flush_owned_input(game: engine.Client) -> None:
-        # A flush itself acquires a native controller lease. Read receipts first
-        # so closing an idle observer does not take input ownership from workers.
-        if any(receipt.get("client_id") == game.client_id and receipt.get("session_id") == game.session_id
-               for receipt in game.input.pending()):
-            game.input.flush(release=True)
-
     def _cleanup_value(self, token: str, value: Any, *, failure: bool) -> None:
         try:
             with self._lock:
@@ -2309,7 +2332,7 @@ class BridgeRuntime:
                 value.close()
             elif isinstance(value, engine.Client) and not value.closed:
                 try:
-                    self._flush_owned_input(value)
+                    value._flush_owned_input()
                 finally:
                     value.close()
         except Exception as error:
@@ -2317,6 +2340,8 @@ class BridgeRuntime:
             self._record_cleanup_error(context.request_id if context else None, error, self.handles._owners.get(token))
             if not failure:
                 raise ToolFailure("cleanup_failed", "resource cleanup failed; inspect cleanup_errors before retrying", {"handle": token, "cause": _exception_failure(error).as_dict()}) from error
+            with self._lock:
+                self._entered.discard(token)
 
     def cleanup(self) -> None:
         with self._lock:

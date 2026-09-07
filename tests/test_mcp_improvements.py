@@ -1,5 +1,6 @@
 """Regression contracts for the current shared API exposed through MCP."""
 import base64
+import dataclasses
 import io
 import json
 import tempfile
@@ -192,6 +193,86 @@ class GenericArgumentValidationTest(unittest.TestCase):
         self.assertEqual(element.raw, parent.call_args.kwargs['element_or_id'].raw)
         self.assertEqual(element_wire, result['data'])
 
+    def test_nested_event_handle_accepts_tokens_and_envelopes(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, self.runtime.handles)
+        with mock.patch.object(game, 'request', return_value={'cursor': 0, 'oldest_cursor': 0}):
+            created = self.runtime.call_tool('automation_bridge_call', {
+                'operation': 'automation_bridge.engine.Client.events', 'target': wire,
+            })
+        self.assertTrue(created['ok'], created)
+        stream_wire = created['data']
+        stream = self.runtime.handles.get(stream_wire['$handle'])
+        for value in (stream_wire, stream_wire['$handle']):
+            with self.subTest(value=value), mock.patch.object(stream, 'wait', return_value={'acknowledged': True}) as wait:
+                result = self.runtime.call_tool('automation_bridge_call', {
+                    'operation': 'automation_bridge.engine.Client.wait_for_input_acknowledgement',
+                    'target': wire, 'arguments': {'input_id': 7, 'events': value},
+                })
+                self.assertEqual({'ok': True, 'data': {'acknowledged': True}}, result)
+                wait.assert_called_once_with('input.acknowledged', where={'input_id': 7},
+                                             event_type='acknowledgement', timeout=10.0)
+        self.runtime.call_tool('automation_bridge_release', {'target': stream_wire})
+        result = self.runtime.call_tool('automation_bridge_call', {
+            'operation': 'automation_bridge.engine.Client.wait_for_input_acknowledgement',
+            'target': wire, 'arguments': {'input_id': 7, 'events': stream_wire['$handle']},
+        })
+        self.assertEqual('unknown_handle', result['error']['code'])
+
+    def test_application_strings_matching_handles_remain_literal(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, self.runtime.handles)
+        token = wire['$handle']
+        payload = {'text': token, 'nested': [token]}
+        with mock.patch.object(game, 'command', return_value=payload) as command:
+            result = self.runtime.call_tool('automation_bridge_call', {
+                'operation': 'automation_bridge.engine.Client.command', 'target': wire,
+                'arguments': {'name': token, 'data': payload},
+            })
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(payload, result['data'])
+        command.assert_called_once_with(name=token, data=payload)
+
+
+class PreferenceReadSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = BridgeRuntime(ROOT)
+        self.addCleanup(self.runtime.cleanup)
+        self.preferences = editor.Client(ROOT, port=51336).preferences
+        self.wire = serialize(self.preferences, self.runtime.handles)
+
+    def read(self, path):
+        return self.runtime.call_tool('automation_bridge_call', {
+            'operation': 'automation_bridge.editor.Preferences.get',
+            'target': self.wire, 'arguments': {'preference': path},
+        })
+
+    def test_password_groups_are_rejected_before_reading_values(self):
+        for path in ('extensions', '/extensions/', 'extensions/build-server-password'):
+            with self.subTest(path=path), mock.patch.object(self.preferences, 'get') as read:
+                result = self.read(path)
+                self.assertEqual('sensitive_preference', result['error']['code'])
+                read.assert_not_called()
+
+    def test_password_type_metadata_covers_nested_groups(self):
+        secret = dataclasses.replace(self.preferences.EXTENSIONS_BUILD_SERVER_PASSWORD,
+                                     path='custom/nested/credential')
+        with mock.patch('automation_bridge.preferences.BUILTIN_PREFERENCES', (secret,)):
+            for path in ('custom', '/custom//nested/', 'custom/nested/credential'):
+                with self.subTest(path=path), mock.patch.object(self.preferences, 'get') as read:
+                    result = self.read(path)
+                    self.assertEqual('sensitive_preference', result['error']['code'])
+                    read.assert_not_called()
+
+    def test_nonsecret_leaves_and_groups_remain_readable(self):
+        for path in ('extensions/build-server', 'code/font', 'custom/window'):
+            with self.subTest(path=path), mock.patch.object(self.preferences, 'get', return_value={'value': 12}) as read:
+                result = self.read(path)
+                self.assertEqual({'ok': True, 'data': {'value': 12}}, result)
+                read.assert_called_once_with(preference=path)
+
 
 class ConnectionCleanupTest(unittest.TestCase):
     def test_failed_readiness_closes_unretained_clients_without_native_mutations(self):
@@ -322,7 +403,9 @@ class CancellationTest(unittest.TestCase):
         def health():
             observed.set()
             return {'ready': False}
-        with mock.patch.object(game, 'health', side_effect=health) as query, mock.patch.object(game.input, 'flush', return_value={}) as flush:
+        with mock.patch.object(game, 'health', side_effect=health) as query, \
+             mock.patch.object(game.input, 'pending', return_value=[{'client_id': game.client_id, 'session_id': game.session_id}]), \
+             mock.patch.object(game.input, 'flush', return_value={}) as flush:
             worker = threading.Thread(target=lambda: responses.append(runtime.call_tool_request('wait', 'automation_bridge_wait', {
                 'operation': 'automation_bridge.engine.Client.health', 'target': wire,
                 'path': 'ready', 'interval': 60, 'timeout': 120,
@@ -356,7 +439,9 @@ class CancellationTest(unittest.TestCase):
         def health():
             runtime.cancel('cancel')
             return {'ready': False}
-        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native refused cleanup')):
+        with mock.patch.object(game, 'health', side_effect=health), \
+             mock.patch.object(game.input, 'pending', return_value=[{'client_id': game.client_id, 'session_id': game.session_id}]), \
+             mock.patch.object(game.input, 'flush', side_effect=RuntimeError('native refused cleanup')):
             response = runtime.call_tool_request('cancel', 'defold_health', {'engine': wire})
         self.assertIn('native refused cleanup', response['error']['data']['cleanup_error']['message'])
         self.assertEqual('cancel', runtime.cleanup_errors[-1]['request_id'])
@@ -397,7 +482,9 @@ class CancellationTest(unittest.TestCase):
         def health():
             started.set()
             return False
-        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', return_value={}) as flush:
+        with mock.patch.object(game, 'health', side_effect=health), \
+             mock.patch.object(game.input, 'pending', return_value=[{'client_id': game.client_id, 'session_id': game.session_id}]), \
+             mock.patch.object(game.input, 'flush', return_value={}) as flush:
             server._accept({'jsonrpc': '2.0', 'id': 'cancel-me', 'method': 'tools/call', 'params': {
                 'name': 'automation_bridge_wait', 'arguments': {
                     'operation': 'automation_bridge.engine.Client.health', 'target': wire, 'interval': 60, 'timeout': 120}}})
@@ -733,3 +820,74 @@ class IdleObserverCleanupTest(unittest.TestCase):
             self.assertTrue(result['ok'], result)
             flush.assert_not_called()
         runtime.cleanup()
+
+    def test_cancelling_observations_does_not_acquire_input_control(self):
+        runtime = BridgeRuntime(ROOT)
+        self.addCleanup(runtime.cleanup)
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, runtime.handles)
+
+        def observe():
+            runtime.cancel('observer')
+            return {'ready': False}
+
+        for receipts in ([], [{'client_id': 'other', 'session_id': game.session_id}],
+                         [{'client_id': game.client_id, 'session_id': 'other'}]):
+            with self.subTest(receipts=receipts), mock.patch.object(game, 'health', side_effect=observe), \
+                 mock.patch.object(game.input, 'pending', return_value=receipts), \
+                 mock.patch.object(game.input, 'flush') as flush:
+                result = runtime.call_tool_request('observer', 'defold_health', {'engine': wire})
+                self.assertEqual('operation_cancelled', result['error']['code'])
+                self.assertNotIn('cleanup_error', result['error'].get('data', {}))
+                flush.assert_not_called()
+
+
+class ContextCleanupEvidenceTest(unittest.TestCase):
+    def test_exceptional_pointer_exit_reports_refusal_and_can_be_retried(self):
+        runtime = BridgeRuntime(ROOT)
+        self.addCleanup(runtime.cleanup)
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        pointer = engine.PointerSession(game, engine.InputReceipt({'input_id': 7, 'state': 'started'}), lease=5)
+        wire = serialize(pointer, runtime.handles)
+        self.assertTrue(runtime.call_tool('automation_bridge_enter', {'target': wire})['ok'])
+        with mock.patch.object(game.input, 'cancel', side_effect=RuntimeError('native cleanup refused')):
+            result = runtime.call_tool('automation_bridge_exit', {'target': wire, 'error': 'interrupted'})
+        self.assertEqual('cleanup_failed', result['error']['code'])
+        self.assertFalse(pointer.closed)
+        self.assertIs(pointer, runtime.handles.get(wire['$handle']))
+        info = runtime.call_tool('automation_bridge_session', {})['data']
+        self.assertIn('native cleanup refused', info['cleanup_errors'][-1]['error']['message'])
+        with mock.patch.object(game.input, 'cancel', return_value=engine.InputReceipt({'input_id': 7, 'state': 'cancelled'})) as cancel:
+            result = runtime.call_tool('automation_bridge_exit', {'target': wire, 'error': 'interrupted'})
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(pointer.closed)
+        cancel.assert_called_once_with(7, release=True)
+
+    def test_session_close_retains_entered_pointer_cleanup_errors(self):
+        runtime = BridgeRuntime(ROOT)
+        self.addCleanup(runtime.cleanup)
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        pointer = engine.PointerSession(game, engine.InputReceipt({'input_id': 7, 'state': 'started'}), lease=5)
+        wire = serialize(pointer, runtime.handles)
+        self.assertTrue(runtime.call_tool('automation_bridge_enter', {'target': wire})['ok'])
+        with mock.patch.object(game.input, 'cancel', side_effect=RuntimeError('native cleanup refused')):
+            result = runtime.call_tool('automation_bridge_session', {'action': 'close'})
+        self.assertTrue(result['ok'], result)
+        self.assertTrue(result['data']['closed'])
+        self.assertEqual(0, result['data']['handles'])
+        self.assertIn('native cleanup refused', result['data']['cleanup_errors'][-1]['error']['message'])
+
+    def test_interruption_scope_keeps_cleanup_failure_on_original_cancellation(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        original = engine.OperationCancelled('interrupted')
+        refusal = RuntimeError('native cleanup refused')
+        with mock.patch.object(game.input, 'flush', side_effect=refusal):
+            with self.assertRaises(engine.OperationCancelled) as caught:
+                with game.input.interruption_scope():
+                    raise original
+        self.assertIs(original, caught.exception)
+        self.assertIs(refusal, caught.exception.cleanup_error)
