@@ -25,4 +25,5 @@ jobs:
           python -m unittest
           tests.test_automation_bridge_api.EngineClientUnitTest
           tests.test_automation_bridge_api.EditorDiscoveryUnitTest
+          tests.test_automation_bridge_api.EditorCompatibilityUnitTest
           tests.test_tooling
