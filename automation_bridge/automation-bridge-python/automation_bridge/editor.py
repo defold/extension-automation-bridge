@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -23,7 +24,7 @@ from typing import Any, Iterator, Mapping, Optional, Sequence, TYPE_CHECKING, Un
 
 from .client import AutomationBridgeError, HttpError, request_json, request_raw
 from .preferences import PreferenceKey, Preferences
-from .waits import wait_until
+from .waits import WaitTimeoutError, wait_until
 
 if TYPE_CHECKING:
     from .client import Client as EngineClient
@@ -33,6 +34,7 @@ _AUTOMATION_BRIDGE_ENDPOINT_TEXT = "Automation Bridge endpoint registered"
 _AUTOMATION_BRIDGE_REPOSITORY = "https://github.com/defold/extension-automation-bridge"
 _AUTOMATION_BRIDGE_LATEST_RELEASE_API = "https://api.github.com/repos/defold/extension-automation-bridge/releases/latest"
 _AUTOMATION_BRIDGE_PYTHON_DIRECTORY = "automation-bridge-python"
+_EDITOR_ABSENCE_GRACE_PERIOD = 5.0
 _DEPENDENCY_LINE_PATTERN = re.compile(r"^(\s*dependencies#(\d+)\s*=\s*)(.*?)([ \t]*(?:\r\n|\n|\r)?)$")
 _SECTION_PATTERN = re.compile(r"^\s*\[([^]]+)\]\s*(?:\r\n|\n|\r)?$")
 _ENGINE_SERVICE_PORT_PATTERNS = (
@@ -602,10 +604,7 @@ class Client:
     def __init__(self, root: Union[str, Path], port: Optional[int] = None):
         self.root = Path(root).resolve()
         if port is None:
-            port_path = self.root / ".internal" / "editor.port"
-            if not port_path.exists():
-                raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
-            port = int(port_path.read_text(encoding="utf-8").strip())
+            port = self._read_editor_port(self.root)
         self.port = int(port)
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._engine_service_port: Optional[int] = self._read_cached_engine_service_port()
@@ -620,6 +619,13 @@ class Client:
         self.reference = Reference(self)
         self.preview = Preview(self)
         self.preferences = Preferences(self)
+
+    @staticmethod
+    def _read_editor_port(project_root: Path) -> int:
+        port_path = project_root / ".internal" / "editor.port"
+        if not port_path.exists():
+            raise FileNotFoundError(f"Defold editor port file is missing: {port_path}")
+        return int(port_path.read_text(encoding="utf-8").strip())
 
     def update_automation_bridge(
         self,
@@ -722,16 +728,22 @@ class Client:
         launcher: Optional[Union[str, Path]] = None,
     ) -> "Client":
         """Connect to this project's editor, launching Defold when necessary."""
+        timeout = float(timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and greater than zero")
         project_root = Path(root).resolve()
         try:
-            client = cls(project_root)
-        except (FileNotFoundError, ValueError):
-            client = None
-        if client is not None and client._is_running(timeout=min(1.0, timeout)):
+            client = cls._wait_for_editor(
+                project_root,
+                timeout=timeout,
+                allow_absent=start_if_needed,
+                message=f"Could not connect to Defold editor for {project_root}",
+            )
+        except WaitTimeoutError as exc:
+            raise NotRunningError(str(exc)) from exc
+        if client is not None:
             client._record_lifecycle("editor_reused", port=client.port)
             return client
-        if not start_if_needed:
-            raise NotRunningError(f"Defold editor is not running for {project_root}")
 
         project_file = project_root / "game.project"
         if not project_file.is_file():
@@ -757,20 +769,12 @@ class Client:
         except OSError as exc:
             raise LaunchError(f"cannot launch Defold from {launcher_path}: {exc}") from exc
 
-        def ready() -> Optional["Client"]:
-            try:
-                candidate = cls(project_root)
-                return candidate if candidate._is_running(timeout=min(1.0, timeout)) else None
-            except (AutomationBridgeError, FileNotFoundError, OSError, ValueError):
-                return None
-
-        client = wait_until(
-            ready,
+        client = cls._wait_for_editor(
+            project_root,
             timeout=timeout,
-            interval=0.1,
             message=f"Defold editor did not start for {project_root}",
-            retry_exceptions=(AutomationBridgeError,),
         )
+        assert client is not None
         client._record_lifecycle(
             "editor_started",
             launcher=str(launcher_path),
@@ -778,6 +782,72 @@ class Client:
             port=client.port,
         )
         return client
+
+    @classmethod
+    def _wait_for_editor(
+        cls,
+        project_root: Path,
+        *,
+        timeout: float,
+        message: str,
+        allow_absent: bool = False,
+    ) -> Optional["Client"]:
+        """Wait for discovery; return None after consistent evidence of absence."""
+        started = time.monotonic()
+        deadline = started + timeout
+        absence_deadline = started + min(_EDITOR_ABSENCE_GRACE_PERIOD, timeout)
+        absent = object()
+        last_refused_port = None
+        unresolved_error = None
+
+        def ready():
+            nonlocal last_refused_port, unresolved_error
+            port = None
+            try:
+                # The editor can publish or replace its port while we wait.
+                port = cls._read_editor_port(project_root)
+                candidate = cls(project_root, port=port)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if allow_absent and unresolved_error is None and port == last_refused_port:
+                        return absent
+                    return None
+                candidate._check_connection(timeout=remaining)
+                return candidate
+            except (FileNotFoundError, ValueError) as exc:
+                failure = exc
+                if port is not None:
+                    unresolved_error = exc
+            except HttpError as exc:
+                failure = exc
+                cause = exc.__cause__
+                if isinstance(cause, urllib.error.URLError):
+                    cause = cause.reason
+                # Only a refused connection establishes that nobody is listening.
+                # A timeout, denied connection, or HTTP error may be a live editor.
+                if isinstance(cause, ConnectionRefusedError):
+                    last_refused_port = port
+                else:
+                    unresolved_error = exc
+            except OSError as exc:
+                failure = exc
+                unresolved_error = exc
+            # Keep the failure that prevents a launch, even if later probes only
+            # observe a missing file or a refused connection.
+            if unresolved_error is not None:
+                raise unresolved_error
+            if allow_absent and time.monotonic() >= absence_deadline:
+                return absent
+            raise failure
+
+        result = wait_until(
+            ready,
+            timeout=timeout,
+            interval=0.1,
+            message=message,
+            retry_exceptions=(HttpError, OSError, ValueError),
+        )
+        return None if result is absent else result
 
     @classmethod
     def _installations(cls) -> list[Installation]:
@@ -838,19 +908,22 @@ class Client:
     def _is_running(self, timeout: float = 1.0) -> bool:
         """Return whether this project's recorded editor port serves the editor API."""
         try:
-            status, document = request_json(f"{self.base_url}/openapi.json", timeout=timeout)
-            if 200 <= status < 300:
-                self._openapi_document = document
-            return 200 <= status < 300
+            self._check_connection(timeout=timeout)
+            return True
         except AutomationBridgeError:
             return False
 
+    def _check_connection(self, *, timeout: float) -> None:
+        """Fetch the editor API, preserving the cause of failed discovery."""
+        url = f"{self.base_url}/openapi.json"
+        status, document = request_json(url, timeout=timeout)
+        if status < 200 or status >= 300:
+            raise HttpError("GET", url, f"HTTP {status}: {document}", status=status)
+        self._openapi_document = document
+
     def _openapi(self) -> dict:
         if self._openapi_document is None:
-            status, document = request_json(f"{self.base_url}/openapi.json", timeout=10.0)
-            if status < 200 or status >= 300:
-                raise HttpError("GET", f"{self.base_url}/openapi.json", str(document), status=status)
-            self._openapi_document = document
+            self._check_connection(timeout=10.0)
         return self._openapi_document
 
     def _require_operation(self, path: str, method: str) -> Mapping[str, Any]:
@@ -1298,7 +1371,7 @@ class Client:
 
 
 def is_running(root: Union[str, Path] = ".", *, timeout: float = 1.0) -> bool:
-    """Return whether the project's recorded editor endpoint is healthy."""
+    """Check the recorded editor endpoint once; use open_project for retries."""
     try:
         return Client(root)._is_running(timeout=timeout)
     except (AutomationBridgeError, FileNotFoundError, OSError, ValueError):
@@ -1312,7 +1385,19 @@ def open_project(
     timeout: float = 30.0,
     launcher: Optional[Union[str, Path]] = None,
 ) -> Client:
-    """Open or reuse a Defold editor for one project."""
+    """Open or reuse a Defold editor for one project.
+
+    Discovery retries for up to ``timeout`` seconds, rereading the port file
+    between attempts. Each HTTP request can use the remaining discovery time.
+    ``timeout`` must be finite and greater than zero.
+
+    With ``start_if_needed=True``, a missing/invalid port file or refused
+    connection gets up to five seconds (bounded by ``timeout``) to recover
+    before launching Defold. Startup then has its own ``timeout`` budget.
+    Other connection failures are retried for the full discovery timeout and
+    raise ``NotRunningError`` with diagnostics instead of launching a duplicate.
+    ``start_if_needed=False`` always waits for discovery without launching.
+    """
     return Client._open_project(
         root,
         start_if_needed=start_if_needed,

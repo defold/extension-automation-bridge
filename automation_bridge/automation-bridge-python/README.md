@@ -136,6 +136,19 @@ The editor bootstrap discovers `.internal/editor.port`, launches Defold when
 needed, rejects stale engine ports, and waits for Automation Bridge health.
 Pass `start_if_needed=False` to require an already-running editor.
 
+Editor discovery retries for up to `timeout` seconds (30 by default), rereading
+the port file between attempts. HTTP requests use the remaining discovery time,
+so a slow response can still reuse the editor. With automatic startup enabled,
+a missing/invalid port file or refused connection gets a five-second grace
+period (bounded by `timeout`) before launch; a newly launched editor then has its
+own `timeout` budget. Timeouts, permission failures, and HTTP/JSON errors raise
+`NotRunningError` with the underlying failure if discovery cannot recover.
+These failures do not trigger another editor launch.
+
+Use `editor.is_running(".", timeout=1)` for a single Boolean probe. A `False`
+result means the endpoint did not respond successfully; `open_project()` handles
+the retries and startup decision.
+
 ## Reliable game test loop
 
 Resize before coordinate-based input or visual assertions, then synchronize on
@@ -223,8 +236,10 @@ from automation_bridge import editor
 project = editor.open_project(".", start_if_needed=False)
 ```
 
-If this raises `NotRunningError`, the required launch procedure differs by
-platform:
+If this raises `NotRunningError`, inspect the included discovery failure first.
+A timeout or denied connection can mean the editor is already running but could
+not be reached. If the editor needs to be started, the launch procedure differs
+by platform:
 
 - **macOS:** Rerun the normal bootstrap with escalated/unsandboxed execution.
   Defold inherits the Python parent's sandbox and otherwise cannot register with

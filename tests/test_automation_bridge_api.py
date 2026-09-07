@@ -1231,7 +1231,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
             with mock.patch("automation_bridge.editor.sys.platform", "linux"):
                 with mock.patch("automation_bridge.editor.subprocess.Popen", side_effect=launch) as popen:
-                    with mock.patch.object(EditorApiClient, "_is_running", return_value=True):
+                    with mock.patch.object(EditorApiClient, "_check_connection", return_value=None):
                         editor_client = editor.open_project(root, launcher=launcher, timeout=0.2)
 
         self.assertEqual(54321, editor_client.port)
@@ -2518,6 +2518,258 @@ class EngineClientUnitTest(unittest.TestCase):
             )
 
 
+class EditorDiscoveryUnitTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        (self.root / ".internal").mkdir()
+        self.port_file = self.root / ".internal" / "editor.port"
+        self.port_file.write_text("12345", encoding="utf-8")
+        (self.root / "game.project").write_text("[project]\ntitle = Test\n", encoding="utf-8")
+        self.launcher = self.root / "Defold"
+        self.launcher.touch()
+        self.now = 0.0
+        self._patch("automation_bridge.editor.time.monotonic", side_effect=lambda: self.now)
+        self.sleep = self._patch("automation_bridge.editor.time.sleep", side_effect=self._advance)
+        self._patch("automation_bridge.editor._macos_gui_launch_is_sandboxed", return_value=False)
+        self.popen = self._patch(
+            "automation_bridge.editor.subprocess.Popen",
+            side_effect=AssertionError("unexpected editor launch"),
+        )
+        self.response = mock.MagicMock()
+        self.response.__enter__.return_value = self.response
+        self.response.getcode.return_value = 200
+        self.response.read.return_value = b'{"openapi":"3.0.3"}'
+        self.urlopen = self._patch(
+            "automation_bridge.client.urllib.request.urlopen",
+            return_value=self.response,
+        )
+
+    def _patch(self, target, **kwargs):
+        patcher = mock.patch(target, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def _advance(self, seconds):
+        self.now += seconds
+
+    def _slow_response(self, request, *, timeout):
+        delay = 1.2
+        self._advance(min(delay, timeout))
+        if timeout < delay:
+            raise TimeoutError("timed out")
+        return self.response
+
+    def _launch(self, *args, **kwargs):
+        self.port_file.write_text("54321", encoding="utf-8")
+        self.urlopen.side_effect = None
+        return mock.Mock(pid=4321)
+
+    def test_slow_editor_is_reused_with_supplied_timeout(self):
+        self.urlopen.side_effect = self._slow_response
+
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(12345, project.port)
+        self.assertEqual("editor_reused", project.lifecycle_events[-1]["stage"])
+        self.assertAlmostEqual(1.2, self.now)
+        self.popen.assert_not_called()
+
+    def test_transient_failures_recover_on_third_attempt_without_launching(self):
+        self.urlopen.side_effect = [
+            urllib.error.URLError(ConnectionRefusedError("not listening yet")),
+            ConnectionResetError("connection reset"),
+            self.response,
+        ]
+
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(12345, project.port)
+        self.assertEqual(3, self.urlopen.call_count)
+        self.popen.assert_not_called()
+
+    def test_missing_or_partial_port_file_can_appear_during_discovery(self):
+        for initial in (None, "", "writing"):
+            for start_if_needed in (False, True):
+                with self.subTest(initial=initial, start_if_needed=start_if_needed):
+                    self.now = 0.0
+                    if initial is None:
+                        self.port_file.unlink()
+                    else:
+                        self.port_file.write_text(initial, encoding="utf-8")
+
+                    def publish_port(seconds):
+                        self._advance(seconds)
+                        if self.now >= 4.0:
+                            self.port_file.write_text("54321", encoding="utf-8")
+
+                    self.sleep.side_effect = publish_port
+                    project = editor.open_project(
+                        self.root,
+                        start_if_needed=start_if_needed,
+                        timeout=5,
+                        launcher=self.launcher,
+                    )
+
+                    self.assertEqual(54321, project.port)
+                    self.assertEqual("editor_reused", project.lifecycle_events[-1]["stage"])
+                    self.popen.assert_not_called()
+
+    def test_port_is_reread_after_a_failed_request(self):
+        def replace_port(request, *, timeout):
+            self.port_file.write_text("54321", encoding="utf-8")
+            self.urlopen.side_effect = None
+            raise urllib.error.URLError(ConnectionRefusedError("old port closed"))
+
+        self.urlopen.side_effect = replace_port
+        project = editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        urls = [call.args[0].full_url for call in self.urlopen.call_args_list]
+        self.assertEqual([
+            "http://127.0.0.1:12345/openapi.json",
+            "http://127.0.0.1:54321/openapi.json",
+        ], urls)
+        self.popen.assert_not_called()
+
+    def test_timeout_preserves_cause_and_does_not_launch(self):
+        failure = TimeoutError("editor response timed out")
+
+        def never_respond(request, *, timeout):
+            self._advance(timeout)
+            raise failure
+
+        self.urlopen.side_effect = never_respond
+        with self.assertRaisesRegex(editor.NotRunningError, "editor response timed out") as raised:
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertAlmostEqual(5, self.now)
+        self.assertIn("http://127.0.0.1:12345/openapi.json", str(raised.exception))
+        wait_error = raised.exception.__cause__
+        self.assertIs(failure, wait_error.last_exception.__cause__)
+        self.popen.assert_not_called()
+
+    def test_denied_connection_never_launches_even_if_later_refused(self):
+        attempts = 0
+
+        def unavailable(request, *, timeout):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise urllib.error.URLError(PermissionError("connection denied"))
+            raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+
+        self.urlopen.side_effect = unavailable
+        with self.assertRaisesRegex(editor.NotRunningError, "connection denied"):
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.assertAlmostEqual(5, self.now)
+        self.popen.assert_not_called()
+
+    def test_http_and_json_errors_keep_diagnostics_without_launching(self):
+        for status, body, detail in (
+            (503, b'{"error":"busy"}', "HTTP 503"),
+            (403, b'{"error":"denied"}', "HTTP 403"),
+            (200, b"not JSON", "invalid JSON response"),
+        ):
+            with self.subTest(status=status, body=body):
+                self.now = 0.0
+                self.response.getcode.return_value = status
+                self.response.read.return_value = body
+                with self.assertRaisesRegex(editor.NotRunningError, detail):
+                    editor.open_project(self.root, timeout=5, launcher=self.launcher)
+                self.assertAlmostEqual(5, self.now)
+                self.popen.assert_not_called()
+
+    def test_unreadable_port_file_keeps_diagnostics_without_launching(self):
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("port file denied")):
+            with self.assertRaisesRegex(editor.NotRunningError, "port file denied"):
+                editor.open_project(self.root, timeout=5, launcher=self.launcher)
+
+        self.urlopen.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_invalid_engine_cache_is_not_mistaken_for_an_absent_editor(self):
+        cache = self.root / ".internal" / "automation_bridge.remotery.url"
+        cache.write_bytes(b"\xff")
+        with self.assertRaisesRegex(editor.NotRunningError, "utf-8"):
+            editor.open_project(self.root, timeout=5, launcher=self.launcher)
+        self.popen.assert_not_called()
+
+    def test_missing_editor_launches_once_after_grace_period(self):
+        self.port_file.unlink()
+        self.popen.side_effect = self._launch
+
+        project = editor.open_project(self.root, timeout=30, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.assertEqual("editor_started", project.lifecycle_events[-1]["stage"])
+        self.assertGreaterEqual(self.now, 5)
+        self.assertLess(self.now, 6)
+        self.popen.assert_called_once()
+
+    def test_refused_stale_port_can_launch_with_a_short_timeout(self):
+        self.urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError("stale port"))
+        self.popen.side_effect = self._launch
+
+        project = editor.open_project(self.root, timeout=0.2, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.popen.assert_called_once()
+
+    def test_no_start_waits_for_the_supplied_timeout_when_file_is_missing(self):
+        self.port_file.unlink()
+        with self.assertRaisesRegex(editor.NotRunningError, "editor.port"):
+            editor.open_project(self.root, start_if_needed=False, timeout=5)
+
+        self.assertAlmostEqual(5, self.now)
+        self.popen.assert_not_called()
+
+    def test_started_editor_uses_remaining_startup_timeout_for_slow_reply(self):
+        self.port_file.unlink()
+
+        def launch(*args, **kwargs):
+            process = self._launch(*args, **kwargs)
+            self.urlopen.side_effect = self._slow_response
+            return process
+
+        self.popen.side_effect = launch
+        project = editor.open_project(self.root, timeout=2, launcher=self.launcher)
+
+        self.assertEqual(54321, project.port)
+        self.assertAlmostEqual(3.2, self.now)
+        self.popen.assert_called_once()
+
+    def test_startup_failure_preserves_diagnostics_and_does_not_launch_again(self):
+        self.port_file.unlink()
+
+        def launch(*args, **kwargs):
+            process = self._launch(*args, **kwargs)
+            self.urlopen.side_effect = urllib.error.URLError(ConnectionRefusedError("not ready"))
+            return process
+
+        self.popen.side_effect = launch
+        with self.assertRaisesRegex(WaitTimeoutError, "not ready"):
+            editor.open_project(self.root, timeout=0.2, launcher=self.launcher)
+        self.popen.assert_called_once()
+
+    def test_invalid_timeout_fails_before_discovery_or_launch(self):
+        for timeout in (0, -1, float("inf"), float("nan")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "timeout must be finite and greater than zero"):
+                    editor.open_project(self.root, timeout=timeout, launcher=self.launcher)
+        self.urlopen.assert_not_called()
+        self.popen.assert_not_called()
+
+    def test_is_running_remains_a_single_boolean_probe(self):
+        self.urlopen.side_effect = TimeoutError("timed out")
+        self.assertFalse(editor.is_running(self.root, timeout=2))
+        self.assertEqual(1, self.urlopen.call_count)
+        self.popen.assert_not_called()
+
+
 class FakeEngineClient(EngineClient):
     def __init__(self, screen=None, capabilities=None):
         super().__init__(12345)
@@ -2981,6 +3233,9 @@ class AutomationBridgeApiTest(unittest.TestCase):
             cls.bridge = EngineClient(int(port), profiler_url=remotery_url)
             cls.bridge.wait_ready()
             return
+
+        if not (ROOT / ".internal" / "editor.port").is_file():
+            raise unittest.SkipTest("Defold editor port file is missing")
 
         try:
             cls.editor = editor.open_project(ROOT, start_if_needed=False)
