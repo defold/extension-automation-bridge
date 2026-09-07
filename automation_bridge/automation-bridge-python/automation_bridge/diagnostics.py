@@ -115,7 +115,7 @@ def inspect_project(
             None if same else "Use the complete project wrapper and restart Python after installation or update.",
         ))
     except (OSError, ValueError, SyntaxError) as exc:
-        checks.append(DiagnosticCheck("python_wrapper", "warning", str(exc), "Run editor.install_python(project_path) after Fetch Libraries."))
+        checks.append(DiagnosticCheck("python_wrapper", "warning", str(exc), "Run editor.update_python_wrapper(project_path) after Fetch Libraries."))
 
     try:
         available = editor.installations()

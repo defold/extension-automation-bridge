@@ -1452,8 +1452,8 @@ def doctor(
     return inspect_project(project_path, required_capabilities=required_capabilities, timeout=timeout)
 
 
-def install_python(project_path: Union[str, Path] = ".") -> Path:
-    """Seed the project's Python wrapper from its already-fetched dependency.
+def update_python_wrapper(project_path: Union[str, Path] = ".") -> Path:
+    """Update the project's Python wrapper from its already-fetched dependency.
 
     No editor or network connection is required. Fetch Libraries first, then
     run this helper from an extension checkout or the standalone install.py.
@@ -1542,10 +1542,10 @@ __all__ = [
     "SourceRange",
     "UnsupportedOperationError",
     "installation_registry_path",
-    "install_python",
     "doctor",
     "installations",
     "is_running",
     "latest_installation",
     "open_project",
+    "update_python_wrapper",
 ]

@@ -459,7 +459,7 @@ class EngineClientUnitTest(unittest.TestCase):
         write.assert_not_called()
         collect.assert_not_called()
 
-    def test_install_python_uses_fetched_archive_without_editing_project(self):
+    def test_update_python_wrapper_uses_fetched_archive_without_editing_project(self):
         dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -467,12 +467,12 @@ class EngineClientUnitTest(unittest.TestCase):
             (root / "game.project").write_text(content)
             self._write_automation_bridge_archive(root, dependency)
             with mock.patch.object(editor, "open_project") as launch:
-                path = editor.install_python(root)
+                path = editor.update_python_wrapper(root)
             self.assertEqual("new", (path / "automation_bridge" / "__init__.py").read_text())
             self.assertEqual(content, (root / "game.project").read_text())
         launch.assert_not_called()
 
-    def test_install_python_rejects_ambiguous_dependencies_and_preserves_wrapper(self):
+    def test_update_python_wrapper_rejects_ambiguous_dependencies_and_preserves_wrapper(self):
         dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -482,7 +482,7 @@ class EngineClientUnitTest(unittest.TestCase):
             marker = wrapper / "existing.py"
             marker.write_text("original")
             with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "ambiguous"):
-                editor.install_python(root)
+                editor.update_python_wrapper(root)
             self.assertEqual("original", marker.read_text())
 
     def test_public_surface_excludes_removed_aliases_and_backend_types(self):
