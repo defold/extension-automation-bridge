@@ -521,14 +521,20 @@ class CancellationTest(unittest.TestCase):
             release.wait(2)
             return game
         responses = []
-        with mock.patch.object(editor, 'open_project', side_effect=connect):
+        with mock.patch.object(editor, 'open_project', side_effect=connect), \
+             mock.patch.object(game.input, 'pending', return_value=[]) as pending, \
+             mock.patch.object(game.input, 'flush') as flush:
             worker = threading.Thread(target=lambda: responses.append(runtime.call_tool_request('late', 'defold_open_project', {'project_path': str(ROOT)})))
             worker.start()
-            self.assertTrue(started.wait(1))
-            runtime.cleanup()
-            release.set()
-            worker.join(1)
-        self.assertFalse(worker.is_alive())
+            try:
+                self.assertTrue(started.wait(1))
+                runtime.cleanup()
+            finally:
+                release.set()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            pending.assert_called_once_with()
+            flush.assert_not_called()
         self.assertFalse(responses[0]['ok'])
         self.assertTrue(game.closed)
         self.assertEqual([], runtime.handles.snapshot())
@@ -645,20 +651,25 @@ class SessionTest(unittest.TestCase):
             started.set()
             release.wait(2)
             return {}
-        with mock.patch.object(game, 'health', side_effect=health), mock.patch.object(game.input, 'flush', return_value={}):
+        with mock.patch.object(game, 'health', side_effect=health), \
+             mock.patch.object(game.input, 'pending', return_value=[]), \
+             mock.patch.object(game.input, 'flush') as flush:
             worker = threading.Thread(target=lambda: runtime.call_tool_request('busy', 'defold_health', {'engine': wire}))
             worker.start()
-            self.assertTrue(started.wait(1))
-            response = runtime.call_tool('automation_bridge_release', {'target': wire})
-            self.assertEqual('handle_busy', response['error']['code'])
-            self.assertFalse(game.closed)
-            runtime.cleanup()
-            self.assertFalse(game.closed)
-            release.set()
-            worker.join(1)
+            try:
+                self.assertTrue(started.wait(1))
+                response = runtime.call_tool('automation_bridge_release', {'target': wire})
+                self.assertEqual('handle_busy', response['error']['code'])
+                self.assertFalse(game.closed)
+                runtime.cleanup()
+                self.assertFalse(game.closed)
+            finally:
+                release.set()
+                worker.join(1)
             self.assertFalse(worker.is_alive())
             self.assertTrue(game.closed)
             self.assertEqual([], runtime.handles.snapshot())
+            flush.assert_not_called()
 
     def test_closing_borrowed_client_releases_input_and_invalidates_child_handles(self):
         runtime = BridgeRuntime(ROOT)
@@ -921,7 +932,8 @@ class InstalledLayoutTest(unittest.TestCase):
         import subprocess
         import sys
         from tests.mcp_client import StdioClient
-        with tempfile.TemporaryDirectory(prefix='automation plugin ') as directory:
+        # Unicode also exercises JSON path escaping on non-Windows runners.
+        with tempfile.TemporaryDirectory(prefix='automation plugin \u00e5 ') as directory:
             root = Path(directory)
             plugin = root / 'installed cache' / 'automation bridge'
             shutil.copytree(ROOT / 'plugins/automation-bridge', plugin, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
@@ -936,7 +948,7 @@ class InstalledLayoutTest(unittest.TestCase):
                 self.assertEqual('missing_argument', missing['error']['code'])
                 doctor = client.tool('defold_doctor', {'project_path': str(cwd)})['structuredContent']
                 self.assertTrue(doctor['ok'], doctor)
-                self.assertIn(str(cwd), json.dumps(doctor['data']))
+                self.assertEqual(cwd.resolve(), Path(doctor['data']['project_path']).resolve())
             self.assertEqual(0, client.process.returncode)
             subprocess.run([sys.executable, str(plugin / 'scripts/validate_plugin.py')], cwd=cwd,
                            check=True, capture_output=True, text=True)
