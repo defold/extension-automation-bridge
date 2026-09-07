@@ -1152,7 +1152,7 @@ class EngineClientUnitTest(unittest.TestCase):
             for path, operations in EDITOR_OPENAPI["paths"].items()
             for method in operations
         }
-        self.assertEqual(advertised_paths, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
+        self.assertEqual(advertised_paths | {("/bob", "post")}, editor._SUPPORTED_PATHS | editor._EXCLUDED_PATHS)
 
     def test_every_editor_command_wrapper_uses_its_advertised_command(self):
         project = EditorApiClient(".", port=12345)
@@ -1540,6 +1540,86 @@ class EngineClientUnitTest(unittest.TestCase):
         request.assert_called_once_with(project.base_url + "/command/compile", method="POST", timeout=12)
         bootstrap.assert_not_called()
         console.assert_not_called()
+
+    def test_editor_bob_sends_options_and_reads_each_session_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            token_path = root / ".internal/editor.token"
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"success": True, "issues": []})) as request, \
+                 mock.patch.object(EngineClient, "_from_editor") as bootstrap:
+                for token in ("first-session", "second-session"):
+                    token_path.write_text(token + "\n", encoding="utf-8")
+                    result = project.bob(options={"platform": "wasm-web", "archive": True, "architectures": ["wasm-web", "js-web"]}, commands=("build", "bundle"), timeout=90)
+                    self.assertEqual("Bearer " + token, request.call_args.kwargs["headers"]["Authorization"])
+                    self.assertEqual("application/json", request.call_args.kwargs["headers"]["Content-Type"])
+                    self.assertEqual(90, request.call_args.kwargs["timeout"])
+                    self.assertEqual(project.base_url + "/bob", request.call_args.args[0])
+                    self.assertEqual(["build", "bundle"], json.loads(request.call_args.kwargs["data"])["commands"])
+                    self.assertEqual(["wasm-web", "js-web"], json.loads(request.call_args.kwargs["data"])["options"]["architectures"])
+                    self.assertIs(project.last_command_result, result)
+                    self.assertTrue(result.success)
+                    self.assertEqual("bob", result.command)
+            self.assertEqual(2, request.call_count)
+            bootstrap.assert_not_called()
+
+    def test_editor_bob_rejects_unsupported_and_malformed_input_before_request(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json") as request:
+            with self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2"):
+                project.bob()
+            for options in ([], "--help", {3: "value"}, {"value": float("nan")}, {"value": object()}):
+                with self.subTest(options=options), self.assertRaises(ValueError):
+                    project.bob(options=options)
+            for commands in (None, "build", b"build", [False], 1):
+                with self.subTest(commands=commands), self.assertRaises(ValueError):
+                    project.bob(commands=commands)
+        request.assert_not_called()
+
+    def test_editor_bob_missing_credentials_and_rejections_do_not_leak_token_or_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            with mock.patch("automation_bridge.editor.request_json") as request:
+                with self.assertRaisesRegex(editor.CommandError, "editor.token"):
+                    project.bob()
+            request.assert_not_called()
+            (root / ".internal").mkdir()
+            token = "private-test-token"
+            (root / ".internal/editor.token").write_text(token, encoding="utf-8")
+            failures = [(401, {"error": token}), (403, {"error": token}),
+                        editor.HttpError("POST", project.base_url + "/bob", token, status=401)]
+            for failure in failures:
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with mock.patch("automation_bridge.editor.request_json", **kwargs) as request:
+                    with self.assertRaisesRegex(editor.CommandError, "authentication was rejected") as error:
+                        project.bob()
+                self.assertNotIn(token, str(error.exception))
+                self.assertIsNone(error.exception.__cause__)
+                request.assert_called_once()
+                self.assertIsNone(project.last_command_result)
+
+    def test_editor_bob_preserves_build_diagnostics_without_retrying_transport(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".internal").mkdir()
+            (root / ".internal/editor.token").write_text("test-session", encoding="utf-8")
+            project = EditorApiClient(root, port=12345)
+            project._openapi_document = {"paths": {"/bob": {"post": {}}}}
+            payload = {"success": False, "issues": [{"severity": "error", "message": "invalid option"}]}
+            with mock.patch("automation_bridge.editor.request_json", return_value=(422, payload)):
+                with self.assertRaises(editor.BuildError) as error:
+                    project.bob(options={"help": True})
+            self.assertIs(project.last_command_result, error.exception.result)
+            with mock.patch("automation_bridge.editor.request_json", side_effect=editor.HttpError("POST", project.base_url, "timed out")) as request:
+                with self.assertRaises(editor.HttpError):
+                    project.bob()
+            request.assert_called_once()
+            self.assertIsNone(project.last_command_result)
 
     def test_editor_compile_and_focus_reject_legacy_before_mutation(self):
         project = EditorApiClient(".", port=12345)

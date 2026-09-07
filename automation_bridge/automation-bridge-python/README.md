@@ -354,6 +354,21 @@ on 1.13.1. Explicit `focus=False` requires advertised focus control (1.13.2);
 `focus=True` works on either version. Unsupported requests fail before engine
 cleanup. `clean_build_and_run()` still uses the native focused launch on both.
 
+Defold 1.13.2 also supports Bob builds and bundles without launching:
+
+```python
+result = project.bob(
+    options={"platform": "wasm-web", "archive": True},
+    commands=("build", "bundle"),
+)
+```
+
+Bob option keys omit `--`; arrays supply repeatable options. Use
+`project.bob(options={"help": True})` and `project.console.read()` for Bob help
+and output. The wrapper reads `.internal/editor.token` for each call and sends
+it as a bearer token. Missing or rejected credentials raise `CommandError`.
+Bob requests are never automatically retried after an uncertain transport failure.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

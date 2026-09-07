@@ -52,6 +52,7 @@ _SUPPORTED_COMMANDS = frozenset({
 })
 _SUPPORTED_PATHS = frozenset({
     ("/command/{command}", "post"),
+    ("/bob", "post"),
     ("/console", "get"),
     ("/console/stream", "get"),
     ("/prefs/{path}", "get"),
@@ -1044,7 +1045,10 @@ class Client:
             raise UnsupportedOperationError(f"editor operation is outside the supported API: {method.upper()} {path}")
         operation = self._openapi().get("paths", {}).get(path, {}).get(method.lower())
         if not isinstance(operation, Mapping):
-            raise UnsupportedOperationError(f"editor does not advertise {method.upper()} {path}")
+            raise UnsupportedOperationError(
+                f"editor does not advertise {method.upper()} {path}",
+                minimum_version="1.13.2" if path == "/bob" else None,
+            )
         return operation
 
     def _command_info(self, command: str) -> Optional[CommandInfo]:
@@ -1141,6 +1145,61 @@ class Client:
         """
         status, response = self._json_command("compile", timeout)
         return self._accept_build_result("compile", f"{self.base_url}/command/compile", status, response)
+
+    def bob(
+        self,
+        *,
+        options: Optional[Mapping[str, Any]] = None,
+        commands: Sequence[str] = (),
+        timeout: float = 300.0,
+    ) -> BuildResult:
+        """Build or bundle through the editor's Bob endpoint without launching.
+
+        Supported from Defold 1.13.2. ``options`` uses Bob CLI keys without
+        ``--``; repeatable values are arrays. For example, pass
+        ``options={"platform": "wasm-web", "archive": True}`` and
+        ``commands=("build", "bundle")`` to bundle HTML5. ``options={"help": True}``
+        prints available options to the editor console. Bob decides output paths
+        and defaults. Output is available through ``project.console.read()``.
+
+        Authentication reads ``.internal/editor.token`` on every call. Missing
+        or rejected credentials raise CommandError. Requests are not retried:
+        after a timeout, inspect the console before repeating a build. Return
+        completion and diagnostics, or raise BuildError with the result.
+        """
+        if options is not None and (not isinstance(options, Mapping) or any(not isinstance(key, str) for key in options)):
+            raise ValueError("Bob options must be an object with string keys")
+        if not isinstance(commands, Sequence) or isinstance(commands, (str, bytes)) or any(not isinstance(command, str) for command in commands):
+            raise ValueError("Bob commands must be a sequence of strings")
+        body = {"options": dict(options) if options is not None else {}, "commands": list(commands)}
+        # Validate before authentication or execution, including non-finite values.
+        try:
+            data = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bob options must contain valid JSON values") from exc
+        check_cancelled()
+        self._require_operation("/bob", "post")
+        token_path = self.root / ".internal" / "editor.token"
+        try:
+            token = token_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            raise CommandError(f"cannot read editor authentication token at {token_path}; reopen the project in Defold 1.13.2 or later") from None
+        if not token or any(char.isspace() or not 33 <= ord(char) <= 126 for char in token):
+            raise CommandError(f"invalid editor authentication token at {token_path}; reopen the project")
+        self._last_command_result = None
+        url = f"{self.base_url}/bob"
+        try:
+            status, response = request_json(
+                url, method="POST", timeout=timeout, data=data,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            )
+        except HttpError as exc:
+            if exc.status not in (401, 403):
+                raise
+            raise CommandError("Bob authentication was rejected; reconnect to the editor and check .internal/editor.token") from None
+        if status in (401, 403):
+            raise CommandError("Bob authentication was rejected; reconnect to the editor and check .internal/editor.token")
+        return self._accept_build_result("bob", url, status, response)
 
     def _run_focus(self, command: str, focus: Optional[bool]) -> Optional[bool]:
         if focus is not None and type(focus) is not bool:
