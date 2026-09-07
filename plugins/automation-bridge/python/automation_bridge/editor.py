@@ -37,6 +37,7 @@ _AUTOMATION_BRIDGE_REPOSITORY = "https://github.com/defold/extension-automation-
 _AUTOMATION_BRIDGE_LATEST_RELEASE_API = "https://api.github.com/repos/defold/extension-automation-bridge/releases/latest"
 _AUTOMATION_BRIDGE_PYTHON_DIRECTORY = "automation-bridge-python"
 _EDITOR_ABSENCE_GRACE_PERIOD = 5.0
+_PROFILER_DISCOVERY_GRACE_PERIOD = 1.0
 _DEPENDENCY_LINE_PATTERN = re.compile(r"^(\s*dependencies#(\d+)\s*=\s*)(.*?)([ \t]*(?:\r\n|\n|\r)?)$")
 _SECTION_PATTERN = re.compile(r"^\s*\[([^]]+)\]\s*(?:\r\n|\n|\r)?$")
 _ENGINE_SERVICE_PORT_PATTERNS = (
@@ -1514,10 +1515,36 @@ class Client:
         return candidates
 
     def _current_registration_remotery_urls(self, lines: Optional[list] = None) -> list:
-        """Return Remotery websocket URLs logged before the latest endpoint registration only."""
+        """Return Remotery URLs from the latest engine initialization."""
         if lines is None:
             lines = self._console_lines()
         return self._latest_registration_remotery_urls(lines)
+
+    def _reported_target_remotery_url(self, port: int, timeout: float) -> Optional[str]:
+        """Collect optional profiler metadata after a structured launch result.
+
+        The editor's console can lag its target URL and the engine's health.
+        Python owns this bounded discovery grace; it does not change native
+        readiness, retry the build, or require a profiler for a usable engine.
+        """
+        def discover():
+            lines = self._console_lines()
+            if port not in self._current_registration_engine_service_ports(lines):
+                return None
+            urls = self._current_registration_remotery_urls(lines)
+            if urls:
+                return (urls[0],)
+            initialization = self._latest_registration_window(lines, include_initialization=True) or ()
+            if any("Failed to initialize Remotery" in line or "Registered automation_bridge extension" in line
+                   for line in initialization):
+                return (None,)
+            return None
+
+        try:
+            result = wait_until(discover, timeout=min(timeout, _PROFILER_DISCOVERY_GRACE_PERIOD), interval=0.05)
+            return result[0]
+        except (AutomationBridgeError, WaitTimeoutError):
+            return None
 
     @classmethod
     def _latest_registration_engine_service_ports(cls, lines: list) -> list:
@@ -1534,14 +1561,19 @@ class Client:
 
     @classmethod
     def _latest_registration_remotery_urls(cls, lines: list) -> list:
-        search_lines = cls._latest_registration_window(lines)
+        search_lines = cls._latest_registration_window(lines, include_initialization=True)
         if search_lines is None:
             search_lines = lines
         candidates = []
-        for line in reversed(search_lines):
+        for line in search_lines:
+            if "Failed to initialize Remotery" in line:
+                candidates.clear()
             match = _REMOTERY_URL_PATTERN.search(line)
             if match:
-                cls._append_unique_candidate(candidates, match.group(1))
+                url = match.group(1)
+                if url in candidates:
+                    candidates.remove(url)
+                candidates.insert(0, url)
         return candidates
 
     def _latest_registration_has_engine_service_port(self) -> bool:
@@ -1561,7 +1593,7 @@ class Client:
         return bool(current_count and current_ports and current_ports != previous_ports)
 
     @staticmethod
-    def _latest_registration_window(lines: list) -> Optional[list]:
+    def _latest_registration_window(lines: list, *, include_initialization: bool = False) -> Optional[list]:
         endpoint_index: Optional[int] = None
         previous_endpoint_index: Optional[int] = None
         for index, line in enumerate(lines):
@@ -1572,6 +1604,15 @@ class Client:
         if endpoint_index is None:
             return None
         start_index = previous_endpoint_index + 1 if previous_endpoint_index is not None else 0
+        if include_initialization:
+            # Extension initialization order differs between engines. Remotery
+            # can log after AppInitialize registers our endpoint. Exclude the
+            # preceding engine's remaining initialization before searching both
+            # sides of the current registration.
+            for index in range(start_index, endpoint_index):
+                if "Registered automation_bridge extension" in lines[index]:
+                    start_index = index + 1
+            return lines[start_index:]
         return lines[start_index:endpoint_index]
 
     def _remember_engine_service_port(
@@ -1649,10 +1690,13 @@ class Client:
         """Return a copy of editor/bootstrap lifecycle events observed by this client."""
         return [dict(event) for event in self._lifecycle_events]
 
-    def _remember_remotery_url(self, url: str) -> None:
-        """Remember the Remotery websocket URL for reused-engine builds."""
+    def _remember_remotery_url(self, url: Optional[str]) -> None:
+        """Replace profiler metadata, clearing a preceding engine's stale URL."""
         self._remotery_url = url
-        self._write_cached_remotery_url(url)
+        if url is None:
+            self._remotery_url_cache_path.unlink(missing_ok=True)
+        else:
+            self._write_cached_remotery_url(url)
 
     @staticmethod
     def _append_port_candidate(candidates: list, port: int) -> None:

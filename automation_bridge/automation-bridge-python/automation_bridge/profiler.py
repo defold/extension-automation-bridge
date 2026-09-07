@@ -126,14 +126,22 @@ class ProfilerClient:
         """Return a live engine profiler connection.
 
         By default this uses the profiler URL discovered while bootstrapping
-        from editor logs. Pass `url`, or `host`/`port`, to override it.
+        from editor logs. Pass `url`, or `port` with an optional `host`, to
+        override it. Without a discovered URL or an explicit port, raise
+        ProfilerError instead of connecting to another engine on a default port.
         """
         if url is not None:
             return ProfilerConnection.from_url(url, timeout=self.timeout)
         if port is None and host is None and self._remotery_url is not None:
             return ProfilerConnection.from_url(self._remotery_url, timeout=self.timeout)
+        if port is None:
+            raise ProfilerError(
+                "No Remotery URL was discovered for this engine. Check its startup console "
+                "for profiler initialization errors, or pass an explicit profiler url or port. "
+                "Concurrent engines need distinct profiler.remotery_port settings."
+            )
         return ProfilerConnection(
-            port=_remotery.DEFAULT_REMOTERY_PORT if port is None else port,
+            port=port,
             host="127.0.0.1" if host is None else host,
             path=path,
             timeout=self.timeout,

@@ -947,8 +947,7 @@ class Client:
             lifecycle = health.get("lifecycle", {})
             if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
                 editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
-            if profiler_url:
-                editor._remember_remotery_url(profiler_url)
+            editor._remember_remotery_url(profiler_url)
             bridge.logs.start()
             bridge._owns_engine = fresh_build
             bridge._project_root = Path(editor.root)
@@ -977,21 +976,20 @@ class Client:
                 if bridge is not None:
                     # The engine URL is authoritative; console metadata is optional.
                     try:
-                        console_lines = editor._console_lines()
-                        if target_port in editor._current_registration_engine_service_ports(console_lines):
-                            profiler_url = cls._editor_profiler_url(editor, fresh_build=True, console_lines=console_lines)
-                            if profiler_url:
-                                bridge._remotery_url = profiler_url
-                                editor._remember_remotery_url(profiler_url)
-                    except AutomationBridgeError:
-                        pass
+                        profiler_url = editor._reported_target_remotery_url(target_port, timeout)
+                    except BaseException as exc:
+                        _cleanup_without_masking(bridge.close, exc)
+                        raise
+                    if profiler_url:
+                        bridge._remotery_url = profiler_url
+                        editor._remember_remotery_url(profiler_url)
                 return bridge
             console_lines = editor._console_lines()
             service_ports = editor._engine_service_ports(console_lines)
             registration_ports = editor._current_registration_engine_service_ports(console_lines)
             profiler_url = cls._editor_profiler_url(
                 editor,
-                fresh_build=fresh_build,
+                fresh_build=fresh_build or bool(registration_ports),
                 console_lines=console_lines,
             )
             for service_port in service_ports:
