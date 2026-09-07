@@ -490,6 +490,7 @@ class InputController:
         queueing input with ``wait=False``. With ``flush=True`` (the default),
         both the active action and later actions owned by this client session
         are cancelled. Cleanup failures never mask the original exception.
+        Inspect ``OperationCancelled.cleanup_error`` when cleanup is refused.
         """
         return InputInterruptionScope(self, flush=flush, release=release)
 
@@ -823,7 +824,7 @@ class Client:
     def _flush_owned_input(self) -> None:
         """Request cleanup only when native receipts belong to this session."""
         # Flushing acquires a controller lease, even when the queue is empty.
-        # An idle observer must not take control merely because it is closing.
+        # An idle observer must not take control merely because it is cancelled.
         if any(receipt.get("client_id") == self.client_id and receipt.get("session_id") == self.session_id
                for receipt in self.input.pending()):
             self.input.flush(release=True)

@@ -91,9 +91,11 @@ Concurrent native validation projects need different available
 `[profiler] remotery_port` settings in `game.project`. Start a new engine process
 after changing that setting. An occupied Remotery port causes profiler startup
 to fail and can freeze the tested 1.13.1 and 1.13.2 alpha engines on in-process
-reboot. The wrapper now reports missing profiler metadata instead of reading
-another game's default port. See `tests/MCP_VALIDATION.md` for the investigation
-and verified workaround; do not hide these failures by skipping runtime tests.
+reboot. The wrapper reports missing profiler metadata instead of reading
+another game's default port. See the
+[Python profiler guidance](automation_bridge/automation-bridge-python/README.md#profiling)
+for connection setup and the verified workaround, and `tests/MCP_VALIDATION.md`
+for the investigation. Keep runtime tests enabled when validating this behavior.
 
 Editor compatibility tests serve the versioned fixtures in `tests/fixtures`
 through local HTTP servers. They cover 1.13.1 command enums and acknowledgements,

@@ -497,6 +497,11 @@ with game.pointer((100, 100)) as pointer:
 
 The pointer object exposes its configured `lease`, `input_id`, and `closed`
 state. `game.input.status(pointer.input_id)` returns its current native receipt.
+Pointer and input-interruption contexts preserve the original cancellation
+exception when cleanup fails. Inspect `OperationCancelled.cleanup_error` for
+the first cleanup failure. A pointer whose cancellation was refused remains
+open, so its native receipt can be inspected before retrying `pointer.cancel()`.
+
 To capture a rendered pressed state, request a frame-relative screenshot while
 the pointer context is still open and choose a lease that comfortably covers
 the capture:

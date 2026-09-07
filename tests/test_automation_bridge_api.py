@@ -338,6 +338,46 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertEqual(bridge.session_id, values["session_id"])
         self.assertTrue(values["release"])
 
+    def test_cancelled_observer_does_not_acquire_input_control(self):
+        bridge = engine.Client(54321)
+        self.addCleanup(bridge.close)
+        for receipts in ([], [{'client_id': 'other', 'session_id': bridge.session_id}],
+                         [{'client_id': bridge.client_id, 'session_id': 'other'}]):
+            token = engine.CancellationToken()
+            with self.subTest(receipts=receipts), \
+                 mock.patch.object(bridge.input, 'pending', return_value=receipts) as pending, \
+                 mock.patch.object(bridge.input, 'flush') as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.cancellation_scope(token):
+                        token.cancel('observer stopped')
+                self.assertEqual('observer stopped', str(error.exception))
+                self.assertIsNone(error.exception.cleanup_error)
+                pending.assert_called_once_with()
+                flush.assert_not_called()
+
+    def test_client_cancellation_retains_receipt_and_cleanup_failures(self):
+        bridge = engine.Client(54321)
+        self.addCleanup(bridge.close)
+        receipts = [engine.InputReceipt({'input_id': 42, 'client_id': bridge.client_id,
+                                         'session_id': bridge.session_id})]
+        for failed_operation in ('pending', 'flush'):
+            token = engine.CancellationToken()
+            refusal = RuntimeError('native cleanup unavailable')
+            with self.subTest(failed_operation=failed_operation), \
+                 mock.patch.object(bridge.input, 'pending', return_value=receipts,
+                                   side_effect=refusal if failed_operation == 'pending' else None), \
+                 mock.patch.object(bridge.input, 'flush',
+                                   side_effect=refusal if failed_operation == 'flush' else None) as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.cancellation_scope(token):
+                        token.cancel('caller stopped')
+                self.assertEqual('caller stopped', str(error.exception))
+                self.assertIs(refusal, error.exception.cleanup_error)
+                if failed_operation == 'pending':
+                    flush.assert_not_called()
+                else:
+                    flush.assert_called_once_with(release=True)
+
     def test_command_cancellation_preserves_native_refusal(self):
         bridge = FakeInputClient()
         token = engine.CancellationToken()
@@ -2316,6 +2356,40 @@ class EngineClientUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(KeyboardInterrupt, "stop"):
             with bridge.pointer((10, 20), lease=2.0):
                 raise KeyboardInterrupt("stop")
+
+    def test_pointer_cancellation_preserves_cleanup_failure_and_allows_retry(self):
+        bridge = FakeInputClient()
+        original = engine.OperationCancelled('caller stopped')
+        refusal = RuntimeError('native cleanup refused')
+        with mock.patch.object(bridge.input, 'cancel', side_effect=refusal) as cancel:
+            with self.assertRaises(engine.OperationCancelled) as error:
+                with bridge.pointer((10, 20), lease=2.0) as pointer:
+                    raise original
+            cancel.assert_called_once_with(pointer.input_id, release=True)
+        self.assertIs(original, error.exception)
+        self.assertIs(refusal, error.exception.cleanup_error)
+        self.assertFalse(pointer.closed)
+        receipt = engine.InputReceipt({'input_id': pointer.input_id, 'state': 'cancelled'})
+        with mock.patch.object(bridge.input, 'cancel', return_value=receipt) as retry:
+            self.assertIs(receipt, pointer.cancel())
+            retry.assert_called_once_with(pointer.input_id, release=True)
+        self.assertTrue(pointer.closed)
+
+    def test_input_interruption_scope_preserves_first_cancellation_cleanup_error(self):
+        bridge = FakeInputClient()
+        for earlier_error in (None, RuntimeError('earlier cleanup refused')):
+            original = engine.OperationCancelled('caller stopped')
+            original.cleanup_error = earlier_error
+            refusal = RuntimeError('native cleanup refused')
+            with self.subTest(earlier_error=earlier_error), \
+                 mock.patch.object(bridge.input, 'flush', side_effect=refusal) as flush:
+                with self.assertRaises(engine.OperationCancelled) as error:
+                    with bridge.input.interruption_scope():
+                        raise original
+                flush.assert_called_once_with(release=True)
+            self.assertIs(original, error.exception)
+            self.assertIs(earlier_error if earlier_error is not None else refusal,
+                          error.exception.cleanup_error)
 
     def test_orientation_helpers_swap_last_known_size(self):
         bridge = FakeEngineClient({"window": {"width": 320, "height": 568}})
