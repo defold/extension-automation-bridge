@@ -307,3 +307,77 @@ class SessionTest(unittest.TestCase):
         self.assertIn('native unavailable', info['cleanup_errors'][-1]['error']['message'])
         self.assertEqual(1, info['handles'])
         runtime.cleanup()
+
+
+PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aDTsAAAAASUVORK5CYII=')
+
+
+class VisualToolsTest(unittest.TestCase):
+    def setUp(self):
+        from automation_bridge.mcp_protocol import McpProtocol
+        self.runtime = BridgeRuntime(ROOT)
+        self.game = engine.Client(54321)
+        self.wire = serialize(self.game, self.runtime.handles)
+        self.protocol = McpProtocol(self.runtime)
+        self.protocol.handle({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': {
+            'protocolVersion': '2025-11-25', 'clientInfo': {'name': 'test', 'version': '1'}, 'capabilities': {}}})
+
+    def tearDown(self):
+        self.runtime.cleanup()
+
+    def call(self, name, arguments):
+        return self.protocol.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': name, 'arguments': arguments}})['result']
+
+    def test_completed_screenshot_is_image_content_without_base64_in_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'capture.png'
+            path.write_bytes(PNG)
+            receipt = engine.ScreenshotReceipt({'state': 'complete', 'path': str(path), 'engine_frame': 12, 'scene_sequence': 4})
+            with mock.patch.object(self.game, 'screenshot', return_value=receipt) as screenshot:
+                result = self.call('defold_screenshot', {'engine': self.wire})
+        self.assertFalse(result['isError'], result)
+        self.assertEqual(['text', 'image'], [content['type'] for content in result['content']])
+        self.assertEqual(PNG, base64.b64decode(result['content'][1]['data']))
+        self.assertNotIn(result['content'][1]['data'], result['content'][0]['text'])
+        self.assertEqual(12, result['structuredContent']['data']['frame'])
+        screenshot.assert_called_once_with(resolution_multiplier=0.5)
+
+    def test_pending_screenshot_has_no_image_and_no_implicit_downscale(self):
+        receipt = engine.ScreenshotReceipt({'state': 'pending', 'path': '/missing/pending.png'})
+        with mock.patch.object(self.game, 'screenshot', return_value=receipt) as screenshot:
+            result = self.call('defold_screenshot', {'engine': self.wire, 'wait': False})
+        self.assertEqual(['text'], [content['type'] for content in result['content']])
+        self.assertEqual('pending', result['structuredContent']['data']['state'])
+        screenshot.assert_called_once_with(wait=False)
+
+    def test_editor_preview_is_an_image_in_focused_and_generic_calls(self):
+        project = editor.Client(ROOT, port=51336)
+        wire = serialize(project, self.runtime.handles)
+        preview_wire = serialize(project.preview, self.runtime.handles)
+        with mock.patch.object(project.preview, 'render', return_value=PNG) as render:
+            result = self.call('defold_preview', {'project': wire, 'path': '/main/main.collection'})
+            self.assertEqual(1, result['structuredContent']['data']['width'])
+            self.assertEqual('image/png', result['content'][1]['mimeType'])
+            self.assertEqual(0.5, render.call_args.kwargs['resolution_multiplier'])
+            result = self.call('automation_bridge_call', {'operation': 'automation_bridge.editor.Preview.render', 'target': preview_wire, 'arguments': {'path': '/main/main.collection'}})
+            self.assertEqual('image', result['content'][1]['type'])
+
+    def test_observation_preserves_different_frame_evidence_and_bounds_logs(self):
+        page = engine.ElementPage.from_raw({'elements': [], 'matched': 20, 'engine_frame': 21, 'scene_sequence': 7})
+        capture = engine.ScreenshotReceipt({'state': 'pending', 'engine_frame': 22, 'scene_sequence': 7})
+        with mock.patch.object(self.game, 'elements_page', return_value=page), mock.patch.object(self.game, 'screenshot', return_value=capture), mock.patch.object(self.game.logs, 'tail', return_value=['info: ok', 'ERROR: ' + 'x' * 3000] * 30):
+            result = self.call('defold_observe', {'engine': self.wire, 'error_limit': 2})
+        data = result['structuredContent']['data']
+        self.assertFalse(data['evidence']['same_frame'])
+        self.assertEqual(21, data['page']['engine_frame'])
+        self.assertEqual(22, data['screenshot']['frame'])
+        self.assertEqual(2, len(data['recent_errors']['lines']))
+        self.assertLessEqual(len(data['recent_errors']['lines'][0]), 2000)
+        self.assertIsNone(data['recent_errors']['engine_frame'])
+
+    def test_missing_or_replaced_capture_preserves_receipt_in_failure(self):
+        receipt = engine.ScreenshotReceipt({'state': 'complete', 'path': '/missing/capture.png', 'capture_id': 17})
+        with mock.patch.object(self.game, 'screenshot', return_value=receipt):
+            result = self.call('defold_screenshot', {'engine': self.wire})
+        self.assertTrue(result['isError'])
+        self.assertEqual(17, result['structuredContent']['error']['data']['receipt']['capture_id'])

@@ -464,7 +464,7 @@ class McpProtocol:
         except (TypeError, ValueError):
             raise ProtocolError(INTERNAL_ERROR, "Internal error")
         return {
-            "content": [{"type": "text", "text": text}],
+            "content": [{"type": "text", "text": text}] + list(getattr(envelope, "image_content", ())),
             "structuredContent": envelope,
             "isError": envelope.get("ok") is False,
         }

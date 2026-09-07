@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import enum
+import hashlib
 import inspect
 import json
 import math
@@ -68,6 +69,14 @@ class ToolFailure(Exception):
         return result
 
 
+class ToolResponse(dict):
+    """JSON envelope plus trusted MCP content, kept out of serialized text."""
+
+    def __init__(self, envelope: dict, images: Sequence[dict] = ()):
+        super().__init__(envelope)
+        self.image_content = list(images)
+
+
 @dataclass
 class RequestContext:
     request_id: Any
@@ -75,6 +84,7 @@ class RequestContext:
     created: list = field(default_factory=list)
     session: str = "default"
     resources: dict = field(default_factory=dict)
+    images: list = field(default_factory=list)
     engines: set = field(default_factory=set)
     scopes: ExitStack = field(default_factory=ExitStack)
 
@@ -984,6 +994,8 @@ class BridgeRuntime:
             "defold_key": self._focused_key,
             "defold_open_project": self._focused_open_project,
             "defold_screenshot": self._focused_screenshot,
+            "defold_preview": self._focused_preview,
+            "defold_observe": self._focused_observe,
             "defold_type_text": self._focused_type_text,
             "defold_wait_for_element": self._focused_wait_for_element,
             "defold_wait_for_event": self._focused_wait_for_event,
@@ -1101,12 +1113,14 @@ class BridgeRuntime:
             with engine.cancellation_scope(context.token), context.scopes:
                 result = self.tool_handlers[name](dict(arguments))
                 check_cancelled()
+                self._capture_images(result)
+                check_cancelled()
                 with self._lock:
                     check_cancelled()
                     if self._closed:
                         raise engine.OperationCancelled("MCP runtime closed")
                     data = serialize(result, self.handles)
-            return {"ok": True, "data": data}
+            return ToolResponse({"ok": True, "data": data}, context.images)
         except Exception as error:
             if isinstance(error, engine.OperationCancelled):
                 self._discard_unretained(result)
@@ -1292,7 +1306,10 @@ class BridgeRuntime:
             if len(size) != 2 or not all(isinstance(item, int) and not isinstance(item, bool) for item in size):
                 raise ToolFailure("invalid_size", "size must contain exactly two integer dimensions")
             kwargs["size"] = tuple(size)
-        return function(**kwargs)
+        result = function(**kwargs)
+        if spec.qualified_name == "automation_bridge.editor.Preview.render":
+            return self._preview_result(result, kwargs.get("path"))
+        return result
 
     def _tool_catalog(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, optional=("query", "cursor", "limit"))
@@ -1854,7 +1871,85 @@ class BridgeRuntime:
         game = self._engine_target(arguments)
         kwargs = dict(arguments)
         kwargs.pop("engine")
+        if kwargs.get("wait", True):
+            kwargs.setdefault("resolution_multiplier", 0.5)
         return game.screenshot(**kwargs)
+
+    @staticmethod
+    def _image_block(data: bytes) -> dict:
+        if len(data) > 8 * 1024 * 1024:
+            raise ToolFailure("image_too_large", "PNG exceeds the 8 MiB MCP image limit; lower resolution_multiplier")
+        if len(data) < 24 or not data.startswith(b"\x89PNG\r\n\x1a\n") or data[12:16] != b"IHDR":
+            raise ToolFailure("invalid_image", "capture did not contain a PNG image")
+        return {"type": "image", "mimeType": "image/png", "data": base64.b64encode(data).decode("ascii")}
+
+    def _capture_images(self, value: Any) -> None:
+        context = _request_context.get()
+        if isinstance(value, engine.ScreenshotReceipt):
+            if value.state != "complete":
+                return
+            try:
+                with value.path.open("rb") as stream:
+                    data = stream.read(8 * 1024 * 1024 + 1)
+                if value.sha256 and hashlib.sha256(data).hexdigest() != value.sha256:
+                    raise ValueError("capture file no longer matches the receipt hash")
+                context.images.append(self._image_block(data))
+            except (OSError, ValueError, ToolFailure) as error:
+                raise ToolFailure("image_unavailable", str(error), {"receipt": serialize(value, self.handles)}) from error
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                self._capture_images(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                self._capture_images(item)
+
+    def _preview_result(self, data: bytes, path: Any) -> dict:
+        block = self._image_block(data)
+        _request_context.get().images.append(block)
+        return {"source": "editor_preview", "path": str(path), "state": "complete",
+                "width": int.from_bytes(data[16:20], "big"), "height": int.from_bytes(data[20:24], "big"),
+                "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+
+    def _focused_preview(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project", "path"), optional=("width", "height", "resolution_multiplier", "timeout"))
+        project = self._editor_target(arguments)
+        kwargs = {key: value for key, value in arguments.items() if key != "project"}
+        if "width" not in kwargs and "height" not in kwargs:
+            kwargs.setdefault("resolution_multiplier", 0.5)
+        return self._preview_result(project.preview.render(**kwargs), arguments["path"])
+
+    def _focused_observe(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("engine",), optional=("selector", "error_limit", "screenshot", "resolution_multiplier", "timeout"))
+        game = self._engine_target(arguments)
+        selector = self._selector(arguments.get("selector", {}))
+        selector.setdefault("limit", 20)
+        if selector["limit"] > 50:
+            raise ToolFailure("invalid_limit", "observations allow at most 50 elements; use defold_find_elements for larger pages")
+        limit = arguments.get("error_limit", 10)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 50:
+            raise ToolFailure("invalid_limit", "error_limit must be between 0 and 50")
+        started = time.time_ns()
+        page = game.elements_page(**selector)
+        errors = {"lines": [], "sampled_at_ns": time.time_ns(), "source": "runtime_log_tail", "engine_frame": None}
+        if limit:
+            try:
+                lines = game.logs.tail(limit=200)
+                errors["lines"] = [line[:2000] for line in lines if any(word in line.casefold() for word in ("error", "exception", "fatal"))][-limit:]
+            except Exception as error:
+                errors["unavailable"] = _exception_failure(error).as_dict()
+        capture = None
+        if arguments.get("screenshot", True):
+            capture = game.screenshot(wait=True, timeout=arguments.get("timeout", 5.0),
+                                      resolution_multiplier=arguments.get("resolution_multiplier", 0.5))
+        return {
+            "engine_instance_id": game.engine_instance_id,
+            "elements": page.elements,
+            "page": {key: getattr(page, key) for key in ("matched", "total", "next_cursor", "truncated", "scene_sequence", "engine_frame")},
+            "recent_errors": errors, "screenshot": capture,
+            "evidence": {"started_at_ns": started, "finished_at_ns": time.time_ns(), "snapshots": "independent",
+                         "same_frame": bool(capture and capture.state == "complete" and page.engine_frame > 0
+                                            and page.engine_frame == capture.frame and page.scene_sequence == capture.scene_sequence)},
+        }
 
     def _focused_close_engine(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("engine", "confirm"), optional=("timeout",))
@@ -2024,9 +2119,17 @@ class BridgeRuntime:
                 "Send a bounded application-defined JSON command and wait for its terminal result.",
                 _object_schema({"engine": _HANDLE_VALUE, "name": _STRING, "data": _ANY_JSON, "timeout": _NUMBER}, ("engine", "name")), False, False, False,
             ),
+            "defold_preview": (
+                "Render a Defold editor preview", "Render a project scene resource without running the game. Returns an MCP PNG image with dimensions and hash; defaults to half resolution.",
+                _object_schema({"project": _HANDLE_VALUE, "path": _STRING, "width": {"type": "integer", "minimum": 1, "maximum": 4096}, "height": {"type": "integer", "minimum": 1, "maximum": 4096}, "resolution_multiplier": {"type": "number", "minimum": 0.01, "maximum": 1}, "timeout": _NUMBER}, ("project", "path")), False, False, False,
+            ),
+            "defold_observe": (
+                "Observe the Defold runtime", "Return up to 50 selected elements, bounded recent errors, and an optional screenshot image. Keeps each snapshot's frame evidence; defaults to 20 elements and half resolution.",
+                _object_schema({"engine": _HANDLE_VALUE, "selector": selector_schema, "error_limit": {"type": "integer", "minimum": 0, "maximum": 50}, "screenshot": _BOOLEAN, "resolution_multiplier": {"type": "number", "minimum": 0.01, "maximum": 1}, "timeout": _NUMBER}, ("engine",)), False, False, False,
+            ),
             "defold_screenshot": (
                 "Capture a Defold screenshot",
-                "Capture a deterministic runtime screenshot receipt with size, frame, and hash metadata.",
+                "Capture a runtime PNG image alongside its atomic receipt with size, frame, and hash metadata. Defaults to half resolution when waiting. Pending receipts have no image.",
                 _object_schema({"engine": _HANDLE_VALUE, "wait": _BOOLEAN, "timeout": _NUMBER, "after_frames": _INTEGER, "resolution_multiplier": _NUMBER}, ("engine",)), False, False, False,
             ),
             "defold_close_engine": (
