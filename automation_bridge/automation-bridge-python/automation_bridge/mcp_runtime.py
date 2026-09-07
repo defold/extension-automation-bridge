@@ -130,7 +130,7 @@ def _qualified_type(value: Any) -> str:
 
 def _plain_error_data(value: Any, depth: int = 0) -> Any:
     """Best-effort JSON error details without handles or object repr leakage."""
-    if depth > 5:
+    if depth > 12:
         return "<truncated>"
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -140,6 +140,11 @@ def _plain_error_data(value: Any, depth: int = 0) -> Any:
         return str(value.expanduser().resolve())
     if isinstance(value, bytes):
         return {"encoding": "base64", "data": base64.b64encode(value).decode("ascii")}
+    if dataclasses.is_dataclass(value):
+        return _plain_error_data({field.name: getattr(value, field.name)
+                                  for field in dataclasses.fields(value) if not field.name.startswith("_")}, depth + 1)
+    if isinstance(value, BaseException):
+        return {"type": type(value).__name__, "message": str(value)}
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
@@ -794,7 +799,7 @@ def _target_token(wire: Any, registry: HandleRegistry) -> Optional[str]:
     return registry.token_for(value)
 
 
-def _exception_failure(error: Exception) -> ToolFailure:
+def _exception_failure(error: Exception, *, read_only: bool = False) -> ToolFailure:
     if isinstance(error, ToolFailure):
         return error
     name = type(error).__name__
@@ -810,7 +815,7 @@ def _exception_failure(error: Exception) -> ToolFailure:
     for key in (
         "status", "method", "url", "command_id", "timeout", "elapsed", "attempts",
         "scene_sequence", "requested_cursor", "oldest_cursor", "latest_cursor", "receipt",
-        "issues", "response", "code",
+        "issues", "response", "code", "result", "minimum_version", "cleanup_error", "reason",
     ):
         if hasattr(error, key):
             value = getattr(error, key)
@@ -820,7 +825,7 @@ def _exception_failure(error: Exception) -> ToolFailure:
         code,
         str(error) or name,
         details,
-        retryable=name in retryable_names or name.endswith("TimeoutError"),
+        retryable=read_only and (name in retryable_names or name.endswith("TimeoutError")),
         error_type=name,
     )
 
@@ -856,6 +861,8 @@ class BridgeRuntime:
             "automation_bridge_release": self._tool_release,
             "automation_bridge_wait": self._tool_wait,
             "defold_build_and_run": self._focused_build_and_run,
+            "defold_compile": self._focused_compile,
+            "defold_bob": self._focused_bob,
             "defold_click": self._focused_click,
             "defold_close_engine": self._focused_close_engine,
             "defold_command": self._focused_command,
@@ -951,7 +958,11 @@ class BridgeRuntime:
             result = self.tool_handlers[name](dict(arguments))
             return {"ok": True, "data": serialize(result, self.handles)}
         except Exception as error:
-            failure = _exception_failure(error)
+            read_only = next((tool["annotations"]["readOnlyHint"] for tool in self._tools if tool["name"] == name), False)
+            if name in {"automation_bridge_call", "automation_bridge_destructive_call"}:
+                spec = self._operation_specs.get(arguments.get("operation"))
+                read_only = bool(spec and spec.read_only)
+            failure = _exception_failure(error, read_only=read_only)
             return {"ok": False, "error": failure.as_dict()}
 
     def cancel(self, request_id: Any) -> None:
@@ -1335,11 +1346,27 @@ class BridgeRuntime:
             kwargs["launcher"] = arguments["launcher"]
         return editor.open_project(**kwargs)
 
+    def _editor_target(self, arguments: Mapping[str, Any]) -> editor.Client:
+        project = self._resolve_target(arguments["project"])
+        if not isinstance(project, editor.Client):
+            raise ToolFailure("wrong_target_type", "project must be an editor.Client handle")
+        return project
+
+    def _focused_compile(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project",), optional=("timeout",))
+        return self._editor_target(arguments).compile(timeout=arguments.get("timeout", 60.0))
+
+    def _focused_bob(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project",), optional=("options", "commands", "timeout"))
+        return self._editor_target(arguments).bob(
+            options=arguments.get("options"), commands=arguments.get("commands", ()),
+            timeout=arguments.get("timeout", 300.0))
+
     def _focused_build_and_run(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(
             arguments,
             required=("project",),
-            optional=("clean", "timeout", "required_capabilities"),
+            optional=("clean", "timeout", "required_capabilities", "focus", "client_id", "session_id"),
         )
         project = self._resolve_target(arguments["project"])
         if not isinstance(project, editor.Client):
@@ -1351,7 +1378,11 @@ class BridgeRuntime:
         if not isinstance(clean, bool):
             raise ToolFailure("invalid_clean", "clean must be boolean")
         method = project.clean_build_and_run if clean else project.build_and_run
-        return method(timeout=arguments.get("timeout", 60.0), required_capabilities=capabilities)
+        kwargs = {key: arguments[key] for key in ("client_id", "session_id", "focus") if key in arguments}
+        if clean and "focus" in kwargs:
+            raise ToolFailure("unsupported_parameter", "clean builds use the editor's native focus behavior; omit focus or use a regular build")
+        game = method(timeout=arguments.get("timeout", 60.0), required_capabilities=capabilities, **kwargs)
+        return {"engine": game, "build_result": project.last_command_result, "session": game.session_info()}
 
     def _focused_connect_engine(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(
@@ -1665,10 +1696,18 @@ class BridgeRuntime:
                 "Probe or launch the Defold Editor for an explicit absolute project path and return an editor handle.",
                 _object_schema({"project_path": _STRING, "start_if_needed": _BOOLEAN, "timeout": _NUMBER, "launcher": _STRING}, ("project_path",)), False, False, False,
             ),
+            "defold_compile": (
+                "Compile a Defold project", "Compile resources and Lua without launching. Requires Defold 1.13.2; returns structured completion and diagnostics.",
+                _object_schema({"project": _HANDLE_VALUE, "timeout": _NUMBER}, ("project",)), False, False, False,
+            ),
+            "defold_bob": (
+                "Build or bundle with Bob", "Run Bob through the editor using its session authentication. Requires Defold 1.13.2. Timeouts do not imply that work stopped; inspect before retrying.",
+                _object_schema({"project": _HANDLE_VALUE, "options": _OPEN_OBJECT, "commands": {"type": "array", "items": _STRING}, "timeout": _NUMBER}, ("project",)), False, False, False,
+            ),
             "defold_build_and_run": (
                 "Build and run a Defold project",
-                "Build an open project, run its debug engine, validate required capabilities, and return an engine handle.",
-                _object_schema({"project": _HANDLE_VALUE, "clean": _BOOLEAN, "timeout": _NUMBER, "required_capabilities": {"type": "array", "items": _STRING}}, ("project",)), False, False, False,
+                "Compile and run directly; return an engine handle, session ownership and build_result. Uses run on 1.13.2 and build on 1.13.1. Omitted focus uses false when supported.",
+                _object_schema({"project": _HANDLE_VALUE, "clean": _BOOLEAN, "focus": _BOOLEAN, "client_id": _STRING, "session_id": _STRING, "timeout": _NUMBER, "required_capabilities": {"type": "array", "items": _STRING}}, ("project",)), False, False, False,
             ),
             "defold_connect_engine": (
                 "Connect to a Defold engine",

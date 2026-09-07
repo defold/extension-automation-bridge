@@ -68,3 +68,54 @@ class SharedToolsTest(unittest.TestCase):
         result = self.runtime.call_tool('defold_session_info', {'engine': self.wire})
         self.assertFalse(result['data']['owns_engine'])
         self.assertFalse(result['data']['closed'])
+
+
+class EditorToolsTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = BridgeRuntime(ROOT)
+        self.project = editor.Client(ROOT, port=51336)
+        self.wire = serialize(self.project, self.runtime.handles)
+
+    def tearDown(self):
+        self.runtime.cleanup()
+
+    def test_build_returns_engine_ownership_and_structured_evidence(self):
+        game = engine.Client(54321)
+        issue = editor.BuildIssue('warning', 'check this', '/main.script',
+                                  editor.SourceRange(editor.SourcePosition(2, 1), editor.SourcePosition(2, 4)))
+        result = editor.BuildResult('run', 200, True, True, (issue,), 'http://localhost:54321', {})
+        self.project._last_command_result = result
+        with mock.patch.object(self.project, 'build_and_run', return_value=game) as build:
+            response = self.runtime.call_tool('defold_build_and_run', {'project': self.wire, 'focus': False})
+        self.assertTrue(response['ok'], response)
+        self.assertIn('$handle', response['data']['engine'])
+        self.assertEqual('http://localhost:54321', response['data']['build_result']['target_url'])
+        self.assertEqual(2, response['data']['build_result']['issues'][0]['range']['start']['line'])
+        self.assertFalse(build.call_args.kwargs['focus'])
+
+    def test_compile_and_bob_forward_without_fallback_or_retries(self):
+        for tool, method, arguments in (
+            ('defold_compile', 'compile', {}),
+            ('defold_bob', 'bob', {'options': {'platform': 'wasm-web'}, 'commands': ['build', 'bundle']}),
+        ):
+            with self.subTest(tool=tool), mock.patch.object(self.project, method, side_effect=TimeoutError('still running')) as call:
+                response = self.runtime.call_tool(tool, {'project': self.wire, **arguments})
+                self.assertFalse(response['ok'])
+                self.assertFalse(response['error']['retryable'])
+                self.assertEqual(1, call.call_count)
+
+    def test_version_requirement_and_build_failure_details_survive(self):
+        errors = [editor.UnsupportedOperationError('compile unavailable', minimum_version='1.13.2')]
+        issue = editor.BuildIssue('error', 'bad Lua', '/main.script',
+                                  editor.SourceRange(editor.SourcePosition(1, 0), editor.SourcePosition(1, 4)))
+        errors.append(editor.BuildError((issue,), result=editor.BuildResult('compile', 200, True, False, (issue,), None, {})))
+        for error in errors:
+            with self.subTest(error=type(error).__name__), mock.patch.object(self.project, 'compile', side_effect=error):
+                response = self.runtime.call_tool('defold_compile', {'project': self.wire})
+                details = response['error']['data']
+                if isinstance(error, editor.UnsupportedOperationError):
+                    self.assertEqual('1.13.2', details['minimum_version'])
+                    self.assertIn('supported from Defold 1.13.2', response['error']['message'])
+                else:
+                    self.assertFalse(details['result']['success'])
+                    self.assertEqual(4, details['result']['issues'][0]['range']['end']['character'])
