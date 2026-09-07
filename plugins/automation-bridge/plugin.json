@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "automation-bridge",
-  "version": "0.1.0+codex.20260907202354",
+  "version": "0.1.0+codex.20260907212807",
   "description": "Inspect and control Defold Editor projects and debug games through Automation Bridge.",
   "author": {
     "name": "Defold",

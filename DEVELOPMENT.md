@@ -87,6 +87,14 @@ still need the editor workflow. The ordinary command skips runtime tests when
 Defold is absent; `AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1` turns unavailable runtime
 setup into a failure. It never launches the editor implicitly.
 
+Concurrent native validation projects need different available
+`[profiler] remotery_port` settings in `game.project`. Start a new engine process
+after changing that setting. An occupied Remotery port causes profiler startup
+to fail and can freeze the tested 1.13.1 and 1.13.2 alpha engines on in-process
+reboot. The wrapper now reports missing profiler metadata instead of reading
+another game's default port. See `tests/MCP_VALIDATION.md` for the investigation
+and verified workaround; do not hide these failures by skipping runtime tests.
+
 Editor compatibility tests serve the versioned fixtures in `tests/fixtures`
 through local HTTP servers. They cover 1.13.1 command enums and acknowledgements,
 1.13.2 command paths and focus, compile/run, structured completion and errors,
