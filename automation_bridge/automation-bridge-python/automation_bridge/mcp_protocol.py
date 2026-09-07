@@ -427,7 +427,23 @@ class McpProtocol:
         if "cursor" in params and not isinstance(params["cursor"], str):
             raise ProtocolError(INVALID_PARAMS, "Invalid params")
         tools = self._runtime_descriptors("tool_descriptors", "tools")
-        return {"tools": tools, "ttlMs": 300_000, "cacheScope": "public"}
+        return {**self._page(tools, params.get("cursor"), "tools"), "ttlMs": 300_000, "cacheScope": "public"}
+
+    @staticmethod
+    def _page(items: list, cursor: Optional[str], kind: str) -> dict:
+        start = 0
+        if cursor is not None:
+            prefix = kind + ":"
+            if not cursor.startswith(prefix) or not cursor[len(prefix):].isascii() or not cursor[len(prefix):].isdigit():
+                raise ProtocolError(INVALID_PARAMS, "Invalid pagination cursor")
+            start = int(cursor[len(prefix):])
+            if start > len(items):
+                raise ProtocolError(INVALID_PARAMS, "Invalid pagination cursor")
+        page = items[start:start + 20]
+        result = {kind: page}
+        if start + len(page) < len(items):
+            result["nextCursor"] = kind + ":" + str(start + len(page))
+        return result
 
     def _call_tool(self, params: Dict[str, Any], request_id: Any = None) -> Dict[str, Any]:
         self._validate_keys(params, required=("name",), optional=("arguments", "_meta"))
@@ -498,7 +514,7 @@ class McpProtocol:
         if "cursor" in params and not isinstance(params["cursor"], str):
             raise ProtocolError(INVALID_PARAMS, "Invalid params")
         resources = self._runtime_descriptors("resource_descriptors", "resources")
-        return {"resources": resources, "ttlMs": 300_000, "cacheScope": "public"}
+        return {**self._page(resources, params.get("cursor"), "resources"), "ttlMs": 300_000, "cacheScope": "public"}
 
     def _read_resource(self, params: Dict[str, Any], modern: bool) -> Dict[str, Any]:
         self._validate_keys(params, required=("uri",), optional=("_meta",))

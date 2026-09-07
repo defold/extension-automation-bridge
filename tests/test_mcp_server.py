@@ -181,6 +181,9 @@ EXPECTED_CATALOG = _qualified_inventory(
 )
 
 EXPECTED_ADAPTATIONS = {
+    "automation_bridge.editor.Preview.render": {
+        "availability": "adapted", "adapter": "png_bytes_to_mcp_image",
+    },
     "automation_bridge.engine.Client.require": {
         "availability": "adapted",
         "adapter": "capabilities_array_to_varargs",
@@ -1016,11 +1019,11 @@ class RuntimeDescriptorAndCatalogTest(unittest.TestCase):
         self.assertTrue(all(item["path"] for item in sensitive))
 
     def test_catalog_pagination_is_complete_stable_and_non_overlapping(self):
-        expected = _catalog_items(self.runtime.catalog(limit=10_000))
+        expected = _catalog_items(self.runtime.catalog(limit=10_000, detail=True))
         actual = []
         cursor = 0
         while cursor is not None:
-            page = self.runtime.catalog(cursor=cursor, limit=17)
+            page = self.runtime.catalog(cursor=cursor, limit=17, detail=True)
             self.assertEqual(len(expected), page["total"])
             actual.extend(page["items"])
             cursor = page["next_cursor"]
@@ -1030,7 +1033,7 @@ class RuntimeDescriptorAndCatalogTest(unittest.TestCase):
         )
 
     def test_catalog_covers_every_documented_operational_member(self):
-        result = self.runtime.catalog(limit=10_000)
+        result = self.runtime.catalog(limit=10_000, detail=True)
         items = _catalog_items(result)
         by_qualified_name = {item["qualified_name"]: item for item in items}
         qualified = set(by_qualified_name)
@@ -1137,7 +1140,7 @@ class RuntimeDescriptorAndCatalogTest(unittest.TestCase):
                                 )
 
     def test_every_catalog_entry_has_a_resolvable_owner_and_callable_dispatcher(self):
-        items = _catalog_items(self.runtime.catalog(limit=10_000))
+        items = _catalog_items(self.runtime.catalog(limit=10_000, detail=True))
         executable = {
             item["qualified_name"]
             for item in items
@@ -1172,7 +1175,7 @@ class RuntimeDescriptorAndCatalogTest(unittest.TestCase):
                     inspect.signature(handler)
 
     def test_removed_and_unsafe_legacy_names_do_not_reappear_in_catalog(self):
-        items = _catalog_items(self.runtime.catalog(limit=10_000))
+        items = _catalog_items(self.runtime.catalog(limit=10_000, detail=True))
         paths = {item["qualified_name"] for item in items}
         leaked = sorted(
             path for path in paths if any(path.rsplit(".", 1)[-1] == name for name in REMOVED_API_NAMES)
@@ -1351,7 +1354,7 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
             open_project.return_value = fake_engine
             runtime = BridgeRuntime(project_root=ROOT)
             try:
-                items = _catalog_items(runtime.catalog(limit=10_000))
+                items = _catalog_items(runtime.catalog(limit=10_000, detail=True))
                 ids = {item["qualified_name"]: item["id"] for item in items}
                 opened = runtime.call_tool(
                     "automation_bridge_call",
@@ -1489,7 +1492,7 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
         fake_engine = FakeEngine()
         runtime = BridgeRuntime(project_root=ROOT)
         try:
-            items = _catalog_items(runtime.catalog(limit=10_000))
+            items = _catalog_items(runtime.catalog(limit=10_000, detail=True))
             ids = {item["qualified_name"]: item["id"] for item in items}
             registry = getattr(runtime, "handles", getattr(runtime, "handle_registry", None))
             self.assertIsNotNone(registry, "BridgeRuntime must expose its explicit handle registry")
@@ -1689,7 +1692,7 @@ class RuntimeSerializationAndDispatchTest(unittest.TestCase):
 
         runtime = BridgeRuntime(project_root=ROOT)
         try:
-            items = _catalog_items(runtime.catalog(limit=10_000))
+            items = _catalog_items(runtime.catalog(limit=10_000, detail=True))
             ids = {item["qualified_name"]: item["id"] for item in items}
             controller = FakeController()
             controller_wire = serialize(controller, runtime.handles)

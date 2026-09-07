@@ -381,3 +381,73 @@ class VisualToolsTest(unittest.TestCase):
             result = self.call('defold_screenshot', {'engine': self.wire})
         self.assertTrue(result['isError'])
         self.assertEqual(17, result['structuredContent']['error']['data']['receipt']['capture_id'])
+
+
+class DiscoveryTest(unittest.TestCase):
+    def test_summary_pages_and_detail_schemas_are_separate(self):
+        runtime = BridgeRuntime(ROOT)
+        first = runtime.call_tool('automation_bridge_catalog', {})['data']
+        self.assertEqual(20, len(first['items']))
+        self.assertEqual('python_wrapper', first['source'])
+        self.assertNotIn('arguments_schema', first['items'][0])
+        self.assertNotIn('signature', first['items'][0])
+        found = runtime.call_tool('automation_bridge_catalog', {'query': 'Client elements_page'})['data']['items']
+        operation = 'automation_bridge.engine.Client.elements_page'
+        self.assertIn(operation, [item['id'] for item in found])
+        detail = runtime.call_tool('automation_bridge_describe', {'operation': operation})['data']
+        self.assertIn('signature', detail)
+        self.assertFalse(detail['arguments_schema']['additionalProperties'])
+        self.assertEqual(500, detail['arguments_schema']['properties']['limit']['maximum'])
+        self.assertTrue(detail['arguments_schema']['properties']['cursor']['pattern'])
+        resource = json.loads(runtime.read_resource('automation-bridge://api/catalog')['contents'][0]['text'])
+        self.assertEqual(first, resource)
+        runtime.cleanup()
+
+    def test_protocol_tool_pages_are_complete_and_reject_bad_cursors(self):
+        from automation_bridge.mcp_protocol import McpProtocol, ProtocolError
+        runtime = BridgeRuntime(ROOT)
+        protocol = McpProtocol(runtime)
+        names, cursor = [], None
+        while True:
+            page = protocol._list_tools({} if cursor is None else {'cursor': cursor})
+            self.assertLessEqual(len(page['tools']), 20)
+            names.extend(item['name'] for item in page['tools'])
+            cursor = page.get('nextCursor')
+            if cursor is None:
+                break
+        self.assertEqual([item['name'] for item in runtime.tool_descriptors()], names)
+        for cursor in ('resources:1', 'tools:-1', 'tools:999999'):
+            with self.assertRaises(ProtocolError):
+                protocol._list_tools({'cursor': cursor})
+        runtime.cleanup()
+
+    def test_focused_schema_rejects_malformed_values_before_io(self):
+        runtime = BridgeRuntime(ROOT)
+        game = engine.Client(54321)
+        wire = serialize(game, runtime.handles)
+        for tool, method, arguments in (
+            ('defold_key', 'key', {'key': 'M', 'hold': True}),
+            ('defold_key', 'key', {'key': 'M', 'wait': 'typo'}),
+            ('defold_click', 'click', {'target': [1, 2, 3]}),
+            ('defold_screenshot', 'screenshot', {'wait': 'false'}),
+        ):
+            with self.subTest(tool=tool, arguments=arguments), mock.patch.object(game, method) as call:
+                response = runtime.call_tool(tool, {'engine': wire, **arguments})
+                self.assertEqual('invalid_arguments', response['error']['code'])
+                call.assert_not_called()
+        result = runtime.call_tool('automation_bridge_call', {'operation': {'bad': 'shape'}})
+        self.assertEqual('invalid_arguments', result['error']['code'])
+        runtime.cleanup()
+
+    def test_adapted_operation_descriptions_explain_json_arguments(self):
+        runtime = BridgeRuntime(ROOT)
+        for operation, parameter in (
+            ('automation_bridge.engine.Client.require', 'capabilities'),
+            ('automation_bridge.engine.Client.reboot', 'args'),
+            ('automation_bridge.engine.wait_until', 'operation'),
+            ('automation_bridge.engine.ProfilerRecording.abort', 'cause'),
+        ):
+            with self.subTest(operation=operation):
+                detail = runtime.call_tool('automation_bridge_describe', {'operation': operation})['data']
+                self.assertIn(parameter, detail['arguments_schema']['properties'])
+        runtime.cleanup()

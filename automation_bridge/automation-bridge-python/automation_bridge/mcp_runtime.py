@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from automation_bridge import editor, engine
 from automation_bridge.cancellation import check_cancelled, cancellable_sleep
 from automation_bridge.elements import Element
+from automation_bridge import mcp_schema
 from automation_bridge.gestures import GestureGenerator
 from automation_bridge.visual import VisualClient
 
@@ -521,7 +522,7 @@ class OperationSpec:
     read_only: bool = False
     destructive: bool = False
 
-    def catalog_item(self) -> JsonObject:
+    def catalog_item(self, *, detail: bool = True) -> JsonObject:
         result: JsonObject = {
             "id": self.id,
             "qualified_name": self.qualified_name,
@@ -541,6 +542,14 @@ class OperationSpec:
             result["unsupported_parameters"] = list(self.unsupported_parameters)
         if self.reason:
             result["reason"] = self.reason
+        if detail:
+            result["arguments_schema"] = mcp_schema.operation_arguments(self)
+            if self.adapter == "declarative_operation_predicate":
+                result["arguments_schema"] = _wait_schema()
+        else:
+            for key in ("signature", "qualified_name", "owner", "name", "member"):
+                result.pop(key, None)
+            result["description"] = self.description.split(". ", 1)[0][:180]
         return result
 
 
@@ -642,6 +651,10 @@ _PROPERTY_GROUPS = (
 
 
 _ADAPTATIONS: Dict[str, Dict[str, Any]] = {
+    "automation_bridge.editor.Preview.render": {
+        "availability": "adapted", "adapter": "png_bytes_to_mcp_image",
+        "reason": "PNG bytes become an MCP image block with structured size and hash evidence.",
+    },
     "automation_bridge.editor.Preferences.get": {
         "availability": "restricted",
         "reason": "Password preference values are never returned over MCP; all non-secret preferences remain readable.",
@@ -839,8 +852,15 @@ _STRING = {"type": "string"}
 _NUMBER = {"type": "number"}
 _BOOLEAN = {"type": "boolean"}
 _INTEGER = {"type": "integer"}
-_HANDLE_VALUE: JsonObject = {}
+_HANDLE_VALUE: JsonObject = mcp_schema.HANDLE
 _OPEN_OBJECT: JsonObject = {"type": "object", "additionalProperties": True}
+
+
+def _wait_schema() -> JsonObject:
+    return _object_schema({"operation": _STRING, "target": _HANDLE_VALUE, "arguments": _OPEN_OBJECT,
+                           "path": _STRING, "predicate": _object_schema({"operator": {"type": "string", "enum": ["truthy", "equals", "not_equals", "exists"]}, "value": {}}),
+                           "timeout": {"type": "number", "minimum": 0, "maximum": 300},
+                           "interval": {"type": "number", "minimum": 0, "maximum": 60}}, ("operation",))
 
 
 def _output_schema() -> JsonObject:
@@ -968,6 +988,8 @@ class BridgeRuntime:
             "automation_bridge_call": self._tool_call,
             "automation_bridge_session": self._tool_session,
             "automation_bridge_catalog": self._tool_catalog,
+            "automation_bridge_describe": self._tool_describe,
+            "defold_editor_capabilities": self._focused_editor_capabilities,
             "automation_bridge_destructive_call": self._tool_destructive_call,
             "automation_bridge_enter": self._tool_enter,
             "automation_bridge_exit": self._tool_exit,
@@ -1036,13 +1058,14 @@ class BridgeRuntime:
         self,
         query: Optional[str] = None,
         cursor: int = 0,
-        limit: int = 200,
+        limit: int = 20,
+        detail: bool = False,
     ) -> JsonObject:
         if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
             raise ToolFailure("invalid_cursor", "cursor must be a non-negative integer")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 10_000:
             raise ToolFailure("invalid_limit", "limit must be between 1 and 10000")
-        items = [spec.catalog_item() for spec in OPERATION_SPECS]
+        items = [spec.catalog_item(detail=detail) for spec in OPERATION_SPECS]
         if query is not None:
             if not isinstance(query, str):
                 raise ToolFailure("invalid_query", "query must be a string")
@@ -1050,13 +1073,13 @@ class BridgeRuntime:
             if needle:
                 items = [
                     item for item in items
-                    if needle in item["qualified_name"].casefold()
-                    or needle in item["description"].casefold()
+                    if all(word in (item["id"] + " " + self._operation_specs[item["id"]].description).casefold() for word in needle.split())
                 ]
         page = items[cursor:cursor + limit]
         next_cursor = cursor + len(page)
         return {
             "items": page,
+            "source": "python_wrapper",
             "total": len(items),
             "next_cursor": next_cursor if next_cursor < len(items) else None,
         }
@@ -1104,6 +1127,14 @@ class BridgeRuntime:
             if not isinstance(arguments, Mapping):
                 raise ToolFailure("invalid_arguments", "tool arguments must be an object")
             arguments = dict(arguments)
+            descriptor = next(tool for tool in self._tools if tool["name"] == name)
+            # Required/unknown fields retain the established structured errors.
+            self._expect_keys(arguments, required=descriptor["inputSchema"].get("required", ()),
+                              optional=tuple(descriptor["inputSchema"]["properties"]))
+            try:
+                mcp_schema.validate(arguments, descriptor["inputSchema"])
+            except ValueError as error:
+                raise ToolFailure("invalid_arguments", str(error)) from error
             session = arguments.pop("mcp_session", "default")
             if not isinstance(session, str) or not self._sessions.get(session):
                 raise ToolFailure("unknown_session", "MCP session is missing or closed")
@@ -1127,7 +1158,7 @@ class BridgeRuntime:
                 self._record_cleanup_error(request_id, error)
             read_only = next((tool["annotations"]["readOnlyHint"] for tool in self._tools if tool["name"] == name), False)
             if name in {"automation_bridge_call", "automation_bridge_destructive_call"} and isinstance(arguments, Mapping):
-                spec = self._operation_specs.get(arguments.get("operation"))
+                spec = self._operation_specs.get(arguments.get("operation")) if isinstance(arguments.get("operation"), str) else None
                 read_only = bool(spec and spec.read_only)
             failure = _exception_failure(error, read_only=read_only)
             return {"ok": False, "error": failure.as_dict()}
@@ -1316,8 +1347,16 @@ class BridgeRuntime:
         return self.catalog(
             query=arguments.get("query"),
             cursor=arguments.get("cursor", 0),
-            limit=arguments.get("limit", 200),
+            limit=arguments.get("limit", 20),
         )
+
+    def _tool_describe(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("operation",))
+        return self._spec(arguments["operation"]).catalog_item()
+
+    def _focused_editor_capabilities(self, arguments: Mapping[str, Any]) -> Any:
+        self._expect_keys(arguments, required=("project",), optional=("refresh",))
+        return {"source": "connected_editor", "commands": self._editor_target(arguments).commands.catalog(refresh=arguments.get("refresh", False))}
 
     def _tool_call(self, arguments: Mapping[str, Any]) -> Any:
         self._expect_keys(arguments, required=("operation",), optional=("target", "arguments"))
@@ -1572,18 +1611,10 @@ class BridgeRuntime:
         unknown = set(value) - _SELECTOR_KEYS
         if unknown:
             raise ToolFailure("invalid_selector", "selector contains unknown fields", {"fields": sorted(unknown)})
-        for key, item in value.items():
-            if key in {"enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive"}:
-                valid = isinstance(item, bool)
-            elif key in {"limit", "offset"}:
-                maximum = 500 if key == "limit" else 4294967295
-                valid = isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= maximum
-            elif key == "include":
-                valid = isinstance(item, str) or (isinstance(item, list) and all(isinstance(part, str) for part in item))
-            else:
-                valid = isinstance(item, str)
-            if not valid:
-                raise ToolFailure("invalid_selector", "invalid selector value", {"field": key})
+        try:
+            mcp_schema.validate(dict(value), mcp_schema.SELECTOR)
+        except ValueError as error:
+            raise ToolFailure("invalid_selector", str(error)) from error
         return dict(value)
 
     def _focused_open_project(self, arguments: Mapping[str, Any]) -> Any:
@@ -1963,13 +1994,7 @@ class BridgeRuntime:
         wait_predicate = _object_schema(
             {"operator": {"type": "string", "enum": ["truthy", "equals", "not_equals", "exists"]}, "value": _ANY_JSON}
         )
-        selector_schema = _object_schema({key: _STRING for key in sorted(_SELECTOR_KEYS)})
-        selector_schema["properties"].update({
-            **{key: _BOOLEAN for key in ("enabled", "has_bounds", "visible_and_enabled", "visible", "case_sensitive")},
-            "include": {"anyOf": [_STRING, {"type": "array", "items": _STRING}]},
-            "limit": {"type": "integer", "minimum": 0, "maximum": 500},
-            "offset": {"type": "integer", "minimum": 0, "maximum": 4294967295},
-        })
+        selector_schema = mcp_schema.SELECTOR
         modifiers_schema = {"anyOf": [_STRING, {"type": "array", "items": _STRING, "maxItems": 4}]}
         definitions = {
             "automation_bridge_session": (
@@ -1996,10 +2021,18 @@ class BridgeRuntime:
                 "Close the local engine client", "Release client resources while leaving the engine process running.",
                 _object_schema({"engine": _HANDLE_VALUE}, ("engine",)), False, False, True,
             ),
+            "automation_bridge_describe": (
+                "Describe one wrapper operation", "Load the full docstring, signature, JSON argument schema and restrictions for one operation id from automation_bridge_catalog.",
+                _object_schema({"operation": _STRING}, ("operation",)), True, False, True,
+            ),
+            "defold_editor_capabilities": (
+                "Discover connected editor commands", "Inspect commands and parameters advertised by this editor. This is separate from wrapper API discovery and game application contracts.",
+                _object_schema({"project": _HANDLE_VALUE, "refresh": _BOOLEAN}, ("project",)), True, False, True,
+            ),
             "automation_bridge_catalog": (
                 "Catalog Automation Bridge APIs",
-                "List the complete allowlisted public editor and engine API catalog, including signatures and MCP adaptations.",
-                _object_schema({"query": _STRING, "cursor": _INTEGER, "limit": _INTEGER}), True, False, True,
+                "Search small summary pages of the wrapper API (20 by default). Follow next_cursor and use automation_bridge_describe for full schemas. Editor and application capabilities have separate discovery tools.",
+                _object_schema({"query": _STRING, "cursor": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}), True, False, True,
             ),
             "automation_bridge_call": (
                 "Call an Automation Bridge API",
@@ -2082,22 +2115,22 @@ class BridgeRuntime:
             "defold_click": (
                 "Click a Defold target",
                 "Click an Element snapshot, element id, or screen point through the engine input queue.",
-                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "target": _ANY_JSON, "y": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "target")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "target": mcp_schema.TARGET, "y": _NUMBER, "wait": mcp_schema.WAIT, "visualize": _BOOLEAN, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "target")), False, False, False,
             ),
             "defold_drag": (
                 "Drag between Defold targets",
                 "Drag between stale-safe Element snapshots, element ids, or screen points.",
-                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "from_target": _ANY_JSON, "to_target": _ANY_JSON, "duration": _NUMBER, "wait": _ANY_JSON, "visualize": _BOOLEAN, "easing": _STRING, "hold_before": _NUMBER, "hold_after": _NUMBER, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "from_target", "to_target")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "from_target": mcp_schema.TARGET, "to_target": mcp_schema.TARGET, "duration": _NUMBER, "wait": mcp_schema.WAIT, "visualize": _BOOLEAN, "easing": _STRING, "hold_before": _NUMBER, "hold_after": _NUMBER, "device": _STRING, "pointer_id": _INTEGER, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "from_target", "to_target")), False, False, False,
             ),
             "defold_type_text": (
                 "Type text in Defold",
                 "Queue literal UTF-8 text input for a running Defold engine.",
-                _object_schema({"engine": _HANDLE_VALUE, "text": _STRING, "wait": _ANY_JSON, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "text")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "text": _STRING, "wait": mcp_schema.WAIT, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "text")), False, False, False,
             ),
             "defold_key": (
                 "Press a Defold key",
                 "Queue a validated special key input for a running Defold engine.",
-                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "key": _STRING, "hold": {"type": "number", "minimum": 0, "maximum": 60}, "wait": _ANY_JSON, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "key")), False, False, False,
+                _object_schema({"engine": _HANDLE_VALUE, "modifiers": modifiers_schema, "key": _STRING, "hold": {"type": "number", "minimum": 0, "maximum": 60}, "wait": mcp_schema.WAIT, "expected_scene_sequence": _INTEGER, "timeout": _NUMBER, "cancel_on_interrupt": _BOOLEAN, "flush_on_interrupt": _BOOLEAN}, ("engine", "key")), False, False, False,
             ),
             "defold_wait_for_element": (
                 "Wait for a Defold element",
@@ -2145,12 +2178,32 @@ class BridgeRuntime:
                 name, title, description, schema,
                 read_only=read_only, destructive=destructive, idempotent=idempotent,
             ))
+        build_result = _object_schema({"command": _STRING, "status": _INTEGER, "completed": _BOOLEAN,
+                                       "success": {"anyOf": [_BOOLEAN, {"type": "null"}]}, "issues": {"type": "array", "items": _OPEN_OBJECT},
+                                       "target_url": {"anyOf": [_STRING, {"type": "null"}]}, "raw": _OPEN_OBJECT},
+                                      ("command", "status", "completed", "success", "issues", "target_url", "raw"))
+        for descriptor in descriptors:
+            name = descriptor["name"]
+            props = descriptor["inputSchema"]["properties"]
+            if name == "automation_bridge_wait":
+                descriptor["inputSchema"] = _wait_schema()
+                descriptor["inputSchema"]["properties"]["mcp_session"] = _STRING
+            if name in {"defold_compile", "defold_bob"}:
+                descriptor["outputSchema"]["properties"]["data"] = build_result
+            elif name == "defold_build_and_run":
+                descriptor["outputSchema"]["properties"]["data"] = _object_schema({"engine": _HANDLE_VALUE, "build_result": {"anyOf": [build_result, {"type": "null"}]}, "session": _OPEN_OBJECT}, ("engine", "build_result", "session"))
+            elif name == "defold_find_elements":
+                descriptor["outputSchema"]["properties"]["data"] = _object_schema({
+                    "elements": {"type": "array", "items": mcp_schema.ELEMENT}, "matched": _INTEGER, "total": _INTEGER,
+                    "count": _INTEGER, "offset": _INTEGER, "next_cursor": {"anyOf": [_STRING, {"type": "null"}]},
+                    "truncated": _BOOLEAN, "scene_sequence": _INTEGER, "engine_frame": _INTEGER, "raw": _OPEN_OBJECT,
+                }, ("elements", "matched", "next_cursor", "scene_sequence", "engine_frame"))
         return sorted(descriptors, key=lambda item: item["name"])
 
     @staticmethod
     def _build_resource_descriptors() -> List[JsonObject]:
         resources = (
-            ("automation-bridge://api/catalog", "api-catalog", "Automation Bridge API catalog", "Every allowlisted operation, signature, and MCP adaptation.", "application/json"),
+            ("automation-bridge://api/catalog", "api-catalog", "Automation Bridge API catalog", "First summary page of the wrapper API; continue through automation_bridge_catalog and load schemas with automation_bridge_describe.", "application/json"),
             ("automation-bridge://api/preferences", "preference-catalog", "Defold preference catalog", "Complete generated Defold preference metadata without preference values.", "application/json"),
             ("automation-bridge://docs/best-practices", "best-practices", "Automation Bridge best practices", "Dependency-free Python examples and synchronization guidance.", "text/x-python"),
             ("automation-bridge://docs/plugin", "plugin-guide", "Automation Bridge plugin guide", "Installation, portability, API, and validation guide.", "text/markdown"),
@@ -2180,7 +2233,7 @@ class BridgeRuntime:
             raise KeyError(uri)
         mime = next(item["mimeType"] for item in self._resources if item["uri"] == uri)
         if uri == "automation-bridge://api/catalog":
-            text = json.dumps(self.catalog(limit=10_000), sort_keys=True, indent=2)
+            text = json.dumps(self.catalog(), sort_keys=True, indent=2)
         elif uri == "automation-bridge://api/preferences":
             from automation_bridge._preferences_catalog import CATALOG
 
