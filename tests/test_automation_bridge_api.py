@@ -168,6 +168,41 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_editor_discovery_accepts_individual_command_paths(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = {"paths": {
+            "/command/run": {"post": {"summary": "Compile and launch", "parameters": [
+                {"name": "focus", "in": "query", "schema": {"type": "boolean", "default": True}},
+            ]}},
+            "/command/compile": {"post": {"summary": "Compile without launching"}},
+            "/command/documentation": {"post": {}},
+        }}
+        self.assertEqual(["compile", "run"], [item.name for item in project.commands.catalog()])
+        self.assertTrue(project.commands.supports("run", parameter="focus"))
+        self.assertFalse(project.commands.supports("compile", parameter="focus"))
+        self.assertFalse(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("documentation"))
+        self.assertEqual("Compile and launch", project._require_command("run").summary)
+        self.assertEqual("/command/compile", project._require_command("compile").path)
+
+    def test_editor_discovery_preserves_legacy_commands_and_version_guidance(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        self.assertTrue(project.commands.supports("build"))
+        self.assertFalse(project.commands.supports("build", parameter="focus"))
+        for name in ("compile", "run"):
+            with self.subTest(name=name), self.assertRaisesRegex(editor.UnsupportedOperationError, "supported from Defold 1.13.2") as error:
+                project._require_command(name)
+            self.assertEqual("1.13.2", error.exception.minimum_version)
+
+    def test_editor_discovery_refreshes_without_executing_commands(self):
+        project = EditorApiClient(".", port=12345)
+        project._openapi_document = EDITOR_OPENAPI
+        with mock.patch("automation_bridge.editor.request_json", return_value=(200, {"paths": {"/command/compile": {"post": {}}}})) as request:
+            self.assertFalse(project.commands.supports("compile"))
+            self.assertEqual(["compile"], [item.name for item in project.commands.catalog(refresh=True)])
+        request.assert_called_once_with(project.base_url + "/openapi.json", timeout=10.0)
+
     def test_required_runtime_does_not_silently_skip_missing_editor(self):
         with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "1"}):
             with self.assertRaisesRegex(RuntimeError, "missing editor"):
@@ -1107,7 +1142,7 @@ class EngineClientUnitTest(unittest.TestCase):
 
         parameters = EDITOR_OPENAPI["paths"]["/command/{command}"]["post"]["parameters"]
         advertised = set(parameters[0]["schema"]["enum"])
-        self.assertEqual(advertised, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
+        self.assertEqual(advertised | {"compile", "run"}, editor._SUPPORTED_COMMANDS | editor._EXCLUDED_COMMANDS)
         self.assertFalse(editor._SUPPORTED_COMMANDS & editor._EXCLUDED_COMMANDS)
         self.assertEqual({("/eval", "post")}, editor._EXCLUDED_PATHS)
         advertised_paths = {

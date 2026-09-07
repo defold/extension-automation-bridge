@@ -331,6 +331,13 @@ for preference in project.preferences.list(prefix="code"):
 
 ## Capabilities
 
+Editor command discovery supports Defold 1.13.1's command enum and 1.13.2's
+individual OpenAPI paths. Use `project.commands.catalog()` for descriptions and
+parameter schemas, and `project.commands.supports("run", parameter="focus")`
+to probe support. Pass `refresh=True` to `catalog()` after capabilities change.
+New-feature `editor.UnsupportedOperationError` messages identify Defold 1.13.2
+as the minimum version; their `minimum_version` attribute is available to hosts.
+
 Declare mandatory capabilities during bootstrap or later with `require()`:
 
 ```python

@@ -45,7 +45,7 @@ _ENGINE_SERVICE_PORT_PATTERNS = (
 )
 _REMOTERY_URL_PATTERN = re.compile(r"Initialized Remotery \((ws://[^)\s]+)\)")
 _SUPPORTED_COMMANDS = frozenset({
-    "build", "clean-build", "build-html5", "fetch-libraries", "hot-reload",
+    "build", "run", "compile", "clean-build", "build-html5", "fetch-libraries", "hot-reload",
     "rebundle", "reload-extensions", "reload-stylesheets", "debugger-start",
     "debugger-stop", "debugger-break", "debugger-continue", "debugger-detach",
     "debugger-step-into", "debugger-step-out", "debugger-step-over",
@@ -66,6 +66,7 @@ _EXCLUDED_COMMANDS = frozenset({
     "show-curve-editor", "toggle-pane-bottom", "toggle-pane-left", "toggle-pane-right",
 })
 _EXCLUDED_PATHS = frozenset({("/eval", "post")})
+_COMMAND_MINIMUM_VERSIONS = {"compile": "1.13.2", "run": "1.13.2"}
 
 
 Error = AutomationBridgeError
@@ -81,6 +82,12 @@ class LaunchError(Error):
 
 class UnsupportedOperationError(Error):
     """Raised when the connected editor does not advertise an operation."""
+
+    def __init__(self, message: str, *, minimum_version: Optional[str] = None):
+        self.minimum_version = minimum_version
+        if minimum_version is not None:
+            message += f"; supported from Defold {minimum_version}. Upgrade the connected editor to use this feature"
+        super().__init__(message)
 
 
 class CommandError(Error):
@@ -472,9 +479,43 @@ class Installation:
     last_launched_at: str
 
 
+@dataclass(frozen=True)
+class CommandInfo:
+    """An advertised editor command supported by this wrapper.
+
+    ``parameters`` retains OpenAPI parameter descriptions and schemas. Legacy
+    command-enum metadata is normalized to a concrete ``path``; UI-only commands
+    outside this wrapper's supported surface are excluded from discovery.
+    """
+
+    name: str
+    path: str
+    summary: str
+    description: str
+    parameters: tuple[Mapping[str, Any], ...]
+    raw: Mapping[str, Any]
+
+
 class Commands:
     def __init__(self, client: "Client"):
         self._client = client
+
+    def catalog(self, *, refresh: bool = False) -> tuple[CommandInfo, ...]:
+        """List supported commands from either editor OpenAPI format.
+
+        The first call reads OpenAPI; later calls reuse it. Pass ``refresh=True``
+        after editor capabilities change. Discovery does not execute commands.
+        """
+        if refresh:
+            self._client._check_connection(timeout=10.0)
+        return tuple(info for name in sorted(_SUPPORTED_COMMANDS) if (info := self._client._command_info(name)) is not None)
+
+    def supports(self, command: str, *, parameter: Optional[str] = None) -> bool:
+        """Check advertisement of a supported command or one of its query parameters."""
+        info = self._client._command_info(command)
+        return info is not None and (parameter is None or any(
+            item.get("name") == parameter and item.get("in") == "query" for item in info.parameters
+        ))
 
     def fetch_libraries(self, timeout: float = 60.0) -> FetchLibrariesResult:
         status, response = self._client._json_command("fetch-libraries", timeout)
@@ -956,16 +997,42 @@ class Client:
             raise UnsupportedOperationError(f"editor does not advertise {method.upper()} {path}")
         return operation
 
-    def _require_command(self, command: str) -> None:
-        operation = self._require_operation("/command/{command}", "post")
-        names = set()
-        for parameter in operation.get("parameters", ()):
-            if isinstance(parameter, Mapping) and parameter.get("name") == "command":
-                schema = parameter.get("schema", {})
-                if isinstance(schema, Mapping):
-                    names.update(str(value) for value in schema.get("enum", ()))
-        if command not in names:
-            raise UnsupportedOperationError(f"editor does not advertise command {command!r}")
+    def _command_info(self, command: str) -> Optional[CommandInfo]:
+        if not isinstance(command, str) or command not in _SUPPORTED_COMMANDS:
+            return None
+        paths = self._openapi().get("paths", {})
+        path = f"/command/{command}"
+        path_item = paths.get(path, {})
+        operation = path_item.get("post") if isinstance(path_item, Mapping) else None
+        if not isinstance(operation, Mapping):
+            path_item = paths.get("/command/{command}", {})
+            operation = path_item.get("post") if isinstance(path_item, Mapping) else None
+            if not isinstance(operation, Mapping):
+                return None
+            advertised = any(
+                isinstance(item, Mapping) and item.get("name") == "command"
+                and isinstance(item.get("schema"), Mapping)
+                and command in item["schema"].get("enum", ())
+                for item in (*path_item.get("parameters", ()), *operation.get("parameters", ()))
+            )
+            if not advertised:
+                return None
+        # Operation-level declarations override parameters shared by a path.
+        parameters = {
+            (item.get("name"), item.get("in")): dict(item)
+            for item in (*path_item.get("parameters", ()), *operation.get("parameters", ()))
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str) and item.get("name") != "command"
+        }
+        return CommandInfo(command, path, str(operation.get("summary", "")), str(operation.get("description", "")), tuple(parameters.values()), dict(operation))
+
+    def _require_command(self, command: str) -> CommandInfo:
+        info = self._command_info(command)
+        if info is None:
+            raise UnsupportedOperationError(
+                f"editor does not advertise supported command {command!r}",
+                minimum_version=_COMMAND_MINIMUM_VERSIONS.get(command),
+            )
+        return info
 
     def _empty_command(self, command: str, timeout: float) -> None:
         check_cancelled()
@@ -1517,6 +1584,7 @@ __all__ = [
     "BuildIssue",
     "Client",
     "CommandError",
+    "CommandInfo",
     "Commands",
     "Console",
     "ConsoleRegion",
