@@ -749,3 +749,9 @@ them from the extension repository root with:
 PYTHONPATH=automation_bridge/automation-bridge-python \
 python3 -m unittest tests.test_automation_bridge_api tests.test_tooling
 ```
+
+CI explicitly runs the Python/tooling unit classes on Linux, macOS and Windows
+with Python 3.10 and 3.14. The complete suite also exercises a running Defold
+sample project. Set `AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1` for release checks so a
+missing editor/engine causes a failure instead of skipping runtime coverage.
+See the source repository's `DEVELOPMENT.md` for unit-only and runtime commands.

@@ -421,11 +421,12 @@ class InputController:
         if receipt is not None:
             if receipt.state in {"cancelled", "failed"}:
                 raise InputExecutionError(receipt)
-            if state == "accepted" and receipt.state in {"accepted", "started", "released"}:
-                return receipt
         deadline = time.monotonic() + max(0.0, timeout)
         last = receipt
         try:
+            check_cancelled()
+            if receipt is not None and state == "accepted" and receipt.state in {"accepted", "started", "released"}:
+                return receipt
             while True:
                 check_cancelled()
                 if last is None or last.state == "accepted" or state == "released":

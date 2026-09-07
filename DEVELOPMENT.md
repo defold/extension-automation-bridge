@@ -64,3 +64,38 @@ Run the dependency-free suite from the repository root:
 ```sh
 PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling
 ```
+
+CI runs the Python and tooling tests explicitly on Linux, macOS, and Windows
+with Python 3.10 and 3.14, independently of the native Bob build. For a local run
+that never contacts an editor:
+
+```sh
+PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api.EngineClientUnitTest tests.test_automation_bridge_api.EditorDiscoveryUnitTest tests.test_tooling
+```
+
+Before merging changes to the shared protocol, open this sample project in
+Defold and run the complete suite with a required runtime:
+
+```sh
+AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1 PYTHONPATH=automation_bridge/automation-bridge-python python3 -m unittest tests.test_automation_bridge_api tests.test_tooling
+```
+
+The suite reuses the editor, builds the sample, and closes engines it built.
+`AUTOMATION_BRIDGE_ENGINE_PORT` can select an already built sample engine; that
+process is borrowed and remains running after teardown. Editor-specific tests
+still need the editor workflow. The ordinary command skips runtime tests when
+Defold is absent; `AUTOMATION_BRIDGE_REQUIRE_RUNTIME=1` turns unavailable runtime
+setup into a failure. It never launches the editor implicitly.
+
+Runtime checks cover pagination metadata and malformed values, built/borrowed
+clients, cancellation release, competing client/session identities, native lease
+expiry, and application contracts. The sample enables `test_contracts = 1` to
+load the bounded Lua contract fixtures in `tests/application_contracts.lua`;
+dependent projects do not need this test setting. Use short leases or explicitly
+cancel held input instead of waiting out a maximum-duration operation.
+
+Merge/gesture tests use the fixture's `sample.arrange_items` command before
+selecting targets. It separates and stops existing items outside the spawn
+button's hit area; random placement can otherwise turn a drag into another spawn
+or place targets on top of each other. Input delivery still uses native receipts
+and the normal gameplay merge path.

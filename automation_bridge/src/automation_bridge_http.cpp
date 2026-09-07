@@ -5,6 +5,7 @@
 #if defined(DM_DEBUG)
 
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <string.h>
 
@@ -551,8 +552,9 @@ namespace dmAutomationBridge
         }
 
         char* end = 0;
+        errno = 0;
         unsigned long parsed = strtoul(text, &end, 10);
-        if (!end || *end != 0 || parsed == 0 || parsed > (unsigned long)max_value)
+        if (errno == ERANGE || !end || *end != 0 || parsed == 0 || parsed > (unsigned long)max_value)
         {
             return false;
         }
@@ -569,8 +571,9 @@ namespace dmAutomationBridge
             return false;
         }
         char* end = 0;
+        errno = 0;
         unsigned long parsed = strtoul(text, &end, 10);
-        if (!end || *end != 0 || parsed > (unsigned long)max_value)
+        if (errno == ERANGE || !end || *end != 0 || parsed > (unsigned long)max_value)
         {
             return false;
         }
@@ -587,8 +590,9 @@ namespace dmAutomationBridge
             return false;
         }
         char* end = 0;
+        errno = 0;
         unsigned long long parsed = strtoull(text, &end, 10);
-        if (!end || *end != 0 || parsed > max_value || (!allow_zero && parsed == 0))
+        if (errno == ERANGE || !end || *end != 0 || parsed > max_value || (!allow_zero && parsed == 0))
         {
             return false;
         }

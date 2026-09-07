@@ -197,6 +197,9 @@ function init(self)
 			schema = { type = "object", properties = { request_id = { type = "string" } } },
 		})
 		publish_automation_state()
+		if sys.get_config_int("automation_bridge.test_contracts", 0) == 1 then
+			require("tests.application_contracts").register(function() return items end, item_bounds)
+		end
 	end
 end
 

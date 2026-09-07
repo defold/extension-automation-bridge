@@ -168,6 +168,22 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_required_runtime_does_not_silently_skip_missing_editor(self):
+        with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "missing editor"):
+                AutomationBridgeApiTest.runtime_unavailable("missing editor")
+        with mock.patch.dict(os.environ, {"AUTOMATION_BRIDGE_REQUIRE_RUNTIME": "0"}):
+            with self.assertRaises(unittest.SkipTest):
+                AutomationBridgeApiTest.runtime_unavailable("missing editor")
+
+    def test_runtime_teardown_only_terminates_owned_engine(self):
+        for owned in (True, False):
+            bridge = mock.Mock()
+            with self.subTest(owned=owned), mock.patch.object(AutomationBridgeApiTest, "bridge", bridge, create=True), mock.patch.object(AutomationBridgeApiTest, "_owns_runtime", owned, create=True):
+                AutomationBridgeApiTest.close_bridge()
+            self.assertEqual(int(owned), bridge.close_engine.call_count)
+            self.assertEqual(int(not owned), bridge.close.call_count)
+
     def test_application_catalog_retains_contracts_and_pagination(self):
         bridge = EngineClient(12345)
         bridge._last_health = {"capabilities": ["application.catalog"]}
@@ -259,6 +275,16 @@ class EngineClientUnitTest(unittest.TestCase):
                 bridge.input.wait(42)
         self.assertEqual(["/input/cancel"], [path for _, path, _ in bridge.api_requests])
         self.assertTrue(bridge.api_requests[0][2]["release"])
+
+    def test_cancelled_accepted_receipt_wait_honors_cleanup_option(self):
+        for cleanup in (True, False):
+            token = engine.CancellationToken()
+            bridge = FakeInputClient()
+            with self.subTest(cleanup=cleanup), self.assertRaises(engine.OperationCancelled):
+                with engine.cancellation_scope(token):
+                    token.cancel()
+                    bridge.input.wait({"input_id": 42, "state": "accepted"}, state="accepted", cancel_on_interrupt=cleanup)
+            self.assertEqual(["/input/cancel"] if cleanup else [], [path for _, path, _ in bridge.api_requests])
 
     def test_client_scope_releases_its_input_when_scene_wait_is_cancelled(self):
         bridge = FakeInputClient()
@@ -3512,9 +3538,16 @@ class AutomationBridgeApiTest(unittest.TestCase):
     SPRITE_COUNTER_NAME = "Sprite"
 
     @classmethod
+    def runtime_unavailable(cls, message):
+        if os.environ.get("AUTOMATION_BRIDGE_REQUIRE_RUNTIME") == "1":
+            raise RuntimeError(message)
+        raise unittest.SkipTest(message)
+
+    @classmethod
     def setUpClass(cls):
         cls.editor = None
         cls.bridge = None
+        cls._owns_runtime = False
         port = os.environ.get("AUTOMATION_BRIDGE_ENGINE_PORT")
         if port:
             remotery_url = os.environ.get("AUTOMATION_BRIDGE_REMOTERY_URL")
@@ -3526,12 +3559,12 @@ class AutomationBridgeApiTest(unittest.TestCase):
             return
 
         if not (ROOT / ".internal" / "editor.port").is_file():
-            raise unittest.SkipTest("Defold editor port file is missing")
+            cls.runtime_unavailable("Defold editor port file is missing")
 
         try:
             cls.editor = editor.open_project(ROOT, start_if_needed=False)
         except (FileNotFoundError, editor.NotRunningError) as exc:
-            raise unittest.SkipTest(str(exc)) from exc
+            cls.runtime_unavailable(str(exc))
 
     @classmethod
     def close_bridge(cls):
@@ -3539,7 +3572,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
             return
         bridge = cls.bridge
         cls.bridge = None
-        bridge.close_engine()
+        if cls._owns_runtime:
+            bridge.close_engine()
+        else:
+            bridge.close()
 
     @classmethod
     def tearDownClass(cls):
@@ -3558,7 +3594,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual(1, second.offset)
         self.assertNotEqual(first.elements[0].logical_id, second.elements[0].logical_id)
         self.assertGreaterEqual(second.engine_frame, first.engine_frame)
-        for params in ({"limit": "invalid"}, {"limit": 501}, {"cursor": "invalid"}, {"offset": -1}):
+        for params in ({"limit": "invalid"}, {"limit": 501}, {"cursor": "invalid"}, {"offset": -1}, {"offset": "9" * 30}, {"cursor": "9" * 30}):
             with self.subTest(params=params), self.assertRaises(AutomationBridgeApiError) as error:
                 self.bridge.request("GET", "/elements", params=params)
             self.assertEqual(400, error.exception.status)
@@ -3583,7 +3619,30 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 self.bridge.request("GET", "/application/catalog", params=params)
             self.assertEqual(400, error.exception.status)
 
+    def test_application_contract_validation_and_replacement_are_atomic(self):
+        self.ensure_running_bridge()
+        checks = self.bridge.state("sample.contract_checks").value["rejected"]
+        self.assertEqual(13, len(checks))
+        self.assertTrue(all(checks), checks)
+        future = self.bridge.application_catalog(kind="state", name="sample.future")
+        self.assertEqual("Replacement declaration", future.entries[0].description)
+        self.assertIs(False, future.entries[0].schema)
+        self.assertEqual(0, len(self.bridge.states(name="sample.future")["states"]))
+        undocumented = self.bridge.application_catalog(kind="command", name="sample.catalog_probe")
+        self.assertEqual({}, undocumented.entries[0].contract)
+        self.assertEqual({"available": True}, self.bridge.command("sample.catalog_probe")["result"])
+        before = self.bridge.application_catalog().revision
+        result = self.bridge.command("sample.catalog_reject")
+        self.assertTrue(result["result"]["rejected"])
+        self.assertEqual(before, self.bridge.application_catalog().revision)
+
     def test_session_ownership_and_detach_leave_engine_available(self):
+        if self.editor is not None:
+            self.bridge = self.editor.build_and_run(timeout=20, client_id="owner", session_id="lifecycle-test")
+            self.__class__.bridge = self.bridge
+            self.__class__._owns_runtime = True
+            self.assertTrue(self.bridge.owns_engine)
+            self.assertEqual("lifecycle-test", self.bridge.session_info()["session_id"])
         self.ensure_running_bridge()
         attached = engine.connect(self.bridge.port, client_id="observer", session_id="detach-test")
         self.assertFalse(attached.owns_engine)
@@ -3607,6 +3666,46 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertLess(receipt["actual_duration"], 4)
         self.assertEqual("released", self.bridge.key("SPACE", wait="released").state)
 
+    def test_competing_clients_preserve_ownership_and_allow_observation(self):
+        self.ensure_running_bridge()
+        # Exercise both halves of the native identity pair.
+        for client_id, session_id in ((self.bridge.client_id, "competing-session"), ("competing-client", self.bridge.session_id)):
+            with self.subTest(client_id=client_id, session_id=session_id):
+                with engine.connect(self.bridge.port, client_id=client_id, session_id=session_id) as observer:
+                    held = self.bridge.key("SPACE", hold=5, wait="started")
+                    try:
+                        self.assertGreater(observer.elements_page(limit=0).matched, 0)
+                        for mutation in (lambda: observer.key("SPACE"), lambda: observer.input.cancel(held.input_id), lambda: observer.input.flush()):
+                            with self.assertRaises(AutomationBridgeApiError) as error:
+                                mutation()
+                            self.assertEqual("input_controller_busy", error.exception.code)
+                            self.assertEqual(409, error.exception.status)
+                        self.assertEqual("started", self.bridge.input.status(held.input_id).state)
+                    finally:
+                        self.bridge.input.flush()
+                    wait_until(lambda: self.bridge.input.status(held.input_id), predicate=lambda item: item.state == "cancelled", timeout=2)
+
+    def test_native_lease_expiry_allows_another_client_to_acquire_control(self):
+        self.ensure_running_bridge()
+        self.bridge.input.configure(lease=0.2)
+
+        def acquire(client):
+            try:
+                return client.input.configure(lease=0.3)
+            except AutomationBridgeApiError as exc:
+                if exc.code != "input_controller_busy":
+                    raise
+                return None
+
+        try:
+            with engine.connect(self.bridge.port, client_id="lease-successor", session_id="lease-test") as successor:
+                wait_until(lambda: acquire(successor), timeout=2, interval=0.01)
+                with self.assertRaises(AutomationBridgeApiError) as error:
+                    self.bridge.input.configure()
+                self.assertEqual("input_controller_busy", error.exception.code)
+        finally:
+            wait_until(lambda: acquire(self.bridge), timeout=2, interval=0.01)
+
     def test_automation_bridge_api_end_to_end(self):
         previous_port = None
         run_count = 1 if self.editor is None else 2
@@ -3615,6 +3714,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
             if self.editor is not None:
                 self.bridge = self.editor.build_and_run(timeout=20)
                 self.__class__.bridge = self.bridge
+                self.__class__._owns_runtime = True
                 self.bridge.wait_ready()
                 if previous_port is not None:
                     self.assertNotEqual(previous_port, self.bridge.port)
@@ -3718,6 +3818,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         before = self.label_count("L1")
         self.bridge.click(spawner)
         wait_until(lambda: self.label_count("L1") > before, timeout=2, message="circular-drag item missing")
+        self.arrange_items()
         item_label = self.bridge.element(type="labelc", text="L1", visible=True)
         item = self.bridge.parent(item_label)
         center_x = float(item.center["x"])
@@ -3927,9 +4028,10 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.bridge.wait_ready()
             return
         if self.editor is None:
-            raise unittest.SkipTest("no Automation Bridge engine or Defold editor is available")
+            self.runtime_unavailable("no Automation Bridge engine or Defold editor is available")
         self.bridge = self.editor.build_and_run(timeout=20)
         self.__class__.bridge = self.bridge
+        self.__class__._owns_runtime = True
         self.bridge.wait_ready()
 
     def supports_capability(self, capability):
@@ -4327,6 +4429,8 @@ class AutomationBridgeApiTest(unittest.TestCase):
         return self.bridge.count(type="labelc", text=label)
 
     def parents_for_label(self, label):
+        self.arrange_items()
+
         def resolve_parents():
             parents = []
             elements = self.bridge.elements(type="labelc", text=label, limit=100)
@@ -4345,6 +4449,12 @@ class AutomationBridgeApiTest(unittest.TestCase):
             message=f"missing pair for {label}: {self.item_labels()}",
         )
         return parents
+
+    def arrange_items(self):
+        result = self.bridge.command("sample.arrange_items")
+        self.assertEqual("completed", result["state"], result)
+        self.bridge.wait_frames(1)
+        self.assertEqual(len(self.item_labels()), result["result"]["arranged"])
 
 
 class _ClientCloseFailure:
