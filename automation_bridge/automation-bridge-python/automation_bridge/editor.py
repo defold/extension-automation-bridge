@@ -25,6 +25,7 @@ from typing import Any, Iterator, Mapping, Optional, Sequence, TYPE_CHECKING, Un
 from .client import AutomationBridgeError, HttpError, request_json, request_raw
 from .preferences import PreferenceKey, Preferences
 from .waits import WaitTimeoutError, wait_until
+from .diagnostics import DiagnosticCheck, DoctorReport
 
 if TYPE_CHECKING:
     from .client import Client as EngineClient
@@ -247,6 +248,25 @@ def _automation_bridge_archive_path(project_root: Path, dependency_url: str) -> 
             f"Defold reported the dependency fetched, but its archive is missing from {library_directory}"
         )
     return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+
+def _read_project_configuration(root: Path) -> configparser.ConfigParser:
+    configuration = configparser.ConfigParser(interpolation=None)
+    try:
+        configuration.read_string((root / "game.project").read_text(encoding="utf-8"))
+    except configparser.Error as exc:
+        raise ValueError(f"invalid game.project: {exc}") from exc
+    return configuration
+
+
+def _bridge_dependency(configuration: configparser.ConfigParser) -> str:
+    values = configuration.items("project") if configuration.has_section("project") else ()
+    dependencies = [value.strip() for key, value in values if key.startswith("dependencies#") and _is_automation_bridge_dependency(value.strip())]
+    if not dependencies:
+        raise AutomationBridgeUpdateError("Automation Bridge dependency is missing; configure one dependency")
+    if len(dependencies) != 1:
+        raise AutomationBridgeUpdateError("Automation Bridge dependency is ambiguous; configure exactly one dependency")
+    return dependencies[0]
 
 
 def _replace_python_wrapper(archive_path: Path, destination: Path) -> None:
@@ -1378,6 +1398,41 @@ def is_running(root: Union[str, Path] = ".", *, timeout: float = 1.0) -> bool:
         return False
 
 
+def doctor(
+    project_path: Union[str, Path] = ".",
+    *,
+    required_capabilities: Sequence[str] = (),
+    timeout: float = 2.0,
+) -> DoctorReport:
+    """Inspect setup, versions, capabilities and connections without launching.
+
+    ``timeout`` bounds each network probe. No build, install, project edit,
+    input acquisition, background log collector or cache write is performed.
+    Inspect ``report.checks`` for actionable failures, or serialize with
+    ``report.as_dict()``. ``ready`` requires a compatible running engine.
+    """
+    from .diagnostics import inspect_project
+    return inspect_project(project_path, required_capabilities=required_capabilities, timeout=timeout)
+
+
+def install_python(project_path: Union[str, Path] = ".") -> Path:
+    """Seed the project's Python wrapper from its already-fetched dependency.
+
+    No editor or network connection is required. Fetch Libraries first, then
+    run this helper from an extension checkout or the standalone install.py.
+    It atomically replaces the complete managed automation-bridge-python
+    directory; keep project scripts elsewhere and restart Python afterward.
+    The dependency URL and other project settings remain unchanged.
+    """
+    root = Path(project_path).expanduser().resolve()
+    dependency = _bridge_dependency(_read_project_configuration(root))
+    destination = root / _AUTOMATION_BRIDGE_PYTHON_DIRECTORY
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise AutomationBridgeUpdateError(f"refusing to replace non-directory Python wrapper path: {destination}")
+    _replace_python_wrapper(_automation_bridge_archive_path(root, dependency), destination)
+    return destination
+
+
 def open_project(
     root: Union[str, Path] = ".",
     *,
@@ -1431,6 +1486,8 @@ __all__ = [
     "ConsoleSnapshot",
     "ConsoleStream",
     "Debugger",
+    "DiagnosticCheck",
+    "DoctorReport",
     "Error",
     "FetchLibrariesResult",
     "HttpError",
@@ -1448,6 +1505,8 @@ __all__ = [
     "SourceRange",
     "UnsupportedOperationError",
     "installation_registry_path",
+    "install_python",
+    "doctor",
     "installations",
     "is_running",
     "latest_installation",

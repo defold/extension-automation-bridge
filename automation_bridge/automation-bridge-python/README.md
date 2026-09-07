@@ -12,6 +12,21 @@ docstrings for details.
 
 ## Install or update Automation Bridge
 
+For initial installation, run `install.py /absolute/path/to/project` from this
+directory after the target project's Fetch Libraries completes. It locates the
+archive for the configured dependency and atomically installs the wrapper without
+launching Defold or rewriting the dependency. From an existing helper installation,
+the equivalent API is `editor.install_python(project_path)`. Restart Python after
+replacing a wrapper. No project code should be stored in the managed directory.
+
+Use `editor.doctor(project_path, required_capabilities=("elements",))` to inspect
+project configuration, copied/loaded Python versions, editor installations,
+connection errors, native API compatibility, and required capabilities. It never
+launches or builds, acquires input, starts a log collector, or writes caches.
+Its `timeout` bounds each network probe; total time depends on how many candidate
+ports are inspected. Missing capabilities are failures; an unavailable launcher
+registry is a warning when an editor is already running.
+
 Once this helper directory is present, use the editor client to install or
 update the matching extension dependency and refresh the complete copied Python
 wrapper:

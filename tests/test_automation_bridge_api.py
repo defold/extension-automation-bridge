@@ -168,6 +168,81 @@ def _count_light_pixels_in_rect(path, rect):
 
 
 class EngineClientUnitTest(unittest.TestCase):
+    def test_doctor_reports_invalid_project_without_launching(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(editor, "open_project") as open_project:
+            report = editor.doctor(root)
+        self.assertFalse(report.ready)
+        self.assertEqual("project", report.checks[0].name)
+        self.assertIn("game.project", report.checks[0].action)
+        json.dumps(report.as_dict())
+        open_project.assert_not_called()
+
+    def test_doctor_reports_connection_failure_without_launching_or_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text("[project]\ntitle = Test\n")
+            before = sorted(root.rglob("*"))
+            with mock.patch.object(editor, "installations", return_value=[]), mock.patch.object(editor, "open_project") as launch:
+                report = editor.doctor(root)
+            self.assertEqual(before, sorted(root.rglob("*")))
+        self.assertFalse(report.ready)
+        checks = {check.name: check for check in report.checks}
+        self.assertEqual("error", checks["editor_connection"].status)
+        self.assertIn("sandbox", checks["editor_connection"].action)
+        launch.assert_not_called()
+
+    def test_doctor_validates_cached_engine_without_collectors_or_cache_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text("[project]\ntitle = Test\n")
+            native = root / "automation_bridge"
+            native.mkdir()
+            (native / "ext.manifest").touch()
+            project = EditorApiClient(root, port=1234)
+            project._engine_service_port = 1235
+            project._cached_engine_identity = {"port": 1235, "engine_instance_id": "e1", "project_identity": "p1"}
+            health = {"version": "2", "identity": {"engine_instance_id": "e1", "project_identity": "p1"}, "capabilities": ["elements"]}
+            with mock.patch.object(editor, "installations", return_value=[]), \
+                 mock.patch.object(editor, "Client", return_value=project), \
+                 mock.patch.object(project, "_check_connection"), \
+                 mock.patch.object(project, "_write_cached_engine_identity") as write, \
+                 mock.patch.object(engine.RuntimeLogs, "start") as collect, \
+                 mock.patch.object(editor, "request_json", return_value=(200, {"lines": []})), \
+                 mock.patch.object(EngineClient, "_request", return_value=health):
+                report = editor.doctor(root, required_capabilities=("elements",))
+                missing = editor.doctor(root, required_capabilities=("unavailable",))
+        self.assertTrue(report.ready)
+        self.assertFalse(missing.ready)
+        self.assertIn("unavailable", missing.checks[-1].message)
+        write.assert_not_called()
+        collect.assert_not_called()
+
+    def test_install_python_uses_fetched_archive_without_editing_project(self):
+        dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            content = f"[project]\ntitle = Existing\ndependencies#3 = {dependency}\n"
+            (root / "game.project").write_text(content)
+            self._write_automation_bridge_archive(root, dependency)
+            with mock.patch.object(editor, "open_project") as launch:
+                path = editor.install_python(root)
+            self.assertEqual("new", (path / "automation_bridge" / "__init__.py").read_text())
+            self.assertEqual(content, (root / "game.project").read_text())
+        launch.assert_not_called()
+
+    def test_install_python_rejects_ambiguous_dependencies_and_preserves_wrapper(self):
+        dependency = "https://github.com/defold/extension-automation-bridge/archive/refs/tags/2.1.0.zip"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "game.project").write_text(f"[project]\ndependencies#0 = {dependency}\ndependencies#1 = {dependency}\n")
+            wrapper = root / "automation-bridge-python"
+            wrapper.mkdir()
+            marker = wrapper / "existing.py"
+            marker.write_text("original")
+            with self.assertRaisesRegex(editor.AutomationBridgeUpdateError, "ambiguous"):
+                editor.install_python(root)
+            self.assertEqual("original", marker.read_text())
+
     def test_public_surface_excludes_removed_aliases_and_backend_types(self):
         bridge = EngineClient(1)
         removed_client_names = {

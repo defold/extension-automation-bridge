@@ -9,6 +9,9 @@
   Never merge wrapper versions or store project code in the wrapper directory.
 - Probe a running editor with
   `editor.open_project(".", start_if_needed=False)` before launching one.
+- Use `editor.doctor(".")` for setup, version, capability and connection
+  diagnostics without launching or writing project files. Seed a wrapper with
+  `install.py PROJECT_PATH` after Fetch Libraries when it has not been copied yet.
 - macOS: a launch must run unsandboxed; an existing editor may be reused.
   Detached processes and `/usr/bin/open` do not escape the inherited sandbox.
 - Windows: if the sandbox blocks the JDK loopback connection, start Defold

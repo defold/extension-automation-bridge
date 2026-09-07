@@ -31,6 +31,14 @@ from automation_bridge import editor, engine
 ProjectPath = Union[str, Path]
 
 
+def diagnose_project(project_root: ProjectPath = ".") -> editor.DoctorReport:
+    """Inspect setup without launching or building, and retain actionable errors."""
+    report = editor.doctor(project_root, required_capabilities=("elements",))
+    for check in report.checks:
+        print(check.name, check.status, check.message, check.action or "")
+    return report
+
+
 def update_bridge(
     project: editor.Client,
     version: Optional[str] = None,
