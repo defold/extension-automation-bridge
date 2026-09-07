@@ -144,10 +144,12 @@ class HandleRegistry:
             self._identity[identity] = token
             self._owners[token] = context.session if context else "default"
             root = _resource_owner(value)
-            if root is value and not isinstance(value, (engine.Client, editor.Client)) and context and context.resources:
-                self._resources[token] = dict(context.resources)
-            else:
-                self._resources[token] = {_resource_key(root): root}
+            resources = {_resource_key(root): root}
+            if not isinstance(value, (engine.Client, editor.Client)) and context:
+                # A derived resource may have its own connection while still
+                # belonging to the engine used to create it (e.g. a recording).
+                resources.update(context.resources)
+            self._resources[token] = resources
             if context is not None:
                 context.created.append((token, value))
             return token
@@ -522,6 +524,12 @@ class OperationSpec:
     read_only: bool = False
     destructive: bool = False
 
+    def arguments_schema(self) -> JsonObject:
+        """Return the shared JSON contract for discovery and dispatch."""
+        if self.adapter == "declarative_operation_predicate":
+            return _wait_schema()
+        return mcp_schema.operation_arguments(self)
+
     def catalog_item(self, *, detail: bool = True) -> JsonObject:
         result: JsonObject = {
             "id": self.id,
@@ -543,9 +551,7 @@ class OperationSpec:
         if self.reason:
             result["reason"] = self.reason
         if detail:
-            result["arguments_schema"] = mcp_schema.operation_arguments(self)
-            if self.adapter == "declarative_operation_predicate":
-                result["arguments_schema"] = _wait_schema()
+            result["arguments_schema"] = self.arguments_schema()
         else:
             for key in ("signature", "qualified_name", "owner", "name", "member"):
                 result.pop(key, None)
@@ -1253,21 +1259,26 @@ class BridgeRuntime:
             raise ToolFailure("invalid_arguments", "operation arguments must be an object")
         if spec.adapter == "mcp_request_cancellation":
             raise ToolFailure("request_cancellation", spec.reason, {"operation": spec.id})
-        kwargs = deserialize(dict(arguments), self.handles)
-        if spec.qualified_name in {
-            "automation_bridge.engine.connect", "automation_bridge.editor.Client.connect_engine",
-            "automation_bridge.editor.Client.build_and_run", "automation_bridge.editor.Client.clean_build_and_run",
-        }:
-            kwargs = self._connection_identity(kwargs)
-        if not isinstance(kwargs, dict):
-            raise ToolFailure("invalid_arguments", "operation arguments must be an object")
-        prohibited = sorted(set(kwargs) & set(spec.unsupported_parameters))
+        prohibited = sorted(set(arguments) & set(spec.unsupported_parameters))
         if prohibited:
             raise ToolFailure(
                 "unsupported_parameter",
                 spec.reason or "the parameter cannot be represented over MCP",
                 {"operation": spec.qualified_name, "parameters": prohibited},
             )
+        try:
+            mcp_schema.validate(dict(arguments), spec.arguments_schema(), "$.arguments")
+        except ValueError as error:
+            raise ToolFailure("invalid_arguments", str(error)) from error
+        if spec.adapter == "declarative_operation_predicate":
+            # The nested operation validates and resolves its own wire values.
+            return self._wait_declarative(arguments)
+        kwargs = deserialize(dict(arguments), self.handles)
+        if spec.qualified_name in {
+            "automation_bridge.engine.connect", "automation_bridge.editor.Client.connect_engine",
+            "automation_bridge.editor.Client.build_and_run", "automation_bridge.editor.Client.clean_build_and_run",
+        }:
+            kwargs = self._connection_identity(kwargs)
         if spec.qualified_name == "automation_bridge.editor.Preferences.get":
             preference = kwargs.get("preference")
             path = getattr(preference, "path", preference)
@@ -1277,9 +1288,6 @@ class BridgeRuntime:
                     "password preference values are not returned over MCP",
                     {"path": path},
                 )
-        if spec.qualified_name == "automation_bridge.engine.wait_until":
-            return self._wait_declarative(kwargs)
-
         if spec.kind == "function":
             if target_wire is not None:
                 raise ToolFailure("unexpected_target", "module functions do not accept a target handle")
@@ -1724,8 +1732,18 @@ class BridgeRuntime:
                 "required_capabilities": capabilities,
             }
             game = engine.connect(port, **kwargs)
-        if arguments.get("wait_ready", True):
-            game.wait_ready(timeout=timeout)
+        try:
+            if arguments.get("wait_ready", True):
+                game.wait_ready(timeout=timeout)
+        except BaseException:
+            # The client has not been retained yet, so session cleanup cannot
+            # reach its log collector when readiness fails or is cancelled.
+            try:
+                game.close()
+            except Exception as cleanup_error:
+                context = _request_context.get()
+                self._record_cleanup_error(context.request_id if context else None, cleanup_error)
+            raise
         return game
 
     def _engine_target(self, arguments: Mapping[str, Any]) -> engine.Client:
@@ -2277,7 +2295,9 @@ class BridgeRuntime:
                 return
             if isinstance(value, engine.PointerSession) and not value.closed:
                 value.cancel(release=True)
-            elif isinstance(value, engine.ProfilerRecording) and value.running:
+            elif isinstance(value, engine.ProfilerRecording):
+                # A stopped reader can still own a socket after max_frames or
+                # a read error. abort() also handles already finalized captures.
                 value.abort(RuntimeError("MCP session ended"))
             elif isinstance(value, engine.VideoRecordingSession):
                 value.stop()

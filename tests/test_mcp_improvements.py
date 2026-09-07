@@ -121,6 +121,197 @@ class EditorToolsTest(unittest.TestCase):
                     self.assertEqual(4, details['result']['issues'][0]['range']['end']['character'])
 
 
+class GenericArgumentValidationTest(unittest.TestCase):
+    def setUp(self):
+        self.runtime = BridgeRuntime(ROOT)
+        self.addCleanup(self.runtime.cleanup)
+
+    def test_generic_open_rejects_malformed_boolean_before_editor_discovery(self):
+        for value in ('false', 0, None):
+            with self.subTest(value=value), mock.patch.object(editor.Client, '_open_project') as open_project:
+                result = self.runtime.call_tool('automation_bridge_call', {
+                    'operation': 'automation_bridge.editor.open_project',
+                    'arguments': {'root': str(ROOT), 'start_if_needed': value},
+                })
+                self.assertFalse(result['ok'], result)
+                self.assertEqual('invalid_arguments', result['error']['code'])
+                open_project.assert_not_called()
+        with mock.patch.object(editor.Client, '_open_project', return_value={'connected': True}) as open_project:
+            result = self.runtime.call_tool('automation_bridge_call', {
+                'operation': 'automation_bridge.editor.open_project',
+                'arguments': {'root': str(ROOT), 'start_if_needed': False},
+            })
+            self.assertTrue(result['ok'], result)
+            open_project.assert_called_once_with(str(ROOT), start_if_needed=False, timeout=30.0, launcher=None)
+
+    def test_generic_methods_and_destructive_calls_reject_invalid_arguments(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, self.runtime.handles)
+        for tool, method, arguments, extra in (
+            ('automation_bridge_call', 'key', {'key': 'A', 'hold': 'long'}, {}),
+            ('automation_bridge_destructive_call', 'close_engine', {'timeout': 'soon'}, {'confirm': True}),
+        ):
+            with self.subTest(method=method), mock.patch.object(game, method) as operation:
+                result = self.runtime.call_tool(tool, {
+                    'operation': 'automation_bridge.engine.Client.' + method,
+                    'target': wire, 'arguments': arguments, **extra,
+                })
+                self.assertFalse(result['ok'], result)
+                self.assertEqual('invalid_arguments', result['error']['code'], result)
+                operation.assert_not_called()
+
+    def test_declarative_wait_validates_nested_observation_arguments(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, self.runtime.handles)
+        with mock.patch.object(game, 'scene') as scene:
+            result = self.runtime.call_tool('automation_bridge_wait', {
+                'operation': 'automation_bridge.engine.Client.scene', 'target': wire,
+                'arguments': {'visible': 'false'},
+            })
+            self.assertFalse(result['ok'], result)
+            self.assertEqual('invalid_arguments', result['error']['code'], result)
+            scene.assert_not_called()
+
+    def test_generic_wait_preserves_element_wire_arguments_until_dispatch(self):
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        wire = serialize(game, self.runtime.handles)
+        element = engine.Element({'id': 'child', 'parent_id': 'parent', 'instance_id': 'instance-a'})
+        element_wire = serialize(element, self.runtime.handles)
+        with mock.patch.object(game, 'parent', return_value=element) as parent:
+            result = self.runtime.call_tool('automation_bridge_call', {
+                'operation': 'automation_bridge.engine.wait_until',
+                'arguments': {
+                    'operation': 'automation_bridge.engine.Client.parent', 'target': wire,
+                    'arguments': {'element_or_id': element_wire},
+                },
+            })
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(element.raw, parent.call_args.kwargs['element_or_id'].raw)
+        self.assertEqual(element_wire, result['data'])
+
+
+class ConnectionCleanupTest(unittest.TestCase):
+    def test_failed_readiness_closes_unretained_clients_without_native_mutations(self):
+        for through_project in (False, True):
+            for error in (TimeoutError('not ready'), engine.UnsupportedCapabilityError('missing scene'),
+                          engine.OperationCancelled('cancelled while connecting')):
+                with self.subTest(through_project=through_project, error=type(error).__name__):
+                    runtime = BridgeRuntime(ROOT)
+                    self.addCleanup(runtime.cleanup)
+                    game = engine.Client(54321)
+                    self.addCleanup(game.close)
+                    project = editor.Client(ROOT, port=51336)
+                    arguments = {'project': serialize(project, runtime.handles)} if through_project else {'port': 54321}
+                    owner, member = (project, 'connect_engine') if through_project else (engine, 'connect')
+                    with mock.patch.object(owner, member, return_value=game), \
+                         mock.patch.object(game, 'wait_ready', side_effect=error), \
+                         mock.patch.object(game.logs, 'close') as close_logs, \
+                         mock.patch.object(game.input, 'flush') as flush, \
+                         mock.patch.object(game, 'close_engine') as terminate:
+                        result = runtime.call_tool('defold_connect_engine', arguments)
+                        self.assertFalse(result['ok'], result)
+                        self.assertEqual(type(error).__name__, result['error']['type'])
+                        self.assertTrue(game.closed)
+                        close_logs.assert_called_once_with()
+                        flush.assert_not_called()
+                        terminate.assert_not_called()
+                    self.assertIsNone(runtime.handles.token_for(game))
+
+    def test_readiness_error_survives_cleanup_failure(self):
+        runtime = BridgeRuntime(ROOT)
+        self.addCleanup(runtime.cleanup)
+        game = engine.Client(54321)
+        self.addCleanup(game.close)
+        with mock.patch.object(engine, 'connect', return_value=game), \
+             mock.patch.object(game, 'wait_ready', side_effect=engine.UnsupportedCapabilityError('missing scene')), \
+             mock.patch.object(game, 'close', side_effect=RuntimeError('collector cleanup failed')):
+            result = runtime.call_tool('defold_connect_engine', {'port': 54321})
+        self.assertEqual('unsupported_capability_error', result['error']['code'], result)
+        info = runtime.call_tool('automation_bridge_session', {})['data']
+        self.assertEqual('collector cleanup failed', info['cleanup_errors'][-1]['error']['message'])
+
+
+class ProfilerCleanupTest(unittest.TestCase):
+    def test_engine_cleanup_reaches_profiler_recordings_through_both_helpers(self):
+        for through_connection in (False, True):
+            for tool, argument in (('defold_close', 'engine'), ('automation_bridge_release', 'target')):
+                with self.subTest(through_connection=through_connection, tool=tool):
+                    runtime = BridgeRuntime(ROOT)
+                    self.addCleanup(runtime.cleanup)
+                    game = engine.Client(54321)
+                    self.addCleanup(game.close)
+                    wire = serialize(game, runtime.handles)
+                    profiler = runtime.call_tool('automation_bridge_get', {
+                        'operation': 'automation_bridge.engine.Client.profiler', 'target': wire,
+                    })['data']
+                    connection = engine.ProfilerConnection()
+                    connection._socket = mock.Mock()
+                    self.addCleanup(connection.stop)
+                    polled = threading.Event()
+                    pause = threading.Event()
+                    def receive(deadline):
+                        polled.set()
+                        pause.wait(0.01)
+                        raise engine.ProfilerTimeoutError('fixture poll')
+                    with mock.patch.object(engine.ProfilerClient, 'connect', return_value=connection), \
+                         mock.patch.object(connection, '_next_message', side_effect=receive), \
+                         mock.patch.object(game.input, 'pending', return_value=[]):
+                        target, owner = profiler, 'ProfilerClient'
+                        if through_connection:
+                            target = runtime.call_tool('automation_bridge_call', {
+                                'operation': 'automation_bridge.engine.ProfilerClient.connect', 'target': profiler,
+                            })['data']
+                            owner = 'ProfilerConnection'
+                        response = runtime.call_tool('automation_bridge_call', {
+                            'operation': 'automation_bridge.engine.' + owner + '.start_recording', 'target': target,
+                        })
+                        self.assertTrue(response['ok'], response)
+                        recording_wire = response['data']
+                        recording = runtime.handles.get(recording_wire['$handle'])
+                        self.addCleanup(recording.abort)
+                        try:
+                            self.assertTrue(polled.wait(1))
+                            result = runtime.call_tool(tool, {argument: wire})
+                            self.assertTrue(result['ok'], result)
+                            self.assertTrue(game.closed)
+                            self.assertFalse(recording.running)
+                            self.assertFalse(connection.connected)
+                            self.assertIsNone(runtime.handles.token_for(recording))
+                        finally:
+                            recording.abort()
+
+    def test_stopped_recordings_are_finalized_on_release_and_session_close(self):
+        from tests.test_automation_bridge_api import _remotery_sample_frame_body
+        for reader_error in (False, True):
+            for close_session in (False, True):
+                with self.subTest(reader_error=reader_error, close_session=close_session):
+                    runtime = BridgeRuntime(ROOT)
+                    self.addCleanup(runtime.cleanup)
+                    connection = engine.ProfilerConnection()
+                    connection._socket = mock.Mock()
+                    self.addCleanup(connection.stop)
+                    recording = engine.ProfilerRecording(connection, max_frames=1, resolve_names=False, close_on_stop=True)
+                    self.addCleanup(recording.abort)
+                    result = ('SMPL', _remotery_sample_frame_body())
+                    error = engine.ProfilerError('reader failed') if reader_error else None
+                    with mock.patch.object(connection, '_next_message', return_value=result, side_effect=error):
+                        recording.start()
+                        recording._thread.join(1)
+                    self.assertFalse(recording.running)
+                    self.assertTrue(connection.connected)
+                    wire = serialize(recording, runtime.handles)
+                    if close_session:
+                        response = runtime.call_tool('automation_bridge_session', {'action': 'close'})
+                    else:
+                        response = runtime.call_tool('automation_bridge_release', {'target': wire})
+                    self.assertTrue(response['ok'], response)
+                    self.assertFalse(connection.connected)
+                    self.assertEqual([], runtime.handles.snapshot())
+
+
 class CancellationTest(unittest.TestCase):
     def test_wait_cancellation_stops_polling_and_requests_native_cleanup(self):
         runtime = BridgeRuntime(ROOT)
