@@ -269,12 +269,13 @@ class EngineLogStream:
                         raise
 
 
-def _cleanup_without_masking(cleanup: Any) -> None:
-    """Run best-effort cleanup while preserving an already-active exception."""
+def _cleanup_without_masking(cleanup: Any, interrupted: Optional[BaseException] = None) -> None:
+    """Preserve the original exception and retain cancellation cleanup evidence."""
     try:
         cleanup()
-    except BaseException:
-        pass
+    except BaseException as cleanup_error:
+        if isinstance(interrupted, OperationCancelled) and interrupted.cleanup_error is None:
+            interrupted.cleanup_error = cleanup_error
 
 
 class RuntimeLogs:
@@ -359,7 +360,10 @@ class RuntimeLogs:
 
 
 class InputInterruptionScope:
-    """Flush this client's input session if an enclosed operation is interrupted."""
+    """Flush this client's input session if an enclosed operation is interrupted.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, controller: "InputController", flush: bool, release: bool):
         self._controller = controller
@@ -373,7 +377,7 @@ class InputInterruptionScope:
         if exc_type is None:
             return
         if self.flush:
-            _cleanup_without_masking(lambda: self._controller.flush(release=self.release))
+            _cleanup_without_masking(lambda: self._controller.flush(release=self.release), exc)
 
 
 class InputController:
@@ -486,12 +490,16 @@ class InputController:
         queueing input with ``wait=False``. With ``flush=True`` (the default),
         both the active action and later actions owned by this client session
         are cancelled. Cleanup failures never mask the original exception.
+        Inspect ``OperationCancelled.cleanup_error`` when cleanup is refused.
         """
         return InputInterruptionScope(self, flush=flush, release=release)
 
 
 class PointerSession:
-    """Leased low-level pointer that guarantees up/cancel cleanup in a context manager."""
+    """Leased low-level pointer with up/cancel cleanup in a context manager.
+
+    Refused cleanup is retained on ``OperationCancelled.cleanup_error``.
+    """
 
     def __init__(self, bridge: "Client", receipt: InputReceipt, lease: float):
         self._bridge = bridge
@@ -510,7 +518,7 @@ class PointerSession:
         if self.closed:
             return
         if exc_type is not None:
-            _cleanup_without_masking(self.cancel)
+            _cleanup_without_masking(self.cancel, exc)
             return
         self.up()
 
@@ -813,12 +821,21 @@ class Client:
         if self._closed:
             raise AutomationBridgeError("engine client is closed; reconnect to continue")
 
+    def _flush_owned_input(self) -> None:
+        """Request cleanup only when native receipts belong to this session."""
+        # Flushing acquires a controller lease, even when the queue is empty.
+        # An idle observer must not take control merely because it is cancelled.
+        if any(receipt.get("client_id") == self.client_id and receipt.get("session_id") == self.session_id
+               for receipt in self.input.pending()):
+            self.input.flush(release=True)
+
     @contextmanager
     def cancellation_scope(self, token: CancellationToken):
         """Cancel waits and request release of this session's input on cancellation.
 
         One token belongs to one operation. Use separate clients/identities for
         independent operations; cleanup only targets this client's native lease.
+        Idle observers do not acquire control during cancellation cleanup.
         A cleanup failure is retained on ``OperationCancelled.cleanup_error``.
         """
         entered = False
@@ -829,7 +846,7 @@ class Client:
         except OperationCancelled as exc:
             if entered:
                 try:
-                    self.input.flush(release=True)
+                    self._flush_owned_input()
                 except Exception as cleanup_error:
                     if exc.cleanup_error is None:
                         exc.cleanup_error = cleanup_error
@@ -931,8 +948,7 @@ class Client:
             lifecycle = health.get("lifecycle", {})
             if isinstance(lifecycle, Mapping) and lifecycle.get("current_stage") == "initial_scene_ready":
                 editor._record_lifecycle("initial_scene_ready", engine_instance_id=bridge.engine_instance_id)
-            if profiler_url:
-                editor._remember_remotery_url(profiler_url)
+            editor._remember_remotery_url(profiler_url)
             bridge.logs.start()
             bridge._owns_engine = fresh_build
             bridge._project_root = Path(editor.root)
@@ -961,21 +977,20 @@ class Client:
                 if bridge is not None:
                     # The engine URL is authoritative; console metadata is optional.
                     try:
-                        console_lines = editor._console_lines()
-                        if target_port in editor._current_registration_engine_service_ports(console_lines):
-                            profiler_url = cls._editor_profiler_url(editor, fresh_build=True, console_lines=console_lines)
-                            if profiler_url:
-                                bridge._remotery_url = profiler_url
-                                editor._remember_remotery_url(profiler_url)
-                    except AutomationBridgeError:
-                        pass
+                        profiler_url = editor._reported_target_remotery_url(target_port, timeout)
+                    except BaseException as exc:
+                        _cleanup_without_masking(bridge.close, exc)
+                        raise
+                    if profiler_url:
+                        bridge._remotery_url = profiler_url
+                        editor._remember_remotery_url(profiler_url)
                 return bridge
             console_lines = editor._console_lines()
             service_ports = editor._engine_service_ports(console_lines)
             registration_ports = editor._current_registration_engine_service_ports(console_lines)
             profiler_url = cls._editor_profiler_url(
                 editor,
-                fresh_build=fresh_build,
+                fresh_build=fresh_build or bool(registration_ports),
                 console_lines=console_lines,
             )
             for service_port in service_ports:
