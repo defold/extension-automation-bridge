@@ -1042,6 +1042,7 @@ class RemoteryClient:
             raise RemoteryProtocolError("websocket handshake returned an invalid Sec-WebSocket-Accept header")
 
     def _recv_frame(self, deadline: Optional[float]) -> bytes:
+        fragments: Optional[bytearray] = None
         while True:
             header = self._recv_exact(2, deadline)
             fin = (header[0] & 0x80) != 0
@@ -1067,11 +1068,20 @@ class RemoteryClient:
                 continue
             if opcode == 0xA:
                 continue
-            if opcode not in (0x1, 0x2):
+            if opcode == 0x0:
+                if fragments is None:
+                    raise RemoteryProtocolError("unexpected websocket continuation frame")
+            elif opcode in (0x1, 0x2):
+                if fragments is not None:
+                    raise RemoteryProtocolError("expected websocket continuation frame")
+                if fin:
+                    return payload
+                fragments = bytearray()
+            else:
                 raise RemoteryProtocolError(f"unsupported websocket opcode: {opcode}")
-            if not fin:
-                raise RemoteryProtocolError("fragmented websocket frames are not supported")
-            return payload
+            fragments.extend(payload)
+            if fin:
+                return bytes(fragments)
 
     def _send_text(self, text: str) -> None:
         try:
