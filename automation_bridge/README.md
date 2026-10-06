@@ -336,7 +336,7 @@ curl -fsS "$BASE/element?id=e:0123456789abcdef&include=bounds,properties,childre
 
 ### Input ownership, FIFO execution, and receipts
 
-All click, drag, path, pointer, and key actions share one FIFO. Only the first action advances during an engine update, so independent gestures cannot overwrite the same HID state. Every mutating request carries `client_id`, `session_id`, and `request_id`; keep ids compact on query endpoints because Defold bounds the complete request resource. The first client/session acquires the controller lease and other clients receive `input_controller_busy` until that lease expires. Observer endpoints remain readable without the lease.
+All click, drag, path, pointer, key, and wheel actions share one FIFO. Only the first action advances during an engine update, so independent gestures cannot overwrite the same HID state. Every mutating request carries `client_id`, `session_id`, and `request_id`; keep ids compact on query endpoints because Defold bounds the complete request resource. The first client/session acquires the controller lease and other clients receive `input_controller_busy` until that lease expires. Observer endpoints remain readable without the lease.
 
 Use `PUT /input/configure?client_id=...&session_id=...&lease=5&device=auto&visualize=1` to acquire or renew control and set defaults. Devices are exclusive per gesture: `auto`, `mouse`, or `touch`. `GET /health` reports `input.device.mouse` and, on platforms where native touch injection is supported, `input.device.touch`. The public Defold HID API has no reliable connected-touch-device predicate, so explicit touch is conservatively enabled on iOS, Android, and Switch and rejected elsewhere; one gesture never injects both mouse and touch.
 
@@ -377,14 +377,14 @@ Accepted input returns HTTP 200 with this lifecycle receipt in `data`:
 }
 ```
 
-Lifecycle terms are exact: `accepted` means queued, `started` means the first down/key event was injected, and `released` means the final up was injected. `cancelled` and `failed` are terminal and include `reason`. They do not claim that application code consumed or accepted the action.
+Lifecycle terms are exact: `accepted` means queued, `started` means the first down/key event was injected, and `released` means the final up was injected; for a wheel event they are the first detent's tick and the last detent's rest. `cancelled` and `failed` are terminal and include `reason`. They do not claim that application code consumed or accepted the action.
 
 Use `GET /input/status?input_id=42` for current/bounded-history status and `GET /input/pending` for the FIFO. `POST /input/cancel?input_id=42&release=1&client_id=...&session_id=...` cancels one action. `POST /input/flush?release=1&client_id=...&session_id=...` cancels the owning session's active and later actions. `release=1` releases mouse/key state or emits a cancelled touch contact. A pointer or controller lease expiry performs the same safe cleanup.
 
 Element-targeted input accepts `expected_scene_sequence`. A mismatch returns logical status 409 with `stale_scene` before resolving a snapshot/path element id. Receipts retain the scene sequence used for resolution plus engine instance/frame metadata.
 
 For protection that survives ordinary frame/snapshot advancement, element-targeted
-clicks also accept `expected_logical_id`; element-targeted drags accept
+clicks and wheel events also accept `expected_logical_id`; element-targeted drags accept
 `expected_from_logical_id` and `expected_to_logical_id`. If a path-derived element id
 now belongs to a different runtime instance, the request returns logical status 409 with
 `stale_element` before input is queued.
@@ -422,6 +422,14 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 ### `POST /automation-bridge/v2/input/key`
 
 Use `text` for literal UTF-8 or `keys` for one or more brace-wrapped special keys such as URL-encoded `%7BKEY_ENTER%7D`. Values are limited to 4096 bytes. Supported names cover every named key in the engine's `dmHID::Key` enum: arrows, modifiers, navigation keys, `KEY_F1`–`KEY_F12`, `KEY_A`–`KEY_Z`, `KEY_0`–`KEY_9`, punctuation and symbol keys (`KEY_EQUALS`, `KEY_MINUS`, `KEY_COMMA`, `KEY_PERIOD`, `KEY_SLASH`, brackets, and the rest), keypad keys (`KEY_KP_0`–`KEY_KP_9`, `KEY_KP_ADD`, ...), and lock/system keys (`KEY_CAPS_LOCK`, `KEY_PAUSE`, `KEY_LSUPER`, ...). Unknown or malformed brace-wrapped names return `unsupported_key` instead of producing a successful no-op receipt. Braces supplied through `text` remain literal. `hold` keeps each special key pressed for that many seconds (`0..60`, default `0` -- a single-update tap) before releasing it; it applies per `{KEY_...}` token, the combined hold across all tokens must stay within 60 seconds, and it requires at least one special key (literal text cannot be held). While held, the key is re-asserted every engine update, so bindings receive the same continuous per-frame actions a physically held key produces; progressing key events keep controller ownership through their bounded release without an indefinitely renewable hold, and the receipt's `requested_duration` reports the total requested hold. Key presses share the FIFO, report the same receipts, and cancellation releases an active special key. `modifiers` holds up to four comma-separated key names as a chord across the press (e.g. `keys=%7BKEY_Z%7D&modifiers=KEY_LCTRL` for ctrl-Z), pressed one update before the first key and released one update after the last; it composes with `hold`, requires at least one special key (literal text cannot be chorded), and is advertised as the `input.modifiers` capability. The receipt echoes `modifier_count` so a client can tell a chord was honoured. `GET /health` advertises `input.key` capability version `2` for full named-key and hold support; clients must negotiate `input.key>=2` before sending `hold`.
+
+### `POST /automation-bridge/v2/input/wheel`
+
+Turns the mouse wheel by `steps` detents. Use `id`, or finite `x`/`y`, as on `/input/click`; a request with neither returns `bad_request`. `steps` is required: a non-zero integer from `-64` to `64`, where positive fires `mouse_wheel_up` and negative fires `mouse_wheel_down`; a missing, zero, fractional, or out-of-range value returns `bad_request`. Each detent takes two engine updates, a tick (the binding reads value `1` and `pressed`) and a rest (value `0`, `released`), so every detent is a new press. The pointer is held at the target for the whole event, so the wheel action carries the target position as a click does (`action.screen_y` uses Defold's bottom-left origin). Defold delivers every wheel, trackpad included, as whole detents: the HID wheel is an integer and the binding clamps each update's change to `0..1`, so there is no fractional value to send. The wheel is always a mouse input: a `modifiers` field of any value, and a `device` other than `auto` or `mouse` (including an empty, `null`, or non-string value), return `bad_request`, and `visualize` has no effect. Detents already sent stay applied when the event is cancelled: a wheel has nothing to release. Wheel events share the FIFO and receipts, and own the controller through release like key events. Advertised as the `input.wheel` capability (version `1`).
+
+```sh
+curl -fsS -X POST "$BASE/input/wheel?x=480&y=360&steps=1&client_id=runner&session_id=test"
+```
 
 ### `GET /automation-bridge/v2/screenshot`
 

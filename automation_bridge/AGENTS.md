@@ -22,7 +22,9 @@
   validated special-key tokens; wait for the required receipt phase. `modifiers`
   holds up to four named keys as a chord across a click, drag, pointer session,
   or key press, pressed one update before the primary action and released one
-  update after; it needs the `input.modifiers` capability.
+  update after; it needs the `input.modifiers` capability. `/input/wheel` turns
+  the mouse wheel by a non-zero integer `steps` (`-64..64`, one detent each) at
+  an element or point; it needs the `input.wheel` capability.
 - Screenshot and Metal captures are asynchronous; poll their status receipts.
   Metal capture requires macOS, the Metal adapter, and
   `METAL_CAPTURE_ENABLED=1`; inspect completed traces with `gpudebug` when

@@ -26,8 +26,8 @@
 - Use `elements_page()` for continuation cursors, match counts and snapshot
   evidence; see `engine.ElementSelector` for typed filters and their semantics.
 - `Element` objects are snapshots. Re-query after state or scene changes. Pass
-  `Element` objects to `click()` and both ends of `drag()` for stale-identity
-  protection; handle `engine.StaleElementError` by re-querying.
+  `Element` objects to `click()`, `wheel()`, and both ends of `drag()` for
+  stale-identity protection; handle `engine.StaleElementError` by re-querying.
 - Use `game.parent(component)` when a visible child exposes the selector but its
   parent receives input. Use `type_text()` for literal text and `key()` for one
   validated special key.

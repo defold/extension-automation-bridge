@@ -167,6 +167,8 @@ def send_safe_input(game: engine.Client) -> None:
     game.type_text("literal {UTF-8} text")
     game.key("ENTER")
     game.key("SPACE", hold=1.0, wait="released", timeout=2.0)
+    if game.supports("input.wheel"):
+        game.wheel(game.element(automation_id="map", visible=True), steps=-2)
 
 
 def control_input_lifecycle(game: engine.Client) -> None:

@@ -24,6 +24,7 @@ namespace dmAutomationBridge
     static const uint32_t MAX_INPUT_PATH_POINTS = 128;
     static const uint32_t MAX_INPUT_MODIFIERS = 4;
     static const float MAX_INPUT_DURATION = 60.0f;
+    static const int32_t MAX_WHEEL_STEPS = 64;
     static const uint32_t MAX_KEY_INPUT_BYTES = 4096;
     static const uint32_t MAX_APPLICATION_JSON_BYTES = 32768;
     static const uint32_t MAX_APPLICATION_NAME_BYTES = 128;
@@ -166,7 +167,8 @@ namespace dmAutomationBridge
     {
         INPUT_EVENT_MOUSE,
         INPUT_EVENT_KEYS,
-        INPUT_EVENT_POINTER
+        INPUT_EVENT_POINTER,
+        INPUT_EVENT_WHEEL
     };
 
     enum InputDevice
@@ -263,6 +265,12 @@ namespace dmAutomationBridge
         dmHID::Key m_Modifiers[MAX_INPUT_MODIFIERS];
         uint8_t    m_ModifierCount;
         bool       m_ModifierLeadDone;
+
+        // Wheel events: signed detent count, and the updates run so far. Even updates
+        // tick the wheel by one detent, odd updates rest (see UpdateWheelEvent). The
+        // position is m_Points[0].
+        int32_t  m_WheelSteps;
+        uint32_t m_WheelUpdates;
     };
 
     struct InputVisualization
@@ -363,6 +371,7 @@ namespace dmAutomationBridge
         char*                   m_ControllerClientId;
         char*                   m_ControllerSessionId;
         uint64_t                m_ControllerLeaseDeadline;
+        int32_t                 m_WheelOffset; // injected detents, written back every update (UpdateInput)
         InputDevice             m_DefaultInputDevice;
         bool                    m_DefaultInputVisualize;
         char                    m_EngineInstanceId[64];
@@ -598,6 +607,9 @@ namespace dmAutomationBridge
                      const dmHID::Key* modifiers, uint32_t modifier_count,
                      const char* client_id, const char* session_id, const char* request_id,
                      uint64_t scene_sequence, InputReceipt** receipt);
+    bool AddWheelInput(float x, float y, int32_t steps,
+                       const char* client_id, const char* session_id, const char* request_id,
+                       uint64_t scene_sequence, InputReceipt** receipt);
     bool AppendPointerMove(uint64_t input_id, const InputPoint* point, float lease, const char** error);
     bool AppendPointerHold(uint64_t input_id, float duration, float lease, const char** error);
     bool ReleasePointer(uint64_t input_id, const char** error);

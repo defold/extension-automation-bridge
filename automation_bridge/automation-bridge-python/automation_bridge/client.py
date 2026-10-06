@@ -1381,16 +1381,7 @@ class Client:
         modifier's own key trigger observe the same ordering a human chord produces.
         """
         check_cancelled()
-        if isinstance(target, Element):
-            json_body: Dict[str, Any] = {"id": target.id}
-            if target.logical_id:
-                json_body["expected_logical_id"] = target.logical_id
-        elif isinstance(target, str):
-            json_body = {"id": target}
-        else:
-            x_value, y_value = self._point(target, y)
-            json_body = {"x": x_value, "y": y_value}
-
+        json_body = self._input_target(target, y)
         json_body.update(self._input_json_body())
         json_body.update({"visualize": visualize, "device": device, "expected_scene_sequence": expected_scene_sequence})
         if pointer_id:
@@ -1634,6 +1625,51 @@ class Client:
             self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
         receipt = InputReceipt(self._request("POST", "/input/key", json_body=json_body))
+        return self._wait_input_compat(
+            receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
+        )
+
+    def wheel(
+        self,
+        target: Union[Target, float, int],
+        y: Optional[float] = None,
+        *,
+        steps: int,
+        wait: Union[str, bool, float] = "released",
+        expected_scene_sequence: Optional[int] = None,
+        timeout: float = 10.0,
+        cancel_on_interrupt: bool = True,
+        flush_on_interrupt: bool = False,
+    ) -> InputReceipt:
+        """Queue one FIFO mouse-wheel turn of ``steps`` detents over a target.
+
+        ``target`` accepts the same forms as ``click()``; an ``Element`` also
+        sends its logical identity and raises ``engine.StaleElementError`` when
+        its id now names another instance. ``steps`` is a non-zero integer from
+        ``-64`` to ``64``: positive fires ``mouse_wheel_up``, negative
+        ``mouse_wheel_down``, and each detent is one ``pressed`` action followed
+        by a ``released`` one. Defold reads the wheel as a whole change clamped to
+        ``0..1`` per update, so only whole detents exist: a non-integer ``steps``
+        raises ``TypeError`` and an out-of-range one ``ValueError`` before
+        queueing, never rounded or clamped.
+
+        The pointer is held at the target while the detents play, so the wheel
+        action carries the target position as a click does. Each
+        detent takes two engine updates; raise ``timeout`` for many detents at a
+        low frame rate. Cancelling stops later detents, but detents already sent
+        stay applied because a wheel has nothing to release. Requires the
+        ``input.wheel`` capability.
+        """
+        check_cancelled()
+        if isinstance(steps, bool) or not isinstance(steps, int):
+            raise TypeError("steps must be an integer")
+        if steps == 0 or not -64 <= steps <= 64:
+            raise ValueError("steps must be a non-zero integer between -64 and 64")
+        self._require_cached_capability("input.wheel")
+        json_body = self._input_target(target, y)
+        json_body.update(self._input_json_body())
+        json_body.update({"steps": steps, "expected_scene_sequence": expected_scene_sequence})
+        receipt = InputReceipt(self._request("POST", "/input/wheel", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
         )
@@ -2845,6 +2881,18 @@ class Client:
         if isinstance(target, str):
             return target
         raise TypeError(f"target is not an element reference: {target!r}")
+
+    def _input_target(self, target: Union[Target, float, int], y: Optional[float] = None) -> Dict[str, Any]:
+        """Return the ``id`` or ``x``/``y`` fields of a single-point input request."""
+        if isinstance(target, Element):
+            json_body: Dict[str, Any] = {"id": target.id}
+            if target.logical_id:
+                json_body["expected_logical_id"] = target.logical_id
+            return json_body
+        if isinstance(target, str):
+            return {"id": target}
+        x_value, y_value = self._point(target, y)
+        return {"x": x_value, "y": y_value}
 
     def _point(self, target: Union[Target, float, int], y: Optional[float] = None) -> Tuple[Any, Any]:
         if isinstance(target, Element):

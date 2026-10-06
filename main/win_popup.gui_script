@@ -2,6 +2,8 @@ local HOLD_ACTION = hash("hold_timer")
 local CHORD_H_ACTION = hash("modifier_chord_h")
 local CHORD_SHIFT_ACTION = hash("modifier_chord_shift")
 local CHORD_ALT_ACTION = hash("modifier_chord_alt")
+local WHEEL_UP_ACTION = hash("wheel_counter_up")
+local WHEEL_DOWN_ACTION = hash("wheel_counter_down")
 local MAX_HOLD_SECONDS = 60
 
 local function set_hold_timer_text(self, prefix)
@@ -11,6 +13,10 @@ end
 
 local function set_modifier_chord_text(text)
 	gui.set_text(gui.get_node("modifier_chord"), text)
+end
+
+local function set_wheel_counter_text(self)
+	gui.set_text(gui.get_node("wheel_counter"), string.format("Wheel up %d, down %d, on label %d", self.wheel_up, self.wheel_down, self.wheel_on_label))
 end
 
 local function set_popup_enabled(enabled)
@@ -27,8 +33,12 @@ function init(self)
 	self.hold_active = false
 	self.chord_shift_active = false
 	self.chord_alt_active = false
+	self.wheel_up = 0
+	self.wheel_down = 0
+	self.wheel_on_label = 0
 	set_hold_timer_text(self, "Hold SPACE")
 	set_modifier_chord_text("Send H + SHIFT + ALT")
+	set_wheel_counter_text(self)
 	set_popup_enabled(false)
 end
 
@@ -93,6 +103,22 @@ function on_input(self, action_id, action)
 				self.chord_shift_active and "down" or "up",
 				self.chord_alt_active and "down" or "up"
 			))
+		end
+		return true
+	end
+
+	if action_id == WHEEL_UP_ACTION or action_id == WHEEL_DOWN_ACTION then
+		if action.pressed then
+			if action_id == WHEEL_UP_ACTION then
+				self.wheel_up = self.wheel_up + 1
+			else
+				self.wheel_down = self.wheel_down + 1
+			end
+			-- Detents over the label prove the pointer was held at the wheel target.
+			if gui.pick_node(gui.get_node("wheel_counter"), action.x, action.y) then
+				self.wheel_on_label = self.wheel_on_label + 1
+			end
+			set_wheel_counter_text(self)
 		end
 		return true
 	end

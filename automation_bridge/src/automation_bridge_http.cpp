@@ -600,6 +600,32 @@ namespace dmAutomationBridge
         return true;
     }
 
+    // steps for /input/wheel: a signed, non-zero integer within +-MAX_WHEEL_STEPS. A
+    // fraction, a zero, an out-of-range count, whitespace, or a sign other than a leading
+    // '-' is an error, never a clamp.
+    static bool RequestGetWheelSteps(const RequestContext* ctx, int32_t* steps)
+    {
+        const char* text = GetParam(&ctx->m_Query, "steps");
+        if (IsEmpty(text))
+        {
+            return false;
+        }
+        if (!isdigit((unsigned char)text[0]) && !(text[0] == '-' && isdigit((unsigned char)text[1])))
+        {
+            return false;
+        }
+        char* end = 0;
+        errno = 0;
+        long parsed = strtol(text, &end, 10);
+        if (errno == ERANGE || !end || *end != 0 || parsed == 0 ||
+            parsed > (long)MAX_WHEEL_STEPS || parsed < -(long)MAX_WHEEL_STEPS)
+        {
+            return false;
+        }
+        *steps = (int32_t)parsed;
+        return true;
+    }
+
     static const char* RequestGetParam(const RequestContext* ctx, const char* key)
     {
         return GetParam(&ctx->m_Query, key);
@@ -777,6 +803,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "input.drag_path");
             AppendCapability(&names, &versions, &first, "input.pointer");
             AppendCapability(&names, &versions, &first, "input.key", "2");
+            AppendCapability(&names, &versions, &first, "input.wheel");
             AppendCapability(&names, &versions, &first, "input.modifiers");
             AppendCapability(&names, &versions, &first, "input.receipts");
             AppendCapability(&names, &versions, &first, "input.queue");
@@ -1787,6 +1814,73 @@ namespace dmAutomationBridge
         if (!AddKeyInput(value, parse_special_keys, key_hold, requested_duration,
                          modifiers, modifier_count, client_id, session_id, request_id,
                          g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
+        {
+            RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
+            return;
+        }
+        SendReceiptResponse(ctx, receipt, g_AutomationBridge.m_InputEvents.m_Count);
+    }
+
+    static void HandleWheel(RequestContext* ctx)
+    {
+        if (!HasInputCapability())
+        {
+            RequestSendError(ctx, 501, "unsupported_capability", "input.wheel is unavailable because the runtime has no HID context");
+            return;
+        }
+        RefreshSnapshotForRequest();
+        if (!ValidateExpectedScene(ctx)) return;
+        float x = 0.0f;
+        float y = 0.0f;
+        const char* id = RequestGetParam(ctx, "id");
+        if (!IsEmpty(id))
+        {
+            if (!ValidateExpectedLogicalIdentity(ctx, id, "expected_logical_id")) return;
+            const char* error = 0;
+            if (!GetNodeCenter(id, &x, &y, &error))
+            {
+                RequestSendError(ctx, 404, "not_found", error);
+                return;
+            }
+        }
+        else if (!RequestGetFloatParam(ctx, "x", &x) || !RequestGetFloatParam(ctx, "y", &y) || !IsFiniteFloat(x) || !IsFiniteFloat(y))
+        {
+            RequestSendError(ctx, 400, "bad_request", "provide either id or finite x/y");
+            return;
+        }
+        int32_t steps = 0;
+        if (!RequestGetWheelSteps(ctx, &steps))
+        {
+            RequestSendError(ctx, 400, "bad_request", "steps must be a non-zero integer between -64 and 64; positive sends mouse_wheel_up");
+            return;
+        }
+        // The wheel is always a plain mouse input. A chord or a touch device it cannot
+        // apply fails the request instead of silently becoming an unmodified mouse wheel.
+        // RequestGetParam returns 0 for a JSON list, object, or null, so presence comes
+        // from RequestHasParam: any supplied value is checked, not only a string.
+        if (RequestHasParam(ctx, "modifiers"))
+        {
+            RequestSendError(ctx, 400, "bad_request", "modifiers are not supported by /input/wheel");
+            return;
+        }
+        if (RequestHasParam(ctx, "device"))
+        {
+            const char* device_text = RequestGetParam(ctx, "device");
+            InputDevice device = INPUT_DEVICE_MOUSE;
+            if (IsEmpty(device_text) || !ParseInputDevice(device_text, &device) || device == INPUT_DEVICE_TOUCH)
+            {
+                RequestSendError(ctx, 400, "bad_request", "device must be auto or mouse; the wheel is a mouse input");
+                return;
+            }
+        }
+        const char* client_id = 0;
+        const char* session_id = 0;
+        const char* request_id = 0;
+        float lease = 5.0f;
+        if (!GetInputIdentity(ctx, &client_id, &session_id, &request_id, &lease) || !AcquireControllerForRequest(ctx, client_id, session_id, lease)) return;
+        InputReceipt* receipt = 0;
+        if (!AddWheelInput(x, y, steps, client_id, session_id, request_id,
+                           g_AutomationBridge.m_Snapshot.m_Sequence, &receipt))
         {
             RequestSendError(ctx, 429, "input_queue_full", "too many input events are already queued");
             return;
@@ -2820,6 +2914,7 @@ namespace dmAutomationBridge
         {"/input/drag", "POST", HandleDrag},
         {"/input/drag_path", "POST", HandleDragPath},
         {"/input/key", "POST", HandleKey},
+        {"/input/wheel", "POST", HandleWheel},
         {"/input/status", "GET", HandleInputStatus},
         {"/input/pending", "GET", HandleInputPending},
         {"/input/cancel", "POST", HandleInputCancel},

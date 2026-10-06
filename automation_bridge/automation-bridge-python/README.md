@@ -130,7 +130,7 @@ The package root exposes only `editor` and `engine`.
   `element_by_id(...)`, `parent(...)`, `count(...)`, compact formatting, and
   scene dumps.
 - Input: `click(...)`, `drag(...)`, `drag_path(...)`, `pointer(...)`,
-  `type_text(...)`, `key(...)`, and `game.input`.
+  `type_text(...)`, `key(...)`, `wheel(...)`, and `game.input`.
 - Synchronization: events, states, application commands, full input
   acknowledgements, timeline markers, frame/count waits, and element
   observation.
@@ -445,11 +445,11 @@ Boolean filters include `visible`, `enabled`, `has_bounds`, and
 `name`, `type`, `kind`, `path`, `parent_id`, `text`, `url`, semantic metadata,
 visibility, bounds, children, and `raw`.
 
-When an `Element` is passed directly to `click()`, or `Element` objects are passed
-as both endpoints of `drag()`, the wrapper also sends their logical runtime
-identities. If a path-derived element id has since been reused by another
-instance, input fails with `engine.StaleElementError`; re-query the selector and
-retry deliberately.
+When an `Element` is passed directly to `click()` or `wheel()`, or `Element`
+objects are passed as both endpoints of `drag()`, the wrapper also sends their
+logical runtime identities. If a path-derived element id has since been reused by
+another instance, input fails with `engine.StaleElementError`; re-query the
+selector and retry deliberately.
 
 ## Input
 
@@ -463,6 +463,7 @@ game.drag(first, second, duration=0.2, easing="ease_in_out")
 game.type_text("Hello")
 game.key("SPACE")
 game.key("SPACE", hold=1.5, wait="released", timeout=3)
+game.wheel(480, 320, steps=-2)
 ```
 
 `key()` accepts case-insensitive letters, digits, and every named key in Defold's
@@ -474,9 +475,14 @@ native endpoint advertising `input.key>=2`. When waiting for release, set
 `timeout` above the requested hold. `type_text()` always treats braces and other
 characters as literal UTF-8 text.
 
-`click()`, `drag()`, and `drag_path()` wait for native release by default.
-`type_text()` and `key()` return after the request is accepted unless a `wait`
-state is supplied. These five helpers accept `wait="accepted"`,
+`wheel()` turns the mouse wheel by `steps` detents over its target: a non-zero
+integer from `-64` to `64`, positive for `mouse_wheel_up`. Each detent is one
+`pressed` action, and fractional values are rejected before input is queued. It
+requires `input.wheel`.
+
+`click()`, `drag()`, `drag_path()`, and `wheel()` wait for native release by
+default. `type_text()` and `key()` return after the request is accepted unless a
+`wait` state is supplied. These six helpers accept `wait="accepted"`,
 `wait="started"`, `wait="released"`, or `wait=False` as appropriate.
 
 Low-level queue and interruption control lives under `game.input`:

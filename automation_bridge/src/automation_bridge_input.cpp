@@ -166,7 +166,7 @@ namespace dmAutomationBridge
 
     static void RefreshKeyCompletionDeadline(InputEvent* event, uint64_t now)
     {
-        if (!event || event->m_Type != INPUT_EVENT_KEYS)
+        if (!event || (event->m_Type != INPUT_EVENT_KEYS && event->m_Type != INPUT_EVENT_WHEEL))
         {
             return;
         }
@@ -175,6 +175,8 @@ namespace dmAutomationBridge
         // progress protects long text/key sequences without keeping a stalled event alive.
         // The per-token hold covers work until the next structural progress point; grace
         // covers frame overhead and lets the release update run at the exact 60s boundary.
+        // Wheel events have no hold and refresh on every update, since each tick or rest
+        // is progress.
         float protected_seconds = event->m_HoldAfter + INPUT_COMPLETION_GRACE_SECONDS;
         event->m_CompletionDeadline = now + (uint64_t)(protected_seconds * 1000000.0f);
     }
@@ -223,7 +225,7 @@ namespace dmAutomationBridge
             return deadline;
         }
         const InputEvent* event = &g_AutomationBridge.m_InputEvents.m_Data[0];
-        if (event->m_Type == INPUT_EVENT_KEYS &&
+        if ((event->m_Type == INPUT_EVENT_KEYS || event->m_Type == INPUT_EVENT_WHEEL) &&
             IsInputController(event->m_Receipt.m_ClientId, event->m_Receipt.m_SessionId) &&
             event->m_CompletionDeadline > deadline)
         {
@@ -371,6 +373,37 @@ namespace dmAutomationBridge
         }
         event.m_Receipt.m_RequestedDuration = requested_duration;
         event.m_Receipt.m_ModifierCount = event.m_ModifierCount; // echoed so callers can detect a bridge without modifier support
+        RefreshKeyCompletionDeadline(&event, dmTime::GetTime());
+        if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
+        {
+            FreeInputEvent(&event);
+            return false;
+        }
+        *receipt = &g_AutomationBridge.m_InputEvents.m_Data[g_AutomationBridge.m_InputEvents.m_Count - 1].m_Receipt;
+        return true;
+    }
+
+    bool AddWheelInput(float x, float y, int32_t steps,
+                       const char* client_id, const char* session_id, const char* request_id,
+                       uint64_t scene_sequence, InputReceipt** receipt)
+    {
+        if (steps == 0 || !CanQueueInputEvent())
+        {
+            return false;
+        }
+        InputEvent event;
+        memset(&event, 0, sizeof(event));
+        event.m_Type = INPUT_EVENT_WHEEL;
+        event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
+        event.m_WheelSteps = steps;
+        InputPoint point = {x, y, 0.0f, INPUT_EASING_LINEAR};
+        if (!InitReceipt(&event.m_Receipt, "wheel", client_id, session_id, request_id,
+                         scene_sequence, INPUT_DEVICE_MOUSE, 0) ||
+            !ArrayPush(&event.m_Points, &point))
+        {
+            FreeInputEvent(&event);
+            return false;
+        }
         RefreshKeyCompletionDeadline(&event, dmTime::GetTime());
         if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
@@ -1015,6 +1048,65 @@ namespace dmAutomationBridge
         return false;
     }
 
+    // The engine's HID update writes the OS wheel position into the mouse packet on
+    // every frame (engine/hid/src/native/hid_native.cpp), just before extension updates,
+    // and the input binding reads the wheel as the change from the previous packet. So
+    // injected detents live in a running offset that is written back on EVERY update,
+    // with or without queued input. Written once, the next poll would move the wheel
+    // back and the game would read a false detent the other way.
+    // This assumes one HID poll per extension update. Defold 1.13 with
+    // script.shared_state = 0 runs one extension update per script context, so a tick
+    // and its rest share a frame and the game reads fewer presses than steps (a click
+    // loses its press the same way). The 1.14 engine has a single script context.
+    static void AssertWheelOffset()
+    {
+        if (g_AutomationBridge.m_WheelOffset == 0) return;
+        dmHID::HMouse mouse = dmHID::GetMouse(g_AutomationBridge.m_HidContext, 0);
+        if (mouse == dmHID::INVALID_MOUSE_HANDLE) return;
+        dmHID::MousePacket packet;
+        if (!dmHID::GetMousePacket(mouse, &packet)) return;
+        dmHID::SetMouseWheel(mouse, packet.m_Wheel + g_AutomationBridge.m_WheelOffset);
+    }
+
+    // One detent is two updates: a tick that moves the wheel by one, so the binding reads
+    // value 1 and pressed, and a rest that moves nothing, so it reads value 0 and
+    // released. Without the rest, the next tick would read as the same press still held
+    // (value 1, no new pressed) rather than a new detent. The engine clamps the wheel
+    // value to 0..1, so there is no larger or fractional value to send.
+    static bool UpdateWheelEvent(InputEvent* event)
+    {
+        if (event->m_CancelRequested)
+        {
+            // Detents already sent stay in the offset: a wheel has no down state to release.
+            FinishReceipt(&event->m_Receipt, INPUT_STATE_CANCELLED, event->m_Receipt.m_Reason);
+            return true;
+        }
+        dmHID::HMouse mouse = dmHID::GetMouse(g_AutomationBridge.m_HidContext, 0);
+        dmHID::MousePacket packet;
+        if (mouse == dmHID::INVALID_MOUSE_HANDLE || !dmHID::GetMousePacket(mouse, &packet))
+        {
+            FinishReceipt(&event->m_Receipt, INPUT_STATE_FAILED, "input_device_unavailable");
+            return true;
+        }
+        if (event->m_Receipt.m_State == INPUT_STATE_ACCEPTED) StartReceipt(&event->m_Receipt);
+        // The HID update also writes the OS cursor position every frame, so the requested
+        // point is held on both updates: handlers zoom about action.screen_x/y.
+        const InputPoint* at = &event->m_Points.m_Data[0];
+        dmHID::SetMousePosition(mouse, (int32_t)at->m_X, (int32_t)at->m_Y);
+        if ((event->m_WheelUpdates & 1u) == 0)
+        {
+            int32_t direction = event->m_WheelSteps > 0 ? 1 : -1;
+            g_AutomationBridge.m_WheelOffset += direction;
+            // packet.m_Wheel already holds the polled value plus the old offset (AssertWheelOffset).
+            dmHID::SetMouseWheel(mouse, packet.m_Wheel + direction);
+        }
+        ++event->m_WheelUpdates;
+        uint32_t detents = (uint32_t)(event->m_WheelSteps > 0 ? event->m_WheelSteps : -event->m_WheelSteps);
+        if (event->m_WheelUpdates < 2u * detents) return false;
+        FinishReceipt(&event->m_Receipt, INPUT_STATE_RELEASED, 0);
+        return true;
+    }
+
     bool CancelInput(uint64_t input_id, bool release, const char* reason)
     {
         InputEvent* event = FindQueuedEvent(input_id, 0);
@@ -1045,6 +1137,7 @@ namespace dmAutomationBridge
     void UpdateInput(float dt)
     {
         if (!g_AutomationBridge.m_HidContext) return;
+        AssertWheelOffset();
         uint64_t now = dmTime::GetTime();
         if (g_AutomationBridge.m_InputEvents.m_Count > 0 &&
             g_AutomationBridge.m_InputEvents.m_Data[0].m_Receipt.m_State == INPUT_STATE_ACCEPTED)
@@ -1067,9 +1160,17 @@ namespace dmAutomationBridge
         }
         uint32_t previous_key_index = event->m_KeyIndex;
         dmHID::Key previous_active_key = event->m_ActiveKey;
-        bool done = event->m_Type == INPUT_EVENT_KEYS ? UpdateKeyEvent(dt, event) : UpdateMouseEvent(dt, event);
+        bool done;
+        if (event->m_Type == INPUT_EVENT_KEYS) done = UpdateKeyEvent(dt, event);
+        else if (event->m_Type == INPUT_EVENT_WHEEL) done = UpdateWheelEvent(event);
+        else done = UpdateMouseEvent(dt, event);
         if (!done && event->m_Type == INPUT_EVENT_KEYS &&
             (event->m_KeyIndex != previous_key_index || event->m_ActiveKey != previous_active_key))
+        {
+            RefreshKeyCompletionDeadline(event, dmTime::GetTime());
+        }
+        // Every wheel update is progress: a tick, or the rest that completes it.
+        if (!done && event->m_Type == INPUT_EVENT_WHEEL)
         {
             RefreshKeyCompletionDeadline(event, dmTime::GetTime());
         }

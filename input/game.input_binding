@@ -2,6 +2,14 @@ mouse_trigger {
   input: MOUSE_BUTTON_1
   action: "touch"
 }
+mouse_trigger {
+  input: MOUSE_WHEEL_UP
+  action: "wheel_counter_up"
+}
+mouse_trigger {
+  input: MOUSE_WHEEL_DOWN
+  action: "wheel_counter_down"
+}
 key_trigger {
   input: KEY_SPACE
   action: "hold_timer"

@@ -2321,6 +2321,62 @@ class EngineClientUnitTest(unittest.TestCase):
             bridge.drag((0, 0), (10, 10), duration=0.1, modifiers=[], wait=False)
 
         self.assertEqual([], bridge.api_requests)
+
+    def test_wheel_forwards_point_and_steps(self):
+        bridge = FakeInputClient(statuses=["started", "released"])
+
+        bridge.wheel(480, 320, steps=3, wait=False)
+        bridge.wheel((10, 20), steps=-64, wait=False, expected_scene_sequence=42)
+        released = bridge.wheel({"x": 5, "y": 6}, steps=64)
+
+        up, down, waited = (request for request in bridge.api_requests if request[1] == "/input/wheel")
+        self.assertEqual("POST", up[0])
+        self.assertEqual((480, 320, 3), (up[2]["x"], up[2]["y"], up[2]["steps"]))
+        self.assertEqual((10, 20, -64), (down[2]["x"], down[2]["y"], down[2]["steps"]))
+        self.assertEqual(42, down[2]["expected_scene_sequence"])
+        self.assertEqual((5, 6, 64), (waited[2]["x"], waited[2]["y"], waited[2]["steps"]))
+        self.assertNotIn("id", up[2])
+        # Like click(), wheel() waits past "started" for the native release receipt by default.
+        self.assertEqual("released", released["state"])
+        self.assertEqual(2, sum(1 for method, path, _ in bridge.api_requests if method == "GET" and path == "/input/status"))
+
+    def test_wheel_forwards_element_target_with_identity_guard(self):
+        bridge = FakeInputClient()
+        element = Element({"id": "e:1", "logical_id": "instance:first:g2", "scene_sequence": 10})
+
+        bridge.wheel(element, steps=-2, wait=False)
+        bridge.wheel("e:2", steps=1, wait=False)
+
+        guarded, by_id = (request[2] for request in bridge.api_requests)
+        self.assertEqual("e:1", guarded["id"])
+        self.assertEqual("instance:first:g2", guarded["expected_logical_id"])
+        self.assertEqual(-2, guarded["steps"])
+        self.assertNotIn("x", guarded)
+        self.assertEqual("e:2", by_id["id"])
+        self.assertNotIn("expected_logical_id", by_id)
+
+    def test_wheel_rejects_invalid_steps_before_queueing(self):
+        bridge = FakeInputClient()
+
+        for steps in (0, 65, -65):
+            with self.subTest(steps=steps), self.assertRaisesRegex(ValueError, "between -64 and 64"):
+                bridge.wheel(480, 320, steps=steps, wait=False)
+        # The engine clamps the wheel change to 0..1 per update, so only whole
+        # detents can reach the game; a fraction is rejected rather than rounded.
+        for steps in (1.5, True, "1"):
+            with self.subTest(steps=steps), self.assertRaises(TypeError):
+                bridge.wheel(480, 320, steps=steps, wait=False)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_wheel_requires_capability_before_queueing(self):
+        bridge = FakeInputClient(wheel_supported=False)
+
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.wheel"):
+            bridge.wheel(480, 320, steps=1, wait=False)
+
+        self.assertEqual([], bridge.api_requests)
+
     def test_input_interruption_scope_flushes_after_event_wait_interrupt(self):
         bridge = FakeInputClient()
 
@@ -3748,13 +3804,15 @@ class FakeEngineClient(EngineClient):
 
 
 class FakeInputClient(EngineClient):
-    def __init__(self, statuses=None, input_key_version="2", modifiers_supported=True):
+    def __init__(self, statuses=None, input_key_version="2", modifiers_supported=True, wheel_supported=True):
         super().__init__(12345, client_id="test-client", session_id="test-session")
         self.api_requests = []
         self.statuses = list(statuses or [])
         capabilities = ["input.key"]
         if modifiers_supported:
             capabilities.append("input.modifiers")
+        if wheel_supported:
+            capabilities.append("input.wheel")
         self._last_health = {
             "version": "2",
             "capabilities": capabilities,
@@ -4715,6 +4773,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertGreaterEqual(health["engine_frame"], 0)
         self.assertEqual("1", health["capability_versions"]["scene"])
         self.assertEqual("2", health["capability_versions"]["input.key"])
+        self.assertEqual("1", health["capability_versions"]["input.wheel"])
         self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
         self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
         self.assertGreater(health["identity"]["start_wall_time_us"], 0)
@@ -4950,6 +5009,81 @@ class AutomationBridgeApiTest(unittest.TestCase):
                 "session_id": self.bridge.session_id,
             })
         self.assertEqual("bad_request", chorded_text.exception.code)
+
+        # Each wheel detent is a tick update (pressed) and a rest update (released),
+        # so the demo counts one press per detent. A physical wheel can move the
+        # label before this point, so assert counts relative to its current text.
+        def wheel_counter_text():
+            return self.bridge.element(type="gui_node_text", name_exact="wheel_counter", visible=True).text
+
+        counter_text = wheel_counter_text()
+        self.assertRegex(counter_text, r"^Wheel up \d+, down \d+, on label \d+$")
+        wheel_up, wheel_down, wheel_on_label = (int(part.split()[-1]) for part in counter_text.split(","))
+        wheel_identity = {
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        }
+        # Turned at a neutral coordinate so no game element reacts. The first turn is
+        # still running when the next same-direction turn queues behind it, so each
+        # event must end on a rest or the next tick reads as the same press held.
+        self.bridge.wheel((1, 1), steps=4, wait=False)
+        for steps in (3, -2):
+            with self.subTest(wheel_steps=steps):
+                turned = self.bridge.wheel((1, 1), steps=steps, timeout=5)
+                self.assertEqual("wheel", turned["kind"])
+                self.assertEqual("released", turned["state"])
+        # Like a key event, a wheel event owns the controller through its last rest,
+        # so a lease shorter than its 20 updates does not flush it.
+        short_lease_wheel = self.bridge.request("POST", "/input/wheel", json_body={
+            **wheel_identity, "x": 1, "y": 1, "steps": 10, "lease": 0.1,
+        })
+        short_lease_wheel = self.bridge.input.wait(short_lease_wheel, state="released", timeout=5)
+        self.assertEqual("released", short_lease_wheel["state"])
+        # Element targeting resolves the node center and holds the pointer there, so
+        # only this detent lands on the label.
+        counter = self.bridge.element(type="gui_node_text", name_exact="wheel_counter", visible=True)
+        self.assertEqual("released", self.bridge.wheel(counter, steps=1, timeout=5)["state"])
+        expected_wheel_text = (
+            f"Wheel up {wheel_up + 18}, down {wheel_down + 2}, on label {wheel_on_label + 1}"
+        )
+        wait_until(
+            wheel_counter_text,
+            timeout=2,
+            predicate=lambda text: text == expected_wheel_text,
+            message="game did not count the injected wheel detents",
+        )
+        # The engine rewrites the OS wheel into the mouse packet every frame, so a
+        # detent written only once would move back and count a false detent the
+        # other way after the event ends.
+        self.bridge.wait_frames(5)
+        self.assertEqual(expected_wheel_text, wheel_counter_text())
+
+        with self.assertRaises(StaleElementError) as stale_wheel:
+            self.bridge.wheel(stale_spawner, steps=1)
+        self.assertEqual("stale_element", stale_wheel.exception.code)
+
+        invalid_wheel_fields = [
+            {"steps": steps} for steps in (None, 0, -65, 65, 1.5, True, "", "abc", "+1", " 1", "-", "-0")
+        ]
+        # The wheel is a plain mouse input: a chord or touch is refused, not dropped.
+        # A JSON list, object, or null must fail too, not read as an absent field.
+        invalid_wheel_fields += [
+            {"steps": 1, "modifiers": modifiers} for modifiers in ("KEY_LCTRL", ["KEY_LCTRL"], None)
+        ]
+        invalid_wheel_fields += [
+            {"steps": 1, "device": device} for device in ("touch", {"type": "touch"}, "", None)
+        ]
+        for fields in invalid_wheel_fields:
+            with self.subTest(invalid_wheel=fields):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_wheel:
+                    self.bridge.request("POST", "/input/wheel", json_body={
+                        **wheel_identity, "x": 1, "y": 1, **fields,
+                    })
+                self.assertEqual("bad_request", invalid_wheel.exception.code)
+                self.assertEqual(400, invalid_wheel.exception.status)
+        with self.assertRaises(AutomationBridgeApiError) as untargeted_wheel:
+            self.bridge.request("POST", "/input/wheel", json_body={**wheel_identity, "steps": 1})
+        self.assertEqual("bad_request", untargeted_wheel.exception.code)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(
