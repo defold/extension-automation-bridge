@@ -14,7 +14,7 @@ class MetalCaptureError(RuntimeError):
 
 @dataclass(frozen=True)
 class MetalCaptureStatus:
-    """State reported by the native ``/metal`` capture endpoint."""
+    """State reported by the engine service ``/profiler/gputrace`` endpoint."""
 
     state: str
     path: Optional[str]
@@ -57,7 +57,7 @@ class MetalCaptureClient:
 
     def status(self) -> MetalCaptureStatus:
         """Return current or most recently completed Metal capture state."""
-        return MetalCaptureStatus.from_raw(self.bridge.request("GET", "/metal"))
+        return MetalCaptureStatus.from_raw(self.bridge._request("GET", "/profiler/gputrace", engine_service=True))
 
     def start(
         self,
@@ -70,7 +70,8 @@ class MetalCaptureClient:
         """Schedule a Metal GPU trace and optionally wait for completion.
 
         The running engine must use the Metal graphics adapter and must have
-        been launched with ``METAL_CAPTURE_ENABLED=1``.
+        been launched with ``METAL_CAPTURE_ENABLED=1``. It must provide the core
+        ``/profiler/gputrace`` service (see ``/openapi.json``).
         """
         check_cancelled()
         if isinstance(frames, bool) or not isinstance(frames, int) or not 1 <= frames <= 10000:
@@ -82,9 +83,10 @@ class MetalCaptureClient:
             raise ValueError("Metal capture path must end in .gputrace")
         output.parent.mkdir(parents=True, exist_ok=True)
         capture = MetalCaptureStatus.from_raw(
-            self.bridge.request(
+            self.bridge._request(
                 "POST",
-                "/metal",
+                "/profiler/gputrace",
+                engine_service=True,
                 json_body={"path": str(output), "frames": frames},
             )
         )
@@ -126,7 +128,7 @@ class MetalCaptureClient:
         """Cancel a pending capture or request early completion of an active one."""
         if wait and timeout < 0:
             raise ValueError("timeout must be non-negative")
-        capture = MetalCaptureStatus.from_raw(self.bridge.request("DELETE", "/metal"))
+        capture = MetalCaptureStatus.from_raw(self.bridge._request("DELETE", "/profiler/gputrace", engine_service=True))
         if wait and not capture.terminal:
             return self.wait(timeout=timeout)
         self.bridge._trace_record("metal_capture_finished", capture.to_dict())

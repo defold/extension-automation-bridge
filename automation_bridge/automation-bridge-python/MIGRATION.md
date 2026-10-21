@@ -24,6 +24,14 @@ Put short examples below it only when a table entry is not sufficient. Do not
 rename unrelated variables or valid Defold GUI terms such as `gui_node`,
 `gui_node_box`, and `gui_node_text`.
 
+## Wrapper 3.0 → next release: GPU capture in the engine service
+
+| Wrapper 3.0 | Next wrapper release |
+| --- | --- |
+| Native `/automation-bridge/v2/metal` endpoint | Use the core engine's `/profiler/gputrace` endpoint, listed in `/openapi.json`. |
+| `game.supports("metal.capture")` | Check for `/profiler/gputrace` in `game.engine_openapi().get("paths", {})`. GPU capture requires Metal on macOS and `METAL_CAPTURE_ENABLED=1`. The endpoint is registered only on macOS. An unsupported adapter or launch environment returns `gputrace_unsupported`. |
+| `game.metal_capture.start()`, `status()`, `wait()`, and `stop()` | Calls are unchanged, but now require the engine service endpoint above. |
+
 ## Wrapper 3.0 → next release: explicit profiler connections
 
 | Wrapper 3.0 | Next wrapper release |

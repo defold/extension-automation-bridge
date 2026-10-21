@@ -303,10 +303,15 @@ def record_optional_video(game: engine.Client, output: ProjectPath) -> None:
 
 
 def capture_optional_metal_trace(game: engine.Client, output: ProjectPath) -> None:
-    """Capture Metal only when advertised and enabled at engine launch."""
-    if not game.supports("metal.capture"):
+    """Skip capture when the engine endpoint or Metal capture support is unavailable."""
+    if "/profiler/gputrace" not in game.engine_openapi().get("paths", {}):
         return
-    capture = game.metal_capture.start(output, frames=1)
+    try:
+        capture = game.metal_capture.start(output, frames=1)
+    except engine.AutomationBridgeApiError as error:
+        if error.code == "gputrace_unsupported":
+            return
+        raise
     print(capture.path, capture.frames_captured)
 
 

@@ -71,7 +71,6 @@ Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
 `screenshot_pending`, `recording_unsupported`, `recording_active`,
 `recording_inactive`, `recording_start_failed`, `recording_stop_failed`,
-`metal_capture_unsupported`, `metal_capture_active`, `metal_capture_inactive`, and
 `unsupported_capability`. The latter names a feature
 omitted by the current platform, graphics, game-object, window, or HID backend.
 
@@ -649,36 +648,41 @@ trace clock. Native video recording does not add this correlation automatically.
 
 ## Metal GPU trace capture (macOS)
 
-### `/automation-bridge/v2/metal`
+### Engine service `/profiler/gputrace`
 
-Captures complete rendered frames to a Metal `.gputrace` on macOS when Defold is using the Metal graphics adapter. Launch the engine with `METAL_CAPTURE_ENABLED=1`; the parent directory of the requested output path must already exist.
+GPU capture is provided by the core engine service. It no longer requires a
+native extension endpoint or the `metal.capture` bridge capability. The engine
+must list `/profiler/gputrace` in `/openapi.json`.
 
-Schedule a one-frame capture:
+Captures complete rendered frames to a Metal `.gputrace` on macOS when Defold is using the Metal graphics adapter. Launch the engine with `METAL_CAPTURE_ENABLED=1`; use a writable absolute output path with no existing trace.
+
+Set `ENGINE_PORT` to the engine service port printed in the log. Schedule a one-frame capture:
 
 ```sh
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"path":"/tmp/fontgen.gputrace"}' \
-  "$BASE/metal" | python3 -m json.tool
+  "http://127.0.0.1:$ENGINE_PORT/profiler/gputrace" | python3 -m json.tool
 ```
 
+Prefer JSON bodies for paths, since the engine limits request URLs to 127 bytes.
 Use `frames` to capture more than one frame:
 
 ```sh
 curl -fsS -X POST -H 'Content-Type: application/json' \
   --data '{"path":"/tmp/fontgen.gputrace","frames":60}' \
-  "$BASE/metal" | python3 -m json.tool
+  "http://127.0.0.1:$ENGINE_PORT/profiler/gputrace" | python3 -m json.tool
 ```
 
-`POST` returns HTTP 200 with state `pending`. Capture starts at the next pre-render callback and stops after the requested number of post-render callbacks. Poll status with:
+`POST` returns HTTP 200 with state `pending`. Capture starts before rendering the next frame and stops after `Flip()` submits the requested number of complete frames. Poll status with:
 
 ```sh
-curl -fsS "$BASE/metal" | python3 -m json.tool
+curl -fsS "http://127.0.0.1:$ENGINE_PORT/profiler/gputrace" | python3 -m json.tool
 ```
 
 Request an early stop with:
 
 ```sh
-curl -fsS -X DELETE "$BASE/metal" | python3 -m json.tool
+curl -fsS -X DELETE "http://127.0.0.1:$ENGINE_PORT/profiler/gputrace" | python3 -m json.tool
 ```
 
 Status data includes `state` (`idle`, `pending`, `capturing`, `complete`, `canceled`, or `failed`), `path`, `frames`, `frames_captured`, `stop_requested`, and `error` when startup failed.

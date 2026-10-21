@@ -1987,6 +1987,15 @@ class Client:
             raise HttpError("GET", f"http://127.0.0.1:{self.port}/info", f"unexpected status {status}", status=status)
         return response
 
+    def engine_openapi(self) -> JsonDict:
+        """Return the core engine's OpenAPI document for discovering available endpoints."""
+        self._ensure_open()
+        url = f"http://127.0.0.1:{self.port}/openapi.json"
+        status, response = request_json(url, timeout=self.timeout)
+        if status < 200 or status >= 300:
+            raise HttpError("GET", url, f"unexpected status {status}", status=status)
+        return response
+
     def engine_log_port(self) -> int:
         """Return the Defold TCP log service port from engine `/info`."""
         value = self.engine_info().get("log_port")
@@ -2538,8 +2547,11 @@ class Client:
         path: str,
         params: Optional[Mapping[str, Any]] = None,
         json_body: Optional[Mapping[str, Any]] = None,
+        *,
+        engine_service: bool = False,
     ) -> JsonDict:
-        url = self.base_url + path
+        base_url = f"http://127.0.0.1:{self.port}" if engine_service else self.base_url
+        url = base_url + path
         self._ensure_open()
         encoded_params = self._encoded_params(params)
         if encoded_params:

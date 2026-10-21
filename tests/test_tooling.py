@@ -203,6 +203,58 @@ class BestPracticesReferenceTest(unittest.TestCase):
         self.assertIn("best_practices.py", guidance)
         self.assertIn("if __name__ == \"__main__\":", source)
 
+    def test_optional_metal_capture_skips_an_absent_engine_endpoint(self):
+        reference = importlib.import_module("best_practices")
+        game = EngineClient(1234, timeout=2.0)
+        document = {"openapi": "3.0.3", "paths": {"/": {"get": {}}}}
+        with mock.patch("automation_bridge.client.request_json", return_value=(200, document)) as request:
+            with mock.patch.object(MetalCaptureClient, "start") as start:
+                reference.capture_optional_metal_trace(game, "frame.gputrace")
+        request.assert_called_once_with("http://127.0.0.1:1234/openapi.json", timeout=2.0)
+        start.assert_not_called()
+
+    def test_optional_metal_capture_starts_when_the_engine_advertises_it(self):
+        reference = importlib.import_module("best_practices")
+        game = EngineClient(1234)
+        document = {"paths": {"/profiler/gputrace": {"post": {}}}}
+        capture = engine.MetalCaptureStatus("complete", "/tmp/frame.gputrace", 1, 1, False)
+        with mock.patch("automation_bridge.client.request_json", return_value=(200, document)):
+            with mock.patch.object(MetalCaptureClient, "start", return_value=capture) as start:
+                with mock.patch("builtins.print") as output:
+                    reference.capture_optional_metal_trace(game, "frame.gputrace")
+        start.assert_called_once_with("frame.gputrace", frames=1)
+        output.assert_called_once_with("/tmp/frame.gputrace", 1)
+
+    def test_optional_metal_capture_skips_an_unsupported_adapter(self):
+        reference = importlib.import_module("best_practices")
+        game = EngineClient(1234)
+        document = {"paths": {"/profiler/gputrace": {"post": {}}}}
+        error = engine.AutomationBridgeApiError("gputrace_unsupported", "Metal unavailable", 501, {})
+        with mock.patch("automation_bridge.client.request_json", return_value=(200, document)):
+            with mock.patch.object(MetalCaptureClient, "start", side_effect=error):
+                reference.capture_optional_metal_trace(game, "frame.gputrace")
+
+    def test_optional_metal_capture_preserves_other_capture_errors(self):
+        reference = importlib.import_module("best_practices")
+        game = EngineClient(1234)
+        document = {"paths": {"/profiler/gputrace": {"post": {}}}}
+        error = engine.AutomationBridgeApiError("gputrace_active", "Capture already active", 409, {})
+        with mock.patch("automation_bridge.client.request_json", return_value=(200, document)):
+            with mock.patch.object(MetalCaptureClient, "start", side_effect=error):
+                with self.assertRaises(engine.AutomationBridgeApiError) as raised:
+                    reference.capture_optional_metal_trace(game, "frame.gputrace")
+        self.assertIs(error, raised.exception)
+
+    def test_optional_metal_capture_preserves_discovery_failures(self):
+        reference = importlib.import_module("best_practices")
+        game = EngineClient(1234)
+        with mock.patch("automation_bridge.client.request_json", return_value=(500, {})):
+            with mock.patch.object(MetalCaptureClient, "start") as start:
+                with self.assertRaises(engine.HttpError) as raised:
+                    reference.capture_optional_metal_trace(game, "frame.gputrace")
+        self.assertEqual(500, raised.exception.status)
+        start.assert_not_called()
+
 
 class GestureGeneratorTest(unittest.TestCase):
     def test_seed_is_deterministic_and_result_is_drag_path_kwargs(self):
@@ -313,7 +365,8 @@ class MetalCaptureTest(unittest.TestCase):
             self.traces = []
             self.states = list(states or [])
 
-        def request(self, method, path, *, params=None, json_body=None):
+        def _request(self, method, path, *, params=None, json_body=None, engine_service=False):
+            assert engine_service
             self.requests.append((method, path, params, json_body))
             request_data = json_body if json_body is not None else params
             if method == "POST":
@@ -339,7 +392,7 @@ class MetalCaptureTest(unittest.TestCase):
         def _trace_record(self, kind, payload):
             self.traces.append((kind, payload))
 
-    def test_start_uses_metal_endpoint_and_waits_for_complete(self):
+    def test_start_uses_engine_gputrace_endpoint_and_waits_for_complete(self):
         states = [
             {"state": "capturing", "path": "/tmp/frame.gputrace", "frames": 2,
              "frames_captured": 1, "stop_requested": False},
@@ -358,7 +411,7 @@ class MetalCaptureTest(unittest.TestCase):
 
         self.assertTrue(capture.complete)
         self.assertEqual(2, capture.frames_captured)
-        self.assertEqual(("POST", "/metal"), bridge.requests[0][:2])
+        self.assertEqual(("POST", "/profiler/gputrace"), bridge.requests[0][:2])
         self.assertIsNone(bridge.requests[0][2])
         self.assertEqual(expected_path, Path(bridge.requests[0][3]["path"]))
         self.assertEqual(2, bridge.requests[0][3]["frames"])
@@ -379,7 +432,7 @@ class MetalCaptureTest(unittest.TestCase):
         bridge = self.Bridge()
         capture = MetalCaptureClient(bridge).stop()
         self.assertEqual("canceled", capture.state)
-        self.assertEqual(("DELETE", "/metal"), bridge.requests[0][:2])
+        self.assertEqual(("DELETE", "/profiler/gputrace"), bridge.requests[0][:2])
 
     def test_path_and_frame_count_are_validated(self):
         client = MetalCaptureClient(self.Bridge())
@@ -387,6 +440,20 @@ class MetalCaptureTest(unittest.TestCase):
             client.start("frame.trace", wait=False)
         with self.assertRaises(ValueError):
             client.start("frame.gputrace", frames=0, wait=False)
+
+
+    def test_core_service_uses_engine_origin_and_preserves_native_errors(self):
+        client = EngineClient(1234)
+        status = {"state": "idle", "path": "", "frames": 0,
+                  "frames_captured": 0, "stop_requested": False}
+        with mock.patch("automation_bridge.client.request_json", return_value=(200, {"ok": True, "data": status})) as request:
+            self.assertEqual("idle", client.metal_capture.status().state)
+            self.assertEqual("http://127.0.0.1:1234/profiler/gputrace", request.call_args.args[0])
+        response = {"ok": False, "error": {"status": 501, "code": "gputrace_unsupported", "message": "Metal unavailable"}}
+        with mock.patch("automation_bridge.client.request_json", return_value=(501, response)):
+            with self.assertRaises(engine.AutomationBridgeApiError) as error:
+                client.metal_capture.status()
+        self.assertEqual("gputrace_unsupported", error.exception.code)
 
 
 class _TraceClient:

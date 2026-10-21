@@ -729,11 +729,17 @@ capture = game.metal_capture.start("captures/frame.gputrace", frames=1)
 print(capture.path, capture.frames_captured)
 ```
 
-The engine must be launched with `METAL_CAPTURE_ENABLED=1`, and health must
-advertise `metal.capture`. `start()` creates the parent directory, schedules the
+The engine must provide `/profiler/gputrace` in its `/openapi.json`, use Metal on
+macOS, and be launched with `METAL_CAPTURE_ENABLED=1`. GPU capture is now a core
+engine service; the bridge no longer advertises `metal.capture`. `start()` creates the parent directory, schedules the
 capture, and waits for `complete` by default; pass `wait=False`, inspect
 `status()`, or call `stop()` for explicit lifecycle control. Analyze the result
 with Xcode or, when installed, `gpudebug`.
+
+For optional captures, first check for `/profiler/gputrace` in
+`game.engine_openapi().get("paths", {})`, then handle `gputrace_unsupported` for
+an unsupported adapter or launch environment. See `capture_optional_metal_trace`
+in `best_practices.py`.
 
 Video recording is native and namespaced. It records the running Defold
 process's largest on-screen window to H.264 MP4 using ScreenCaptureKit on
