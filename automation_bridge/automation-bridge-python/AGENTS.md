@@ -30,7 +30,9 @@
   stale-identity protection; handle `engine.StaleElementError` by re-querying.
 - Use `game.parent(component)` when a visible child exposes the selector but its
   parent receives input. Use `type_text()` for literal text and `key()` for one
-  validated special key.
+  validated special key. Pass `button="right"` or `"middle"` to `click()`,
+  `drag()`, `drag_path()`, or `pointer()` for other mouse buttons; it needs
+  `input.button`.
 - Prefer events, published state, commands, acknowledgements, frame waits, and
   element waits over sleeps.
 - Discover game-specific operations with `game.application_catalog()`; command

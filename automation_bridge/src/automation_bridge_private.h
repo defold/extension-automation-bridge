@@ -230,6 +230,10 @@ namespace dmAutomationBridge
         InputDevice m_Device;
         uint32_t    m_PointerId;
         uint8_t     m_ModifierCount;
+        // Pressed mouse button, echoed as "button" for mouse pointer gestures only
+        // (null for touch, key, and wheel receipts).
+        bool               m_HasMouseButton;
+        dmHID::MouseButton m_MouseButton;
     };
 
     struct InputEvent
@@ -589,6 +593,8 @@ namespace dmAutomationBridge
     const char* InputStateName(InputState state);
     const char* InputDeviceName(InputDevice device);
     bool ParseInputDevice(const char* value, InputDevice* device);
+    const char* MouseButtonName(dmHID::MouseButton button);
+    bool ParseMouseButton(const char* value, dmHID::MouseButton* button);
     bool ParseInputEasing(const char* value, InputEasing* easing);
     bool IsInputDeviceSupported(InputDevice device);
     InputDevice ResolveInputDevice(InputDevice device);
@@ -597,6 +603,7 @@ namespace dmAutomationBridge
     void ReleaseInputController(const char* client_id, const char* session_id);
     bool AddMouseInput(const Array<InputPoint>* points, InputPathMode path_mode, float hold_before, float hold_after,
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
+                       dmHID::MouseButton button,
                        const dmHID::Key* modifiers, uint32_t modifier_count,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt);

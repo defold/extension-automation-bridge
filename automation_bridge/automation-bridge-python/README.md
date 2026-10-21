@@ -459,6 +459,7 @@ coordinates:
 ```python
 game.click(element)
 game.click(480, 320)
+game.click(element, button="right")
 game.drag(first, second, duration=0.2, easing="ease_in_out")
 game.type_text("Hello")
 game.key("SPACE")
@@ -479,6 +480,12 @@ characters as literal UTF-8 text.
 integer from `-64` to `64`, positive for `mouse_wheel_up`. Each detent is one
 `pressed` action, and fractional values are rejected before input is queued. It
 requires `input.wheel`.
+
+`click()`, `drag()`, `drag_path()`, and `pointer()` accept `button="left"` (the
+default), `"right"`, or `"middle"`. A right or middle button requires
+`input.button`, because an older native endpoint ignores the field and presses the
+left button; it is a mouse input, so `device="touch"` is rejected before input is
+queued. Receipts echo `button` for mouse gestures.
 
 `click()`, `drag()`, `drag_path()`, and `wheel()` wait for native release by
 default. `type_text()` and `key()` return after the request is accepted unless a

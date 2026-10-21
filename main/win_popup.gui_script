@@ -4,6 +4,8 @@ local CHORD_SHIFT_ACTION = hash("modifier_chord_shift")
 local CHORD_ALT_ACTION = hash("modifier_chord_alt")
 local WHEEL_UP_ACTION = hash("wheel_counter_up")
 local WHEEL_DOWN_ACTION = hash("wheel_counter_down")
+local BUTTON_RIGHT_ACTION = hash("button_counter_right")
+local BUTTON_MIDDLE_ACTION = hash("button_counter_middle")
 local MAX_HOLD_SECONDS = 60
 
 local function set_hold_timer_text(self, prefix)
@@ -17,6 +19,10 @@ end
 
 local function set_wheel_counter_text(self)
 	gui.set_text(gui.get_node("wheel_counter"), string.format("Wheel up %d, down %d, on label %d", self.wheel_up, self.wheel_down, self.wheel_on_label))
+end
+
+local function set_button_counter_text(self)
+	gui.set_text(gui.get_node("button_counter"), string.format("Right %d, middle %d, released %d, on label %d", self.button_right, self.button_middle, self.button_released, self.button_on_label))
 end
 
 local function set_popup_enabled(enabled)
@@ -36,9 +42,14 @@ function init(self)
 	self.wheel_up = 0
 	self.wheel_down = 0
 	self.wheel_on_label = 0
+	self.button_right = 0
+	self.button_middle = 0
+	self.button_released = 0
+	self.button_on_label = 0
 	set_hold_timer_text(self, "Hold SPACE")
 	set_modifier_chord_text("Send H + SHIFT + ALT")
 	set_wheel_counter_text(self)
+	set_button_counter_text(self)
 	set_popup_enabled(false)
 end
 
@@ -120,6 +131,24 @@ function on_input(self, action_id, action)
 			end
 			set_wheel_counter_text(self)
 		end
+		return true
+	end
+
+	if action_id == BUTTON_RIGHT_ACTION or action_id == BUTTON_MIDDLE_ACTION then
+		if action.pressed then
+			if action_id == BUTTON_RIGHT_ACTION then
+				self.button_right = self.button_right + 1
+			else
+				self.button_middle = self.button_middle + 1
+			end
+			-- Presses over the label prove the button went down at the click target.
+			if gui.pick_node(gui.get_node("button_counter"), action.x, action.y) then
+				self.button_on_label = self.button_on_label + 1
+			end
+		elseif action.released then
+			self.button_released = self.button_released + 1
+		end
+		set_button_counter_text(self)
 		return true
 	end
 

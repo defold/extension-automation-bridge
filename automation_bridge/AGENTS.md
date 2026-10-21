@@ -24,7 +24,10 @@
   or key press, pressed one update before the primary action and released one
   update after; it needs the `input.modifiers` capability. `/input/wheel` turns
   the mouse wheel by a non-zero integer `steps` (`-64..64`, one detent each) at
-  an element or point; it needs the `input.wheel` capability.
+  an element or point; it needs the `input.wheel` capability. `button`
+  (`left`, `right`, or `middle`) picks the mouse button for a click, drag,
+  path, or pointer session; a non-left button needs the `input.button`
+  capability and the mouse device.
 - Screenshot and Metal captures are asynchronous; poll their status receipts.
   Metal capture requires macOS, the Metal adapter, and
   `METAL_CAPTURE_ENABLED=1`; inspect completed traces with `gpudebug` when
