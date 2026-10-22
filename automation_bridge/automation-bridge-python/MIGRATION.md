@@ -24,6 +24,30 @@ Put short examples below it only when a table entry is not sufficient. Do not
 rename unrelated variables or valid Defold GUI terms such as `gui_node`,
 `gui_node_box`, and `gui_node_text`.
 
+## Wrapper 3.0 → next release: GPU capture moves to the core engine
+
+| Wrapper 3.0 | Next wrapper release |
+| --- | --- |
+| `game.metal_capture.start()`, `status()`, `wait()`, and `stop()`; `engine.MetalCaptureClient`, `MetalCaptureError`, and `MetalCaptureStatus` | Removed. Use the core engine service's `/profiler/gputrace` endpoint directly. `POST` schedules capture, `GET` reports status, and `DELETE` cancels or stops capture. |
+| `game.supports("metal.capture")` | The bridge no longer advertises this capability. Check the engine's `/openapi.json` for `/profiler/gputrace`. |
+| `/automation-bridge/v2/metal` | Removed. Send requests to `/profiler/gputrace` on the engine service port, without the bridge prefix. |
+
+GPU capture requires an engine that provides this endpoint, macOS, the Metal
+graphics adapter, and `METAL_CAPTURE_ENABLED=1`. Use a writable absolute output
+path that does not already contain a trace. For example, with `ENGINE` set to
+the engine service URL printed in the log:
+
+```sh
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data '{"path":"/tmp/frame.gputrace","frames":1}' \
+  "$ENGINE/profiler/gputrace"
+curl -fsS "$ENGINE/profiler/gputrace"
+```
+
+Poll `GET` until capture reaches a terminal state. The engine's OpenAPI document
+provides the request and response schemas; an unsupported adapter or launch
+environment returns HTTP 501.
+
 ## Wrapper 3.0 → next release: explicit profiler connections
 
 | Wrapper 3.0 | Next wrapper release |
