@@ -10,6 +10,14 @@ mouse_trigger {
   input: MOUSE_WHEEL_DOWN
   action: "wheel_counter_down"
 }
+mouse_trigger {
+  input: MOUSE_BUTTON_RIGHT
+  action: "button_counter_right"
+}
+mouse_trigger {
+  input: MOUSE_BUTTON_MIDDLE
+  action: "button_counter_middle"
+}
 key_trigger {
   input: KEY_SPACE
   action: "hold_timer"

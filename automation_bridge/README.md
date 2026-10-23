@@ -373,7 +373,9 @@ Accepted input returns HTTP 200 with this lifecycle receipt in `data`:
   "scene_sequence": 8,
   "engine_frame": 120,
   "device": "mouse",
-  "pointer_id": 0
+  "pointer_id": 0,
+  "modifier_count": 0,
+  "button": "left"
 }
 ```
 
@@ -393,13 +395,16 @@ now belongs to a different runtime instance, the request returns logical status 
 
 Use `id`, or finite `x`/`y`. Optional common fields are `device`, `pointer_id`, `visualize`, `expected_scene_sequence`, and the ownership/correlation fields above. `modifiers` holds up to four comma-separated key names (e.g. `modifiers=KEY_LSHIFT` for shift-click) as a chord for the whole gesture: pressed one engine update before the pointer goes down and released one update after it comes up, re-asserted every update while the event plays. Accepted names are the same as the `keys` parameter's special keys; unknown names, an empty list, or more than four return an error instead of silently tapping unmodified.
 
+`button` selects the mouse button held for the gesture: `left` (the default), `right`, or `middle`, matching Defold's `MOUSE_BUTTON_LEFT`, `MOUSE_BUTTON_RIGHT`, and `MOUSE_BUTTON_MIDDLE` bindings. It applies the same way to `/input/drag`, `/input/drag_path`, and `/input/pointer/open`, where the button stays down until the final up. Any other supplied value, including an empty, upper-case, numeric, list, object, or `null` value, returns `bad_request` instead of becoming a left click. A touch contact has no buttons: `right` or `middle` with a device that resolves to `touch` returns `input_device_unsupported`. The receipt echoes `button` for mouse gestures and `null` for touch, key, and wheel receipts. Advertised as the `input.button` capability (version `1`); an older bridge ignores the field and clicks left, so negotiate the capability before sending a non-left button.
+
 ```sh
 curl -fsS -X POST "$BASE/input/click?id=e:0123456789abcdef&client_id=runner&session_id=test&request_id=click-1"
+curl -fsS -X POST "$BASE/input/click?x=480&y=320&button=right&client_id=runner&session_id=test"
 ```
 
 ### `POST /automation-bridge/v2/input/drag`
 
-Use `from_id`/`to_id`, or `x1`/`y1`/`x2`/`y2`. `duration`, `hold_before`, and `hold_after` are seconds in `0..60`; their total must not exceed 60. `easing` is `linear`, `ease_in`, `ease_out`, or `ease_in_out`. `modifiers` works as on `/input/click` (e.g. `modifiers=KEY_LCTRL` for ctrl-drag), held across the whole down/move/up.
+Use `from_id`/`to_id`, or `x1`/`y1`/`x2`/`y2`. `duration`, `hold_before`, and `hold_after` are seconds in `0..60`; their total must not exceed 60. `easing` is `linear`, `ease_in`, `ease_out`, or `ease_in_out`. `modifiers` and `button` work as on `/input/click` (e.g. `modifiers=KEY_LCTRL` for ctrl-drag, `button=right` for a right-button drag), held across the whole down/move/up.
 
 ```sh
 curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=.35&easing=ease_in_out&client_id=runner&session_id=test"
@@ -407,7 +412,7 @@ curl -fsS -X POST "$BASE/input/drag?x1=100&y1=100&x2=500&y2=300&duration=.35&eas
 
 ### `POST /automation-bridge/v2/input/drag_path`
 
-Runs exactly one down, a continuous native path, and one up. `points` contains `x,y` pairs separated by semicolons. For `path=sampled` or `linear`, `durations` and `easing` have one comma-separated value per segment. `path=quadratic` requires three control points and one duration/easing; `path=cubic` requires four. Paths contain 2–128 points, the encoded point list is limited to 8192 bytes, and total duration including holds is at most 60 seconds. Visualization records and draws positions actually injected on engine updates, including the sampled curve, rather than drawing only a start/end chord. `modifiers` works as on `/input/click`, held across the whole gesture.
+Runs exactly one down, a continuous native path, and one up. `points` contains `x,y` pairs separated by semicolons. For `path=sampled` or `linear`, `durations` and `easing` have one comma-separated value per segment. `path=quadratic` requires three control points and one duration/easing; `path=cubic` requires four. Paths contain 2–128 points, the encoded point list is limited to 8192 bytes, and total duration including holds is at most 60 seconds. Visualization records and draws positions actually injected on engine updates, including the sampled curve, rather than drawing only a start/end chord. `modifiers` and `button` work as on `/input/click`, held across the whole gesture.
 
 ```sh
 curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -417,7 +422,7 @@ curl -fsS -X POST -H 'Content-Type: application/json' \
 
 ### Low-level pointer sessions
 
-`POST /input/pointer/open?x=...&y=...&pointer_lease=2...` creates a leased pointer receipt. `modifiers` works as on `/input/click`, held for the whole session until the pointer releases. Append continuous work with `/input/pointer/move?input_id=...&x=...&y=...&duration=...&easing=...` and `/input/pointer/hold?input_id=...&duration=...`; finish with `/input/pointer/up?input_id=...`. Every command includes the same client/session identity and renews `pointer_lease`. If the client disappears, expiry emits a safe release/cancel. `POST /input/cancel` closes a session immediately.
+`POST /input/pointer/open?x=...&y=...&pointer_lease=2...` creates a leased pointer receipt. `modifiers` and `button` work as on `/input/click`, held for the whole session until the pointer releases. Append continuous work with `/input/pointer/move?input_id=...&x=...&y=...&duration=...&easing=...` and `/input/pointer/hold?input_id=...&duration=...`; finish with `/input/pointer/up?input_id=...`. Every command includes the same client/session identity and renews `pointer_lease`. If the client disappears, expiry emits a safe release/cancel. `POST /input/cancel` closes a session immediately.
 
 ### `POST /automation-bridge/v2/input/key`
 

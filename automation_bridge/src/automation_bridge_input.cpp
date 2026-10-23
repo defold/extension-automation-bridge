@@ -65,6 +65,39 @@ namespace dmAutomationBridge
         return false;
     }
 
+    const char* MouseButtonName(dmHID::MouseButton button)
+    {
+        switch (button)
+        {
+            case dmHID::MOUSE_BUTTON_RIGHT: return "right";
+            case dmHID::MOUSE_BUTTON_MIDDLE: return "middle";
+            default: return "left";
+        }
+    }
+
+    // Unlike ParseInputDevice, an empty value is not a default: the caller only parses
+    // a supplied "button", and a supplied empty value is malformed.
+    bool ParseMouseButton(const char* value, dmHID::MouseButton* button)
+    {
+        if (IsEmpty(value)) return false;
+        if (StringsEqual(value, "left"))
+        {
+            *button = dmHID::MOUSE_BUTTON_LEFT;
+            return true;
+        }
+        if (StringsEqual(value, "right"))
+        {
+            *button = dmHID::MOUSE_BUTTON_RIGHT;
+            return true;
+        }
+        if (StringsEqual(value, "middle"))
+        {
+            *button = dmHID::MOUSE_BUTTON_MIDDLE;
+            return true;
+        }
+        return false;
+    }
+
     bool ParseInputEasing(const char* value, InputEasing* easing)
     {
         if (IsEmpty(value) || StringsEqual(value, "linear"))
@@ -304,6 +337,7 @@ namespace dmAutomationBridge
 
     bool AddMouseInput(const Array<InputPoint>* points, InputPathMode path_mode, float hold_before, float hold_after,
                        InputDevice device, uint32_t pointer_id, bool visualize, const char* kind,
+                       dmHID::MouseButton button,
                        const dmHID::Key* modifiers, uint32_t modifier_count,
                        const char* client_id, const char* session_id, const char* request_id,
                        uint64_t scene_sequence, float lease, bool pointer_open, InputReceipt** receipt)
@@ -317,6 +351,11 @@ namespace dmAutomationBridge
         {
             return false;
         }
+        // A touch contact has no buttons; the HTTP layer rejects this before queueing.
+        if (resolved != INPUT_DEVICE_MOUSE && button != dmHID::MOUSE_BUTTON_LEFT)
+        {
+            return false;
+        }
 
         InputEvent event;
         memset(&event, 0, sizeof(event));
@@ -324,7 +363,7 @@ namespace dmAutomationBridge
         event.m_PathMode = path_mode;
         event.m_HoldBefore = MaxFloat(0.0f, hold_before);
         event.m_HoldAfter = MaxFloat(0.0f, hold_after);
-        event.m_MouseButton = dmHID::MOUSE_BUTTON_LEFT;
+        event.m_MouseButton = button;
         event.m_Visualize = visualize;
         event.m_ActiveKey = dmHID::MAX_KEY_COUNT;
         SetEventModifiers(&event, modifiers, modifier_count);
@@ -339,6 +378,8 @@ namespace dmAutomationBridge
         memcpy(event.m_Points.m_Data, points->m_Data, sizeof(InputPoint) * points->m_Count);
         event.m_Receipt.m_RequestedDuration = event.m_HoldBefore + RequestedPathDuration(points, path_mode) + event.m_HoldAfter;
         event.m_Receipt.m_ModifierCount = event.m_ModifierCount; // echoed in receipts so callers can detect a bridge without modifier support
+        event.m_Receipt.m_HasMouseButton = resolved == INPUT_DEVICE_MOUSE;
+        event.m_Receipt.m_MouseButton = button;
         if (!ArrayPush(&g_AutomationBridge.m_InputEvents, &event))
         {
             FreeInputEvent(&event);
@@ -571,6 +612,8 @@ namespace dmAutomationBridge
         AppendNumber(out, (double)receipt->m_PointerId);
         StringBufferAppend(out, ",\"modifier_count\":");
         AppendNumber(out, (double)receipt->m_ModifierCount);
+        StringBufferAppend(out, ",\"button\":");
+        if (receipt->m_HasMouseButton) AppendJsonString(out, MouseButtonName(receipt->m_MouseButton)); else StringBufferAppend(out, "null");
         StringBufferAppendChar(out, '}');
     }
 
