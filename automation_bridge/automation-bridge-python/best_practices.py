@@ -169,6 +169,8 @@ def send_safe_input(game: engine.Client) -> None:
     game.key("SPACE", hold=1.0, wait="released", timeout=2.0)
     if game.supports("input.wheel"):
         game.wheel(game.element(automation_id="map", visible=True), steps=-2)
+    if game.supports("input.button"):
+        game.click(game.element(automation_id="inventory_slot", visible=True), button="right")
 
 
 def control_input_lifecycle(game: engine.Client) -> None:

@@ -2322,6 +2322,56 @@ class EngineClientUnitTest(unittest.TestCase):
 
         self.assertEqual([], bridge.api_requests)
 
+    def test_button_is_forwarded_for_every_pointer_gesture(self):
+        bridge = FakeInputClient()
+
+        bridge.click((10, 10), button="right", wait=False)
+        bridge.drag((0, 0), (10, 10), duration=0.1, button="Middle", wait=False)
+        bridge.drag_path([(0, 0), (5, 5)], [0.1], button=" RIGHT ", wait=False)
+        bridge.pointer((10, 10), button="right")
+        bridge.click((10, 10), button="left", wait=False)
+        bridge.click((10, 10), wait=False)
+
+        clicked, dragged, pathed, opened, left, plain = (request for request in bridge.api_requests)
+        self.assertEqual(("/input/click", "right"), (clicked[1], clicked[2]["button"]))
+        self.assertEqual(("/input/drag", "middle"), (dragged[1], dragged[2]["button"]))
+        self.assertEqual(("/input/drag_path", "right"), (pathed[1], pathed[2]["button"]))
+        self.assertEqual(("/input/pointer/open", "right"), (opened[1], opened[2]["button"]))
+        # Left is the native default, so it is never sent.
+        self.assertNotIn("button", left[2])
+        self.assertNotIn("button", plain[2])
+
+    def test_button_rejects_invalid_before_queueing(self):
+        bridge = FakeInputClient()
+
+        for button in ("", "back", "MOUSE_BUTTON_RIGHT", "2"):
+            with self.subTest(button=button), self.assertRaisesRegex(ValueError, "left, right, or middle"):
+                bridge.click((10, 10), button=button, wait=False)
+        for button in (2, True, ["right"]):
+            with self.subTest(button=button), self.assertRaises(TypeError):
+                bridge.click((10, 10), button=button, wait=False)
+        # A touch contact has no buttons.
+        with self.assertRaisesRegex(ValueError, "mouse device"):
+            bridge.click((10, 10), button="right", device="touch", wait=False)
+
+        self.assertEqual([], bridge.api_requests)
+
+    def test_button_requires_capability_before_queueing(self):
+        bridge = FakeInputClient(button_supported=False)
+
+        # An older bridge ignores an unknown button field and clicks left, so a
+        # right click must fail instead of silently becoming a left click.
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.button"):
+            bridge.click((10, 10), button="right", wait=False)
+        with self.assertRaisesRegex(UnsupportedCapabilityError, "input.button"):
+            bridge.pointer((10, 10), button="middle")
+
+        self.assertEqual([], bridge.api_requests)
+
+        # A left-button gesture stays compatible with a bridge that lacks the capability.
+        bridge.click((10, 10), button="left", wait=False)
+        self.assertNotIn("button", bridge.api_requests[0][2])
+
     def test_wheel_forwards_point_and_steps(self):
         bridge = FakeInputClient(statuses=["started", "released"])
 
@@ -3804,7 +3854,8 @@ class FakeEngineClient(EngineClient):
 
 
 class FakeInputClient(EngineClient):
-    def __init__(self, statuses=None, input_key_version="2", modifiers_supported=True, wheel_supported=True):
+    def __init__(self, statuses=None, input_key_version="2", modifiers_supported=True, wheel_supported=True,
+                 button_supported=True):
         super().__init__(12345, client_id="test-client", session_id="test-session")
         self.api_requests = []
         self.statuses = list(statuses or [])
@@ -3813,6 +3864,8 @@ class FakeInputClient(EngineClient):
             capabilities.append("input.modifiers")
         if wheel_supported:
             capabilities.append("input.wheel")
+        if button_supported:
+            capabilities.append("input.button")
         self._last_health = {
             "version": "2",
             "capabilities": capabilities,
@@ -4785,6 +4838,7 @@ class AutomationBridgeApiTest(unittest.TestCase):
         self.assertEqual("1", health["capability_versions"]["scene"])
         self.assertEqual("2", health["capability_versions"]["input.key"])
         self.assertEqual("1", health["capability_versions"]["input.wheel"])
+        self.assertEqual("1", health["capability_versions"]["input.button"])
         self.assertTrue(health["identity"]["engine_instance_id"].startswith("engine:"))
         self.assertTrue(health["identity"]["project_identity"].startswith("project:"))
         self.assertGreater(health["identity"]["start_wall_time_us"], 0)
@@ -5095,6 +5149,61 @@ class AutomationBridgeApiTest(unittest.TestCase):
         with self.assertRaises(AutomationBridgeApiError) as untargeted_wheel:
             self.bridge.request("POST", "/input/wheel", json_body={**wheel_identity, "steps": 1})
         self.assertEqual("bad_request", untargeted_wheel.exception.code)
+
+        # Right and middle presses reach their own bindings, never the left-button
+        # "touch" action. A physical mouse can move the label before this point, so
+        # assert counts relative to its current text.
+        def button_counter_text():
+            return self.bridge.element(type="gui_node_text", name_exact="button_counter", visible=True).text
+
+        counter_text = button_counter_text()
+        self.assertRegex(counter_text, r"^Right \d+, middle \d+, released \d+, on label \d+$")
+        button_right, button_middle, button_released, button_on_label = (
+            int(part.split()[-1]) for part in counter_text.split(",")
+        )
+        button_identity = {
+            "client_id": self.bridge.client_id,
+            "session_id": self.bridge.session_id,
+        }
+        right_click = self.bridge.click((1, 1), button="right", timeout=5)
+        self.assertEqual(("click", "released", "right"), (right_click["kind"], right_click["state"], right_click["button"]))
+        middle_click = self.bridge.click((1, 1), button="middle", timeout=5)
+        self.assertEqual("middle", middle_click["button"])
+        self.assertEqual("left", self.bridge.click((1, 1), timeout=5)["button"])
+        # Element targeting resolves the node center, so only this press lands on the label.
+        counter = self.bridge.element(type="gui_node_text", name_exact="button_counter", visible=True)
+        self.assertEqual("right", self.bridge.click(counter, button="right", timeout=5)["button"])
+        # A pointer session holds the chosen button until up.
+        with self.bridge.pointer((1, 1), button="right") as held:
+            held.hold(0.05)
+        self.assertEqual("right", self.bridge.input.status(held.input_id)["button"])
+        expected_button_text = (
+            f"Right {button_right + 3}, middle {button_middle + 1}, "
+            f"released {button_released + 4}, on label {button_on_label + 1}"
+        )
+        wait_until(
+            button_counter_text,
+            timeout=2,
+            predicate=lambda text: text == expected_button_text,
+            message="game did not count the injected right and middle presses",
+        )
+        # The spawner reacts only to the left button, so a right click on it must not spawn.
+        spawner = self.bridge.element(type="goc", name_exact="/spawner", visible=True)
+        before_right_spawn = self.label_count("L1")
+        self.bridge.click(spawner, button="right", timeout=5)
+        self.bridge.wait_frames(5)
+        self.assertEqual(before_right_spawn, self.label_count("L1"))
+
+        # A supplied value that is not a button name fails, including a JSON list,
+        # object, or null, instead of silently becoming a left click.
+        for button in ("", "RIGHT", "back", "MOUSE_BUTTON_RIGHT", 2, True, ["right"], {"name": "right"}, None):
+            with self.subTest(invalid_button=button):
+                with self.assertRaises(AutomationBridgeApiError) as invalid_button:
+                    self.bridge.request("POST", "/input/click", json_body={
+                        **button_identity, "x": 1, "y": 1, "button": button,
+                    })
+                self.assertEqual("bad_request", invalid_button.exception.code)
+                self.assertEqual(400, invalid_button.exception.status)
 
         self.finish_merge_game()
         gui_nodes = self.bridge.elements(

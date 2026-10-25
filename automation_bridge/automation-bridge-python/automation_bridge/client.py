@@ -34,6 +34,7 @@ JsonDict = Dict[str, Any]
 Target = Union[Element, str, Mapping[str, Any], Sequence[float]]
 _SCREEN_DIMENSION_MAX = 0x7FFFFFFF
 _INPUT_EASINGS = {"linear", "ease_in", "ease_out", "ease_in_out"}
+_MOUSE_BUTTONS = {"left", "right", "middle"}
 _NAMED_KEYS = {
     "SPACE", "ESC", "ESCAPE", "UP", "DOWN", "LEFT", "RIGHT", "TAB", "ENTER",
     "BACKSPACE", "INSERT", "DEL", "DELETE", "PAGEUP", "PAGEDOWN", "HOME", "END",
@@ -1372,6 +1373,7 @@ class Client:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
         modifiers: Optional[Union[str, Sequence[str]]] = None,
+        button: Optional[str] = None,
     ) -> InputReceipt:
         """Queue one FIFO click and optionally wait for the native release receipt.
 
@@ -1379,6 +1381,10 @@ class Client:
         ``"LSHIFT"`` for shift-click): pressed one update before the pointer goes
         down and released one update after it comes up, so bindings that track the
         modifier's own key trigger observe the same ordering a human chord produces.
+
+        ``button`` is ``"left"`` (the default), ``"right"``, or ``"middle"``. A right
+        or middle click is a mouse input: it requires the ``input.button``
+        capability and raises ``ValueError`` with ``device="touch"``.
         """
         check_cancelled()
         json_body = self._input_target(target, y)
@@ -1390,6 +1396,9 @@ class Client:
         if normalized_modifiers is not None:
             self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
+        normalized_button = self._normalize_button(button, device)
+        if normalized_button is not None:
+            json_body["button"] = normalized_button
         receipt = InputReceipt(self._request("POST", "/input/click", json_body=json_body))
         return self._wait_input_compat(
             receipt, wait, timeout, cancel_on_interrupt, flush_on_interrupt
@@ -1412,12 +1421,14 @@ class Client:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
         modifiers: Optional[Union[str, Sequence[str]]] = None,
+        button: Optional[str] = None,
     ) -> InputReceipt:
         """Queue one FIFO drag and wait on native lifecycle state, never wall-clock guessing.
 
         ``modifiers`` holds up to four keys as a chord for the whole drag (e.g.
         ``"LCTRL"`` for ctrl-drag), pressed one update before the pointer goes down
-        and released one update after the final up.
+        and released one update after the final up. ``button`` selects the held
+        mouse button as for ``click()``.
         """
         check_cancelled()
         if self._is_element_ref(from_target) and self._is_element_ref(to_target):
@@ -1450,6 +1461,9 @@ class Client:
         if normalized_modifiers is not None:
             self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
+        normalized_button = self._normalize_button(button, device)
+        if normalized_button is not None:
+            json_body["button"] = normalized_button
         receipt = InputReceipt(self._request("POST", "/input/drag", json_body=json_body))
         return self._wait_input_compat(
             receipt,
@@ -1476,11 +1490,13 @@ class Client:
         cancel_on_interrupt: bool = True,
         flush_on_interrupt: bool = False,
         modifiers: Optional[Union[str, Sequence[str]]] = None,
+        button: Optional[str] = None,
     ) -> InputReceipt:
         """Run one down/path/up gesture with native segment timing, easing, holds, and curves.
 
         ``modifiers`` holds up to four keys as a chord for the whole gesture, pressed
         one update before the pointer goes down and released one update after the up.
+        ``button`` selects the held mouse button as for ``click()``.
         """
         check_cancelled()
         normalized_points = [self._point(point) for point in points]
@@ -1523,6 +1539,9 @@ class Client:
         if normalized_modifiers is not None:
             self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
+        normalized_button = self._normalize_button(button, device)
+        if normalized_button is not None:
+            json_body["button"] = normalized_button
         receipt = InputReceipt(self._request("POST", "/input/drag_path", json_body=json_body))
         return self._wait_input_compat(
             receipt,
@@ -1541,11 +1560,14 @@ class Client:
         pointer_id: int = 0,
         expected_scene_sequence: Optional[int] = None,
         modifiers: Optional[Union[str, Sequence[str]]] = None,
+        button: Optional[str] = None,
     ) -> PointerSession:
         """Press a leased pointer for continuous `move`/`hold` operations and safe cleanup.
 
         ``modifiers`` holds up to four keys as a chord for the whole session, pressed
         one update before the pointer goes down and released one update after the up.
+        ``button`` selects the held mouse button for the whole session as for
+        ``click()``.
         """
         check_cancelled()
         lease = self._input_duration(lease, "lease")
@@ -1568,6 +1590,9 @@ class Client:
         if normalized_modifiers is not None:
             self._require_cached_capability("input.modifiers")
             json_body["modifiers"] = normalized_modifiers
+        normalized_button = self._normalize_button(button, device)
+        if normalized_button is not None:
+            json_body["button"] = normalized_button
         receipt = InputReceipt(self._request("POST", "/input/pointer/open", json_body=json_body))
         return PointerSession(self, receipt, lease)
 
@@ -2646,6 +2671,27 @@ class Client:
         if (len(name) == 1 and name in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") or name in _NAMED_KEYS:
             return f"KEY_{name}"
         raise ValueError(_KEY_ERROR)
+
+    def _normalize_button(self, button: Optional[str], device: Optional[str]) -> Optional[str]:
+        """Validate a mouse ``button``; return the wire value for a non-left one, else ``None``.
+
+        Left is the native default and is not sent, so a left-button gesture stays
+        compatible with a bridge that lacks ``input.button``. Any other button needs
+        the capability, because an older bridge ignores the field and clicks left.
+        """
+        if button is None:
+            return None
+        if not isinstance(button, str):
+            raise TypeError("button must be a string")
+        name = button.strip().lower()
+        if name not in _MOUSE_BUTTONS:
+            raise ValueError("button must be left, right, or middle")
+        if name == "left":
+            return None
+        if device == "touch":
+            raise ValueError("button right and middle require the mouse device")
+        self._require_cached_capability("input.button")
+        return name
 
     @classmethod
     def _normalize_modifiers(cls, modifiers: Optional[Union[str, Sequence[str]]]) -> Optional[str]:

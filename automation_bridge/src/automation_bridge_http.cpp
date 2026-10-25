@@ -805,6 +805,7 @@ namespace dmAutomationBridge
             AppendCapability(&names, &versions, &first, "input.key", "2");
             AppendCapability(&names, &versions, &first, "input.wheel");
             AppendCapability(&names, &versions, &first, "input.modifiers");
+            AppendCapability(&names, &versions, &first, "input.button");
             AppendCapability(&names, &versions, &first, "input.receipts");
             AppendCapability(&names, &versions, &first, "input.queue");
             AppendCapability(&names, &versions, &first, "input.controller");
@@ -1564,6 +1565,27 @@ namespace dmAutomationBridge
         return true;
     }
 
+    // Parse the optional "button" parameter (left, right, or middle; absent means left).
+    // RequestGetParam returns 0 for a JSON list, object, or null, so presence comes from
+    // RequestHasParam: a supplied value that is not a button name fails the request
+    // instead of silently becoming a left-button gesture. A touch contact has no buttons.
+    static bool GetMouseButtonParam(RequestContext* ctx, InputDevice device, dmHID::MouseButton* button)
+    {
+        *button = dmHID::MOUSE_BUTTON_LEFT;
+        if (!RequestHasParam(ctx, "button")) return true;
+        if (!ParseMouseButton(RequestGetParam(ctx, "button"), button))
+        {
+            RequestSendError(ctx, 400, "bad_request", "button must be left, right, or middle");
+            return false;
+        }
+        if (*button != dmHID::MOUSE_BUTTON_LEFT && ResolveInputDevice(device) != INPUT_DEVICE_MOUSE)
+        {
+            RequestSendError(ctx, 422, "input_device_unsupported", "button right and middle require the mouse device");
+            return false;
+        }
+        return true;
+    }
+
     static bool QueuePointerPath(RequestContext* ctx, Array<InputPoint>* points, InputPathMode mode,
                                  float hold_before, float hold_after, const char* kind, bool pointer_open, float pointer_lease)
     {
@@ -1571,6 +1593,8 @@ namespace dmAutomationBridge
         uint32_t pointer_id = 0;
         bool visualize = true;
         if (!GetInputOptions(ctx, &device, &pointer_id, &visualize)) return false;
+        dmHID::MouseButton button = dmHID::MOUSE_BUTTON_LEFT;
+        if (!GetMouseButtonParam(ctx, device, &button)) return false;
         dmHID::Key modifiers[MAX_INPUT_MODIFIERS];
         uint32_t modifier_count = 0;
         if (!GetModifiersParam(ctx, modifiers, &modifier_count)) return false;
@@ -1582,7 +1606,7 @@ namespace dmAutomationBridge
             !AcquireControllerForRequest(ctx, client_id, session_id, controller_lease)) return false;
         InputReceipt* receipt = 0;
         if (!AddMouseInput(points, mode, hold_before, hold_after, device, pointer_id, visualize, kind,
-                           modifiers, modifier_count,
+                           button, modifiers, modifier_count,
                            client_id, session_id, request_id, g_AutomationBridge.m_Snapshot.m_Sequence,
                            pointer_lease, pointer_open, &receipt))
         {
