@@ -8,7 +8,7 @@ platforms:
   osx:
     context:
       defines: ["FPNG_NO_SSE=1", "FPNG_NO_STDIO=1"]
-      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "Foundation", "Metal", "ScreenCaptureKit"]
+      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "Foundation", "ScreenCaptureKit"]
 
   win32:
     context:

@@ -100,16 +100,6 @@ namespace dmAutomationBridge
         FormatIdentity(bridge->m_BuildIdentity, sizeof(bridge->m_BuildIdentity), "config", dmHashString64(build_seed));
     }
 
-    static ExtensionResult PreRender(ExtensionParams* params)
-    {
-        DefoldPrivateApiInitialize(params);
-        // Flip() submits the Metal command buffer after CALLBACK_POST_RENDER.
-        // Finish an active capture here so the previous frame is included.
-        ProcessMetalCapturePostRender();
-        ProcessPendingMetalCaptureStart();
-        return EXTENSION_RESULT_OK;
-    }
-
     static ExtensionResult PostRender(ExtensionParams* params)
     {
         DefoldPrivateApiInitialize(params);
@@ -145,7 +135,6 @@ namespace dmAutomationBridge
         InitApplicationBridge((uint32_t)event_capacity, application_api_enabled);
         g_AutomationBridge.m_Initialized = true;
         RegisterWebEndpoint(params);
-        dmExtension::RegisterCallback(dmExtension::CALLBACK_PRE_RENDER, PreRender);
         dmExtension::RegisterCallback(dmExtension::CALLBACK_POST_RENDER, PostRender);
         return dmExtension::RESULT_OK;
     }
@@ -165,7 +154,6 @@ namespace dmAutomationBridge
         // The engine service outlives engine instances during a reboot. Keep the
         // handler registered so it retains precedence over the profiler's "/"
         // catch-all handler. The web server removes it when the process exits.
-        StopMetalCapture();
         FinalizeNativeRecording();
         FreeAutomationBridgeContext(&g_AutomationBridge);
         InitAutomationBridgeContext(&g_AutomationBridge);

@@ -43,8 +43,8 @@
 - Use atomic receipts for screenshots and recordings. Start visual inspection at
   `resolution_multiplier=0.5`; use `project.preview.render()` for editor-side
   validation without running the game. Optional diagnostics live under
-  `game.visual`, `game.gestures`, `game.video_recording`, `game.metal_capture`,
-  `game.profiler`, and `game.trace(...)`.
+  `game.visual`, `game.gestures`, `game.video_recording`, `game.profiler`, and
+  `game.trace(...)`.
 - Public docstrings are the API reference. See `README.md` for examples and
   `best_practices.py` for copyable agent patterns. See `MIGRATION.md` for
   upgrades and `README.md` for detailed workflows.

@@ -28,7 +28,4 @@
   (`left`, `right`, or `middle`) picks the mouse button for a click, drag,
   path, or pointer session; a non-left button needs the `input.button`
   capability and the mouse device.
-- Screenshot and Metal captures are asynchronous; poll their status receipts.
-  Metal capture requires macOS, the Metal adapter, and
-  `METAL_CAPTURE_ENABLED=1`; inspect completed traces with `gpudebug` when
-  available.
+- Screenshots are asynchronous; poll their status receipts.

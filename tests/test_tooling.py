@@ -22,8 +22,6 @@ from automation_bridge import editor, engine  # noqa: E402
 EngineClient = engine.Client
 from automation_bridge.gestures import GestureConstraintError, GestureGenerator  # noqa: E402
 VideoRecordingClient = engine.VideoRecordingClient
-MetalCaptureClient = engine.MetalCaptureClient
-MetalCaptureError = engine.MetalCaptureError
 from automation_bridge.trace import TraceError, TraceSession  # noqa: E402
 
 
@@ -304,89 +302,6 @@ class VideoRecordingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(KeyboardInterrupt, "stop now"):
             with VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4"):
                 raise KeyboardInterrupt("stop now")
-
-
-class MetalCaptureTest(unittest.TestCase):
-    class Bridge:
-        def __init__(self, states=None):
-            self.requests = []
-            self.traces = []
-            self.states = list(states or [])
-
-        def request(self, method, path, *, params=None, json_body=None):
-            self.requests.append((method, path, params, json_body))
-            request_data = json_body if json_body is not None else params
-            if method == "POST":
-                return {
-                    "state": "pending",
-                    "path": request_data["path"],
-                    "frames": request_data["frames"],
-                    "frames_captured": 0,
-                    "stop_requested": False,
-                }
-            if method == "DELETE":
-                return {
-                    "state": "canceled",
-                    "path": "/tmp/frame.gputrace",
-                    "frames": 1,
-                    "frames_captured": 0,
-                    "stop_requested": False,
-                }
-            if method == "GET" and self.states:
-                return self.states.pop(0)
-            raise AssertionError((method, path))
-
-        def _trace_record(self, kind, payload):
-            self.traces.append((kind, payload))
-
-    def test_start_uses_metal_endpoint_and_waits_for_complete(self):
-        states = [
-            {"state": "capturing", "path": "/tmp/frame.gputrace", "frames": 2,
-             "frames_captured": 1, "stop_requested": False},
-            {"state": "complete", "path": "/tmp/frame.gputrace", "frames": 2,
-             "frames_captured": 2, "stop_requested": False},
-        ]
-        bridge = self.Bridge(states)
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = Path(directory) / "traces" / "frame.gputrace"
-            expected_path = output_path.resolve()
-            capture = MetalCaptureClient(bridge).start(
-                output_path,
-                frames=2,
-                timeout=1,
-            )
-
-        self.assertTrue(capture.complete)
-        self.assertEqual(2, capture.frames_captured)
-        self.assertEqual(("POST", "/metal"), bridge.requests[0][:2])
-        self.assertIsNone(bridge.requests[0][2])
-        self.assertEqual(expected_path, Path(bridge.requests[0][3]["path"]))
-        self.assertEqual(2, bridge.requests[0][3]["frames"])
-        self.assertEqual(
-            ["metal_capture_started", "metal_capture_finished"],
-            [kind for kind, _ in bridge.traces],
-        )
-
-    def test_failed_capture_raises_native_error(self):
-        bridge = self.Bridge([{
-            "state": "failed", "path": "/tmp/frame.gputrace", "frames": 1,
-            "frames_captured": 0, "stop_requested": False, "error": "capture disabled",
-        }])
-        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(MetalCaptureError, "capture disabled"):
-            MetalCaptureClient(bridge).start(Path(directory) / "frame.gputrace", timeout=1)
-
-    def test_pending_capture_can_be_canceled_without_polling(self):
-        bridge = self.Bridge()
-        capture = MetalCaptureClient(bridge).stop()
-        self.assertEqual("canceled", capture.state)
-        self.assertEqual(("DELETE", "/metal"), bridge.requests[0][:2])
-
-    def test_path_and_frame_count_are_validated(self):
-        client = MetalCaptureClient(self.Bridge())
-        with self.assertRaises(ValueError):
-            client.start("frame.trace", wait=False)
-        with self.assertRaises(ValueError):
-            client.start("frame.gputrace", frames=0, wait=False)
 
 
 class _TraceClient:

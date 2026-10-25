@@ -304,14 +304,6 @@ def record_optional_video(game: engine.Client, output: ProjectPath) -> None:
         game.wait_for_state("ui.busy", False, after_revision=revision)
 
 
-def capture_optional_metal_trace(game: engine.Client, output: ProjectPath) -> None:
-    """Capture Metal only when advertised and enabled at engine launch."""
-    if not game.supports("metal.capture"):
-        return
-    capture = game.metal_capture.start(output, frames=1)
-    print(capture.path, capture.frames_captured)
-
-
 def close_owned_game(game: engine.Client, owns_engine: bool) -> None:
     """Do not terminate a reused engine merely because a script is finished."""
     if owns_engine:

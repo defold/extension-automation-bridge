@@ -28,7 +28,6 @@ from .recording import (
     VideoRecordingMetadata,
     VideoRecordingSession,
 )
-from .metal import MetalCaptureClient, MetalCaptureError, MetalCaptureStatus
 from .receipts import ObservationReceipt, ScreenshotReceipt
 from .trace import TraceSession
 from .visual import VisualObservation

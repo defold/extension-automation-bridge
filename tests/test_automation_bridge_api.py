@@ -572,7 +572,7 @@ class EngineClientUnitTest(unittest.TestCase):
             "get", "post", "put", "delete", "post_json", "put_json",
             "optional", "assert_node", "wait_for_appearance",
             "wait_for_stable_frame", "wait_for_region_change", "record_video",
-            "recording_capabilities", "recording_permission_diagnostics",
+            "recording_capabilities", "recording_permission_diagnostics", "metal_capture",
         }
         self.assertTrue(all(not hasattr(bridge, name) for name in removed_client_names))
         self.assertFalse(hasattr(Element({"parent": "root"}), "parent"))
@@ -584,10 +584,10 @@ class EngineClientUnitTest(unittest.TestCase):
         self.assertTrue(hasattr(bridge, "element"))
         self.assertTrue(hasattr(bridge, "wait_for_input_acknowledgement"))
         self.assertTrue(hasattr(bridge, "video_recording"))
-        self.assertTrue(hasattr(bridge, "metal_capture"))
         for removed in (
             "RecordingClient", "RecordingSession", "RecordingCapabilities",
             "RecordingMetadata", "RecordingError", "Node",
+            "MetalCaptureClient", "MetalCaptureError", "MetalCaptureStatus",
         ):
             self.assertFalse(hasattr(engine, removed))
         for removed in ("from_project", "from_editor"):
@@ -4313,6 +4313,17 @@ class AutomationBridgeApiTest(unittest.TestCase):
     def setUp(self):
         if self.bridge:
             self.reset_if_popup_is_visible()
+
+    def test_gpu_capture_is_removed_from_the_bridge(self):
+        self.ensure_running_bridge()
+        health = self.bridge.health()
+        self.assertNotIn("metal.capture", health["capabilities"])
+        self.assertNotIn("metal.capture", health["capability_versions"])
+        for method in ("GET", "POST", "DELETE"):
+            with self.subTest(method=method), self.assertRaises(AutomationBridgeApiError) as error:
+                self.bridge.request(method, "/metal")
+            self.assertEqual(404, error.exception.status)
+            self.assertEqual("not_found", error.exception.code)
 
     def test_pagination_preserves_metadata_and_rejects_invalid_native_values(self):
         self.ensure_running_bridge()
