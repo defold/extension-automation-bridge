@@ -25,6 +25,7 @@ from .recording import (
     VideoRecordingCapabilities,
     VideoRecordingClient,
     VideoRecordingError,
+    VideoRecordingFile,
     VideoRecordingMetadata,
     VideoRecordingSession,
 )

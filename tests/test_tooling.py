@@ -2,11 +2,14 @@
 import ast
 import importlib
 import inspect
+import hashlib
+import http.server
 import json
 import math
 import re
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -240,68 +243,330 @@ class GestureGeneratorTest(unittest.TestCase):
 
 
 class VideoRecordingTest(unittest.TestCase):
-    class Bridge:
-        def __init__(self, fail_stop=False):
-            self.requests = []
-            self.traces = []
-            self.fail_stop = fail_stop
+    """Exercise the native recorder wire contract on a real local HTTP server."""
 
-        def request(self, method, path, *, params=None, json_body=None):
-            self.requests.append((method, path, json_body))
-            if path == "/recording/capabilities":
-                return {"backend": "screen_capture_kit", "available": True,
-                        "application_window": True, "application_audio": True,
-                        "resize_output": True, "frame_rate": True,
-                        "containers": ["mp4"], "video_codecs": ["h264"],
-                        "minimum_platform_version": "macOS 15.0"}
-            if path == "/recording/start":
-                return {"path": json_body["path"], "active": True, "finalized": False,
-                        "audio": json_body.get("audio", True), "width": json_body.get("width", 800),
-                        "height": json_body.get("height", 600), "fps": json_body["fps"]}
-            if path == "/recording/stop":
-                if self.fail_stop:
-                    raise RuntimeError("native finalization failed")
-                return {"path": "capture.mp4", "active": False, "finalized": True,
-                        "audio": True, "width": 320, "height": 240, "fps": 24,
-                        "duration_seconds": 1.25}
-            raise AssertionError(path)
+    def setUp(self):
+        self.requests = []
+        self.payload = b"\x00\x00\x00\x18ftypmp42" + b"native MP4 fixture" * 8192
+        self.download = self.payload
+        self.instance = "record-service-1"
+        self.operation = 1
+        self.state = "idle"
+        self.start_pending = 1
+        self.file_pending = 1
+        self.fail_start = False
+        self.fail_stop = False
+        self.fail_file = False
+        self.fail_delete = False
+        self.stop_race = False
+        self.missing = False
+        self.start_callback = None
+        self.capability = {
+            "version": 1, "supported": True, "audio": True,
+            "backend": "screen_capture_kit", "format": "mp4", "codec": "h264",
+            "minimum_platform_version": "macOS 15.0", "unsupported_reason": "", "max_fps": 60,
+        }
+        self.audio = True
+        self.fps = 30
+        test = self
 
-        def _trace_record(self, kind, payload):
-            self.traces.append((kind, payload))
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
 
-    def test_start_uses_native_endpoint_and_context_finalizes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bridge = self.Bridge()
-            with VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4", size=(320, 240), fps=24) as recording:
-                self.assertTrue(recording.metadata.active)
-            self.assertTrue(recording.metadata.finalized)
-            self.assertEqual((320, 240, 24), (recording.metadata.width, recording.metadata.height, recording.metadata.fps))
-            start = bridge.requests[0]
-            self.assertEqual(("POST", "/recording/start"), start[:2])
-            self.assertEqual({"width": 320, "height": 240, "fps": 24},
-                             {key: start[2][key] for key in ("width", "height", "fps")})
-            self.assertNotIn("audio", start[2])
-        self.assertEqual(["video_recording_started", "video_recording_stopped"], [kind for kind, _ in bridge.traces])
+            def do_GET(self):
+                self.handle_request()
 
-    def test_capabilities_are_reported_by_engine(self):
-        capabilities = VideoRecordingClient(self.Bridge()).capabilities()
+            def do_POST(self):
+                self.handle_request()
+
+            def do_DELETE(self):
+                self.handle_request()
+
+            def handle_request(self):
+                data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = json.loads(data) if data else None
+                status, value = test.respond(self.command, self.path, body, self.headers.get("X-Recording-Instance"))
+                payload = value if isinstance(value, bytes) else json.dumps(value).encode()
+                if status == 204:
+                    payload = b""
+                self.send_response(status)
+                self.send_header("Content-Type", "video/mp4" if isinstance(value, bytes) else "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.close_server)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output = Path(self.directory.name).resolve() / "capture.mp4"
+        self.bridge = EngineClient(self.server.server_port)
+        self.trace = mock.patch.object(self.bridge, "_trace_record").start()
+        self.addCleanup(mock.patch.stopall)
+        mock.patch("automation_bridge.waits.cancellable_sleep").start()
+        self.recorder = self.bridge.video_recording
+
+    def close_server(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def receipt(self):
+        finalized = self.state == "complete"
+        return {
+            "instance_id": self.instance, "operation_id": self.operation,
+            "state": self.state, "pending": self.state in {"starting", "stopping"},
+            "active": self.state == "recording", "finalized": finalized, "supported": True,
+            "backend": self.capability["backend"], "format": "mp4", "codec": "h264",
+            "audio": self.audio, "width": 800, "height": 600, "fps": self.fps,
+            "started_wall_time_us": 10000000, "started_monotonic_time_us": 1000000,
+            "stopped_wall_time_us": 11250000 if finalized else 0,
+            "stopped_monotonic_time_us": 2250000 if finalized else 0,
+            "failure": "permission denied" if self.state == "failed" else "",
+            "file": {
+                "id": "r1-1-1", "url": "/recording/files/r1-1-1",
+                "state": "failed" if self.fail_file else ("complete" if finalized and self.file_pending == 0 else "pending"),
+                "size": len(self.payload) if finalized else 0,
+                "sha256": hashlib.sha256(self.payload).hexdigest() if finalized else "",
+            },
+        }
+
+    def respond(self, method, path, body, instance):
+        self.requests.append((method, path, body, instance))
+        if self.missing:
+            return 404, b"No such resource"
+        if method == "GET" and path == "/recording/capabilities":
+            return 200, dict(self.capability, instance_id=self.instance)
+        if instance != self.instance:
+            return 410, {"error": {"code": "stale_instance", "message": "recording service restarted"}}
+        if method == "POST" and path == "/recording/start":
+            self.assertLessEqual(set(body), {"fps", "audio"})
+            if body.get("audio") and not self.capability["audio"]:
+                return 501, {"error": {"code": "audio_unsupported", "message": "application audio is unavailable"}}
+            self.audio = body.get("audio", self.capability["audio"])
+            self.fps = body["fps"]
+            self.state = "starting"
+            if self.start_callback:
+                self.start_callback()
+            return 202, self.receipt()
+        if method == "GET" and path == "/recording/status":
+            if self.state == "starting":
+                if self.start_pending:
+                    self.start_pending -= 1
+                else:
+                    self.state = "failed" if self.fail_start else "recording"
+            elif self.state == "stopping":
+                self.state = "complete"
+            elif self.state == "complete" and self.file_pending:
+                self.file_pending -= 1
+            return 200, self.receipt()
+        if method == "POST" and path == "/recording/stop":
+            self.assertEqual({"operation_id": self.operation}, body)
+            if self.fail_stop:
+                return 500, {"error": {"code": "stop_failed", "message": "native finalization failed"}}
+            if self.stop_race:
+                self.state = "complete"
+                return 409, {"error": {"code": "recording_inactive", "message": "recording already stopped"}}
+            self.state = "stopping"
+            return 202, self.receipt()
+        if path == "/recording/files/r1-1-1":
+            self.assertEqual("complete", self.state)
+            self.assertEqual(0, self.file_pending)
+            if method == "GET":
+                return 200, self.download
+            if method == "DELETE":
+                if self.fail_delete:
+                    return 500, {"error": {"code": "delete_failed", "message": "delete failed"}}
+                return 204, None
+        self.fail(f"Unexpected recording request: {method} {path}")
+
+    def calls(self, method, path):
+        return [request for request in self.requests if request[:2] == (method, path)]
+
+    def test_context_waits_for_capture_and_file_then_verifies_download_and_deletes(self):
+        with self.recorder.start(self.output, fps=24) as session:
+            self.assertTrue(session.metadata.active)
+            self.assertIsNone(session.metadata.path)
+            self.assertFalse(self.output.exists())
+        self.assertEqual(self.payload, self.output.read_bytes())
+        self.assertTrue(session.metadata.finalized)
+        self.assertEqual(str(self.output), session.metadata.path)
+        self.assertEqual((800, 600, 24), (session.metadata.width, session.metadata.height, session.metadata.fps))
+        self.assertEqual(1.25, session.metadata.duration_seconds)
+        self.assertEqual({"fps": 24}, self.calls("POST", "/recording/start")[0][2])
+        self.assertEqual({"operation_id": 1}, self.calls("POST", "/recording/stop")[0][2])
+        for method, path, _, instance in self.requests:
+            if path != "/recording/capabilities":
+                self.assertEqual(self.instance, instance)
+        self.assertEqual(1, len(self.calls("GET", "/recording/files/r1-1-1")))
+        self.assertEqual("DELETE", self.requests[-1][0])
+        count = len(self.requests)
+        self.assertEqual(session.metadata, session.stop())
+        self.assertEqual(count, len(self.requests))
+        self.assertEqual(["video_recording_started", "video_recording_stopped"], [call.args[0] for call in self.trace.call_args_list])
+
+    def test_capabilities_translate_native_schema_and_do_not_advertise_scaling(self):
+        capabilities = self.recorder.capabilities()
         self.assertTrue(capabilities.available)
         self.assertTrue(capabilities.application_audio)
+        self.assertFalse(capabilities.resize_output)
         self.assertEqual(("h264",), capabilities.video_codecs)
         self.assertEqual("macOS 15.0", capabilities.minimum_platform_version)
+        self.assertEqual((1, self.instance, 60), (capabilities.version, capabilities.instance_id, capabilities.max_fps))
 
-    def test_explicit_audio_false_is_sent_for_portable_video_only_capture(self):
-        bridge = self.Bridge()
-        with tempfile.TemporaryDirectory() as directory:
-            session = VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4", audio=False)
-            self.assertFalse(bridge.requests[0][2]["audio"])
-            session.stop()
+    def test_audio_false_and_linux_video_only_default(self):
+        for options, supported in (({"audio": False}, True), ({}, False)):
+            with self.subTest(options=options):
+                self.capability["audio"] = supported
+                with self.recorder.start(self.output, **options) as session:
+                    self.assertFalse(session.metadata.audio)
+                self.assertEqual(options.get("audio"), self.calls("POST", "/recording/start")[-1][2].get("audio"))
 
-    def test_original_exception_survives_native_finalization_failure(self):
-        bridge = self.Bridge(fail_stop=True)
-        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(KeyboardInterrupt, "stop now"):
-            with VideoRecordingClient(bridge).start(Path(directory) / "capture.mp4"):
+    def test_unsupported_audio_preserves_native_error(self):
+        self.capability["audio"] = False
+        with self.assertRaises(engine.VideoRecordingError) as error:
+            self.recorder.start(self.output, audio=True)
+        self.assertEqual((501, "audio_unsupported"), (error.exception.status, error.exception.code))
+
+    def test_missing_service_is_optional_but_start_reports_minimum_version(self):
+        self.missing = True
+        self.assertFalse(self.recorder.capabilities().available)
+        with self.assertRaisesRegex(engine.VideoRecordingError, "Defold 1.14.1"):
+            self.recorder.start(self.output)
+        self.assertFalse(self.calls("POST", "/recording/start"))
+
+    def test_unsupported_backend_reports_its_reason(self):
+        self.capability.update(supported=False, unsupported_reason="unsupported OS version")
+        self.assertFalse(self.recorder.capabilities().available)
+        with self.assertRaisesRegex(engine.VideoRecordingError, "unsupported OS version"):
+            self.recorder.start(self.output)
+        self.assertFalse(self.calls("POST", "/recording/start"))
+
+    def test_incompatible_protocol_is_rejected_before_start(self):
+        for version in (0, 2, True):
+            with self.subTest(version=version):
+                self.capability["version"] = version
+                with self.assertRaisesRegex(engine.VideoRecordingError, "protocol"):
+                    self.recorder.start(self.output)
+        self.assertFalse(self.calls("POST", "/recording/start"))
+
+    def test_invalid_options_fail_before_requests(self):
+        for options in ({"fps": True}, {"fps": 0}, {"fps": 61}, {"fps": 2.5}, {"audio": 1},
+                        {"timeout": -1}, {"timeout": float("nan")}, {"size": (320, 240)}):
+            with self.subTest(options=options), self.assertRaises((TypeError, ValueError)):
+                self.recorder.start(self.output, **options)
+        self.assertEqual([], self.requests)
+
+    def test_native_startup_failure_is_not_reported_as_active(self):
+        self.fail_start = True
+        with self.assertRaisesRegex(engine.VideoRecordingError, "permission denied"):
+            self.recorder.start(self.output)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.calls("GET", "/recording/files/r1-1-1"))
+
+    def test_startup_timeout_cleans_up_the_accepted_operation(self):
+        self.file_pending = 0
+        with self.assertRaises(engine.WaitTimeoutError) as error:
+            self.recorder.start(self.output, timeout=0)
+        self.assertEqual(1, len(self.calls("POST", "/recording/stop")))
+        self.assertTrue(error.exception.recording_session.metadata.finalized)
+        self.assertEqual(self.payload, self.output.read_bytes())
+
+    def test_cancelled_startup_still_finalizes_the_accepted_operation(self):
+        token = engine.CancellationToken()
+        self.start_callback = lambda: token.cancel("cancel capture")
+        with self.assertRaisesRegex(engine.OperationCancelled, "cancel capture") as error:
+            with engine.cancellation_scope(token):
+                self.recorder.start(self.output)
+        self.assertIsNone(error.exception.cleanup_error)
+        self.assertEqual(self.payload, self.output.read_bytes())
+
+    def test_context_preserves_original_exception_when_native_stop_fails(self):
+        self.fail_stop = True
+        with self.assertRaisesRegex(KeyboardInterrupt, "stop now") as error:
+            with self.recorder.start(self.output):
                 raise KeyboardInterrupt("stop now")
+        self.assertIsInstance(error.exception.cleanup_error, engine.VideoRecordingError)
+        self.assertFalse(self.output.exists())
+
+    def test_restart_is_not_rebound_even_after_new_capability_discovery(self):
+        session = self.recorder.start(self.output)
+        original = self.instance
+        self.instance = "replacement-service"
+        self.assertEqual(self.instance, self.recorder.capabilities().instance_id)
+        with self.assertRaises(engine.VideoRecordingError) as error:
+            session.stop()
+        self.assertEqual("stale_instance", error.exception.code)
+        self.assertEqual(original, self.requests[-1][3])
+        self.assertFalse(self.calls("POST", "/recording/stop"))
+
+    def test_replaced_operation_is_not_stopped(self):
+        session = self.recorder.start(self.output)
+        self.operation += 1
+        with self.assertRaises(engine.VideoRecordingError) as error:
+            session.stop()
+        self.assertEqual("stale_operation", error.exception.code)
+        self.assertFalse(self.calls("POST", "/recording/stop"))
+
+    def test_automatic_resize_finalization_is_downloaded_without_stop(self):
+        session = self.recorder.start(self.output)
+        self.state = "complete"
+        session.stop()
+        self.assertEqual(self.payload, self.output.read_bytes())
+        self.assertFalse(self.calls("POST", "/recording/stop"))
+
+    def test_resize_between_status_and_stop_is_handled(self):
+        session = self.recorder.start(self.output)
+        self.stop_race = True
+        session.stop()
+        self.assertEqual(self.payload, self.output.read_bytes())
+
+    def test_file_preparation_failure_preserves_destination(self):
+        session = self.recorder.start(self.output)
+        self.fail_file = True
+        self.output.write_bytes(b"previous capture")
+        with self.assertRaisesRegex(engine.VideoRecordingError, "preparation failed"):
+            session.stop()
+        self.assertEqual(b"previous capture", self.output.read_bytes())
+        self.assertFalse(self.calls("GET", "/recording/files/r1-1-1"))
+
+    def test_corrupt_download_preserves_destination_and_can_be_retried(self):
+        for download in (b"truncated", b"x" * len(self.payload), self.payload + b"extra"):
+            with self.subTest(size=len(download)):
+                session = self.recorder.start(self.output)
+                self.output.write_bytes(b"previous capture")
+                self.download = download
+                deletes = len(self.calls("DELETE", "/recording/files/r1-1-1"))
+                with self.assertRaisesRegex(engine.VideoRecordingError, "receipt"):
+                    session.stop()
+                self.assertEqual(b"previous capture", self.output.read_bytes())
+                self.assertEqual([], list(self.output.parent.glob("*.part")))
+                self.assertEqual(deletes, len(self.calls("DELETE", "/recording/files/r1-1-1")))
+                self.download = self.payload
+                session.stop()
+                self.assertEqual(self.payload, self.output.read_bytes())
+
+    def test_failed_engine_file_cleanup_retries_without_downloading_again(self):
+        session = self.recorder.start(self.output)
+        self.fail_delete = True
+        with self.assertRaisesRegex(engine.VideoRecordingError, "delete failed"):
+            session.stop()
+        self.assertEqual(self.payload, self.output.read_bytes())
+        self.fail_delete = False
+        session.stop()
+        self.assertEqual(1, len(self.calls("GET", "/recording/files/r1-1-1")))
+
+    def test_finalization_timeout_can_be_retried(self):
+        session = self.recorder.start(self.output)
+        with self.assertRaises(engine.WaitTimeoutError):
+            session.stop(timeout=0)
+        self.assertFalse(self.output.exists())
+        session.stop()
+        self.assertEqual(self.payload, self.output.read_bytes())
+        self.assertEqual(1, len(self.calls("POST", "/recording/stop")))
 
 
 class _TraceClient:

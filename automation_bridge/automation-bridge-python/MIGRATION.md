@@ -24,6 +24,27 @@ Put short examples below it only when a table entry is not sufficient. Do not
 rename unrelated variables or valid Defold GUI terms such as `gui_node`,
 `gui_node_box`, and `gui_node_text`.
 
+## Wrapper 3.0 → next release: engine-native video recording
+
+| Wrapper 3.0 | Next wrapper release |
+| --- | --- |
+| Video recording provided by the extension on macOS and Windows. | The extension now requires Defold 1.14.1+. Recording needs the built-in recorder enabled in a desktop debug engine. |
+| `game.supports("recording.video")` or `recording.application_audio` in bridge health. | Use `game.video_recording.capabilities().available` and `.application_audio`. A missing recorder returns `available=False`; connection errors still raise. |
+| `game.video_recording.start(path, size=(960, 540), fps=30)` | Remove `size`. Capture uses native content pixels, crops odd dimensions, and finalizes on window resize. |
+| `path` names an engine-local file created during capture. | `path` names a client-local MP4 downloaded and verified by `stop()` or context exit. `metadata.path` remains `None` until the download succeeds. |
+| Native start and stop are synchronous. | The wrapper waits for native startup, finalization, and file preparation. `status()` exposes `pending`, `state`, and `file`; `finalized` alone does not mean the download is ready. |
+| Windows audio is always unavailable. | Omitted `audio` follows backend support, including Windows build 20348+; use `audio=False` for portable video-only capture. Linux supports video only. |
+
+`start()` and `stop()` accept `timeout=30.0` for polling. Keep the session to retry
+`stop()` if finalization or downloading fails. A successful stop verifies size
+and SHA-256, atomically replaces the local destination, and deletes the engine's
+temporary file. Engine shutdown/reboot removes retained native files.
+
+Raw clients must move from `/automation-bridge/v2/recording/*` to the engine's
+root `/recording/*` routes. These use a separate versioned protocol and JSON
+schema, with `X-Recording-Instance` on mutations and an `operation_id` for stop.
+See the [native recording contract](../../docs/recording-platform-contract.md).
+
 ## Wrapper 3.0 → next release: GPU capture moves to the core engine
 
 | Wrapper 3.0 | Next wrapper release |

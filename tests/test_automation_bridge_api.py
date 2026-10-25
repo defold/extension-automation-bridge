@@ -4325,6 +4325,22 @@ class AutomationBridgeApiTest(unittest.TestCase):
             self.assertEqual(404, error.exception.status)
             self.assertEqual("not_found", error.exception.code)
 
+    def test_recording_is_owned_by_the_engine_service(self):
+        self.ensure_running_bridge()
+        capabilities = self.bridge.health()["capabilities"]
+        self.assertNotIn("recording.video", capabilities)
+        self.assertNotIn("recording.application_audio", capabilities)
+        with self.assertRaises(AutomationBridgeApiError) as error:
+            self.bridge.request("GET", "/recording/capabilities")
+        self.assertEqual(404, error.exception.status)
+        recorder = self.bridge.video_recording.capabilities()
+        if recorder.available:
+            self.assertEqual(1, recorder.version)
+            self.assertTrue(recorder.instance_id)
+            self.assertFalse(recorder.resize_output)
+        else:
+            self.assertTrue(recorder.reason)
+
     def test_pagination_preserves_metadata_and_rejects_invalid_native_values(self):
         self.ensure_running_bridge()
         first = self.bridge.elements_page(type="goc", limit=1)

@@ -2074,7 +2074,7 @@ class Client:
 
     @property
     def video_recording(self) -> "VideoRecordingClient":
-        """Return optional video recording helpers."""
+        """Return helpers for Defold 1.14.1+'s native recording service."""
         from .recording import VideoRecordingClient
 
         return VideoRecordingClient(self)

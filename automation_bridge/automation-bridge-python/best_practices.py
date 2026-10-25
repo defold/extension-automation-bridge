@@ -294,11 +294,11 @@ def profile_operation(game: engine.Client) -> None:
 
 
 def record_optional_video(game: engine.Client, output: ProjectPath) -> None:
-    """Probe optional recording support before relying on it."""
+    """Probe Defold 1.14.1+ recording before capturing at native resolution."""
     capabilities = game.video_recording.capabilities()
     if not capabilities.available:
         return
-    with game.video_recording.start(output, size=(960, 540), fps=30):
+    with game.video_recording.start(output, fps=30):
         revision = game.state("ui").revision
         game.click(game.element(automation_id="play"))
         game.wait_for_state("ui.busy", False, after_revision=revision)

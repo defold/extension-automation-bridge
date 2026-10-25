@@ -1,115 +1,113 @@
-# Automation Bridge: Native Video Recording Contract
+# Defold-native video recording contract
 
-## Current implementation
+## Ownership and requirements
 
-Automation Bridge records video inside the Defold process on macOS and Windows.
-The Objective-C++ macOS implementation uses ScreenCaptureKit's
-`SCRecordingOutput`, which encodes H.264 video and optional application audio
-directly into an MP4 file. The C++ Windows implementation combines Windows
-Graphics Capture with Media Foundation to produce video-only H.264 MP4. Neither
-backend launches FFmpeg, runs a companion process, or exposes platform window
-handles to Python.
+Defold 1.14.1 introduces the independent recorder from
+[defold/defold#13501](https://github.com/defold/defold/pull/13501).
+The engine owns window selection, capture, audio, encoding, asynchronous state,
+file preparation, and shutdown cleanup. Automation Bridge contains no recorder
+backend, platform capture dependencies, recording routes, or recording health
+capabilities. The extension requires Defold 1.14.1 or newer.
 
-The macOS implementation requires macOS 15 or newer because
-`SCRecordingOutput` was introduced there. Windows video requires Windows 10
-version 1903 or newer. Other platforms compile a small unsupported
-implementation and do not advertise recording capabilities.
+The built-in recorder ships in graphical desktop debug engines unless recording
+is excluded by the app manifest. Release, headless, mobile, and web engines do
+not expose this service. The authoritative wire schema is the running engine's
+`/openapi.json`; implementation details are documented in the
+[upstream recorder README](https://github.com/defold/defold/blob/c571fef566079dd309d009b62198e4cc5782cdf6/engine/record/README.md).
 
-## Capture selection
+| Platform | Capture | Application audio |
+| --- | --- | --- |
+| macOS 15+ | ScreenCaptureKit | Supported |
+| Windows 10 version 1903+ | Windows Graphics Capture and Media Foundation | Requires Windows build 20348+ |
+| Linux with supported graphics | Framebuffer capture, OpenH264 and minimp4 | Unsupported |
 
-The recorder asks ScreenCaptureKit for visible windows and selects the largest
-window whose owning application process id matches the running Defold process.
-This avoids mutable title matching and prevents the Python controller from
-capturing another application's window. `SCContentFilter` captures that window
-independently of the desktop and excludes the cursor, title-bar shadow, and
-other applications.
+Capabilities report backend and OS support; capture may still fail because of
+permissions or device availability. Audio defaults to backend support. Explicit
+unsupported audio is an error. There is no microphone or system-audio fallback.
+No external encoder or helper process is required.
 
-On Windows, `EnumWindows` selects the largest visible unowned top-level window
-belonging to the current process. `IGraphicsCaptureItemInterop::CreateForWindow`
-creates an occlusion-independent capture item for its `HWND`. The backend maps
-`GetClientRect` into the capture surface, crops every Direct3D 11 frame to that
-client area, and temporarily disables Windows 11 DWM corner rounding. The prior
-corner preference is restored during finalization.
+Capture uses the engine window's native content dimensions in physical pixels.
+No resizing or scaling option is exposed. Odd dimensions crop at most one row
+and column. Window resizing or a pixel-density change finalizes capture. The
+frame rate is an integer from 1 to 60, defaulting to 30.
 
-The default output size is the selected window's point size multiplied by the
-window screen's backing scale. AppKit includes the rounded bottom edge in its
-content rectangle, so the macOS backend removes a 16-point bottom safety band
-to return a fully rectangular game frame. Callers may provide an explicit
-paired width and height. Frame rate is an integer from 1 through 60 and defaults
-to 30.
+## Native HTTP protocol
 
-## Audio
+Use the engine service port with root `/recording` paths, outside the bridge's
+`/automation-bridge/v2` namespace. Successful JSON is the receipt itself, without
+an `ok`/`data` envelope. Errors contain `error.code` and `error.message`, with the
+actual HTTP status. Bridge query parameters and its HTTP status adapter do not
+apply.
 
-On macOS, application audio is enabled by default. The stream sets
-`excludesCurrentProcessAudio` to false, uses a 48 kHz stereo configuration, and
-lets ScreenCaptureKit mux the audio and video on its shared capture clock. A
-caller can disable audio explicitly.
+| Method | Path | Result |
+| --- | --- | --- |
+| GET | `/recording/capabilities` | Protocol `version`, `instance_id`, `supported`, `audio`, backend and limits |
+| GET | `/recording/status` | Current operation, native state and file receipt |
+| POST | `/recording/start` | HTTP 202; optional JSON `fps` and `audio` only |
+| POST | `/recording/stop` | HTTP 202; JSON `operation_id` from start |
+| GET | `/recording/files/{id}` | Finalized MP4 stream |
+| DELETE | `/recording/files/{id}` | HTTP 204; release retained native storage |
 
-The recorder never substitutes microphone or system-wide audio. Platforms
-without an equivalent process-aware native API must report recording as
-unsupported until they receive a dedicated implementation.
+The wrapper requires recorder protocol version 1. Discover `instance_id` through
+capabilities, then retain it with the operation and file receipts. Send it as
+`X-Recording-Instance` on every subsequent request. Mutations require the header;
+GET status/download also accept it to reject results from a replacement engine.
+Never refresh an old session's identity after restart or reboot. Stop additionally
+identifies the original operation, so another Lua or HTTP recording is protected.
 
-The current Windows backend advertises video but not application audio. Its
-backend default is `audio=false`, and an explicit `audio=true` request fails.
+Start has no output-path parameter. Poll the accepted operation until `pending`
+is false and `active` is true. After stop, wait for `pending == false`,
+`finalized == true`, and `file.state == "complete"`. Native finalization and file
+hashing are separate phases. Failures may arrive asynchronously in `failure`,
+`state == "failed"`, or `file.state == "failed"`.
 
-## Native API
+A complete file receipt has `id`, `url`, `state`, `size`, and `sha256`. Download
+with a single GET, read incrementally, and verify size and SHA-256. Closed byte
+ranges are supported by the engine but are unnecessary for the wrapper's whole
+file download. Files survive capture completion until deletion or engine
+shutdown/reboot. The service retains at most 128 files, so consumers should
+release them after successful retrieval.
 
-The debug HTTP service exposes:
+## Python behavior
 
-- `GET /recording/capabilities`
-- `GET /recording/status`
-- `POST /recording/start`
-- `POST /recording/stop`
+`game.video_recording.capabilities()` discovers the independent native service.
+Missing routes return `available=False` and a Defold 1.14.1 requirement message;
+connection failures and incompatible protocols raise `VideoRecordingError`.
+`game.supports()` and bridge health do not describe recording availability.
 
-Start accepts `path`, optional `width` and `height`, `fps`, and `audio`. The
-native response reports active/finalized state, dimensions, frame rate, codec,
-container, timestamps, duration, path, and failure text. Only one recording may
-be active. Stop is synchronous: success means the platform encoder finalized
-and the MP4 exists with a non-zero size.
+`game.video_recording.start(path, fps=30, audio=None, timeout=30.0)` validates its
+options, creates the local output directory, submits native start, and waits for
+active capture. The returned session retains the engine identity and operation
+ID. The path belongs to the Python client's filesystem and is never sent to the
+engine. Metadata maps native `format`/`codec` to `container`/`video_codec` and
+computes duration from the native monotonic timestamps.
 
-Health advertises `recording.video` and `recording.application_audio` only when
-the current runtime supports the native implementation.
+`session.stop(timeout=30.0)` handles both explicit and automatic finalization,
+waits for the complete file receipt, and streams into a temporary file beside
+the destination. Only a matching size and SHA-256 allow atomic replacement of
+the destination. Then it deletes the engine-owned file. `metadata.path` remains
+unset until the verified download succeeds. Repeated successful stops are local
+and idempotent. A failed download retains the receipt for retry and leaves the
+previous destination untouched.
 
-## Python ownership
+Polling timeouts bound each wait phase; individual HTTP requests use the client's
+transport timeout. The engine must continue updating during native transitions.
+A startup timeout or interruption triggers cleanup of the accepted operation;
+`exception.recording_session` allows retrying `stop()` and `exception.cleanup_error`
+retains any cleanup failure. Context exit finalizes even during cooperative
+cancellation and preserves an exception already raised by the workflow. Finish
+recording before closing the engine, which removes its temporary files.
 
-`game.video_recording` is deliberately a thin HTTP controller. It validates the
-small public option set, resolves and creates the output directory, and returns
-a context-managed session. Context exit always requests native finalization and
-does not replace an exception already raised by the automated workflow.
+## Validation
 
-Python does not select windows, request OS permissions, encode video, probe the
-result with an external binary, or manage a subprocess.
+The dependency-free suite uses a local HTTP service with the upstream receipt
+schema. It exercises asynchronous capture and file preparation, option validation,
+capability negotiation, 202/204 handling, whole-file downloads, checksum/size
+failures, retries, stale instances and operations, automatic resize finalization,
+startup cancellation/timeouts, and exception-preserving context cleanup.
 
-## Lifecycle and errors
-
-The game process owns its platform capture and encoding objects. On macOS,
-start waits for both stream startup and the recording-start callback; stop waits
-for the recording-finished callback before stopping the stream. On Windows,
-start waits until the first Direct3D frame is written, and stop closes the frame
-pool, waits for any in-flight callback, then synchronously finalizes the Media
-Foundation sink writer. Extension finalization stops an active recording before
-releasing bridge state.
-
-Permission denial, an absent process window, timeouts, duplicate start, inactive
-stop, and finalization errors are explicit failures. The bridge never silently
-falls back to display capture.
-
-## Future platforms
-
-Linux implementations should preserve this endpoint contract but use native
-process/window capture facilities. A platform must not
-advertise application audio unless it can intentionally include the target
-process audio without falling back to microphone input. Backbuffer recording is
-a separate possible capability because it does not capture window presentation
-or application audio.
-
-## Testing
-
-- Build every target to verify platform implementations and stubs remain linkable.
-- On macOS 15+, assert capability reporting and record a short resized MP4.
-- On Windows 10 1903+, verify client-only capture, resizing, requested FPS,
-  synchronous MP4 finalization, and DWM corner restoration.
-- Verify start rejects a second active session and stop rejects an inactive one.
-- Verify permission denial and missing-window failures do not report success.
-- Verify normal stop and extension shutdown leave a finalized non-empty MP4.
-- Verify Python context cleanup preserves the workflow's original exception.
+A desktop release check should additionally build this extension with Defold
+1.14.1+, probe recorder capabilities, capture a short clip, and verify the local
+MP4 after context exit. Exercise platform capture permissions and application
+audio where supported. Native platform implementation tests remain upstream in
+Defold; this repository validates the Python integration and bridge coexistence.

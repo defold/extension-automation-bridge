@@ -15,8 +15,8 @@ Find `<engine_service_port>` in the editor console line:
 INFO:ENGINE: Engine service started on port <port>
 ```
 
-No Lua setup is required for scene inspection, input, screenshots, native
-desktop video recording, the event cursor transport, or timeline markers.
+No Lua setup is required for scene inspection, input, screenshots,
+the event cursor transport, or timeline markers.
 Application-defined events, state, commands, annotations, and acknowledgements
 use a debug-only Lua API that must be enabled explicitly:
 
@@ -69,8 +69,7 @@ Common error codes include `bad_request`, `invalid_json`, `json_body_too_large`,
 `stale_scene`, `stale_element`, `unsupported_key`, `input_queue_full`, `input_too_large`, `input_controller_busy`,
 `input_device_unsupported`, `input_not_found`, `input_not_owned`, `pointer_closed`,
 `screen_resize_unsupported`, `screenshot_unsupported`, `screenshot_not_found`,
-`screenshot_pending`, `recording_unsupported`, `recording_active`,
-`recording_inactive`, `recording_start_failed`, `recording_stop_failed`, and
+`screenshot_pending`, and
 `unsupported_capability`. The latter names a feature
 omitted by the current platform, graphics, game-object, window, or HID backend.
 
@@ -184,8 +183,8 @@ Response `data` includes:
 - `platform`: `macos`, `windows`, `linux`, `android`, `ios`, or `unknown`.
 - `capabilities`: supported capability names for runtime health/lifecycle,
   diagnostics, scene inspection, screen/coordinate operations, input and input
-  devices, events, markers, frame waits, application synchronization, screenshots,
-  and native video recording. Backend-dependent names are omitted when unavailable.
+  devices, events, markers, frame waits, application synchronization, and
+  screenshots. Backend-dependent names are omitted when unavailable.
 - `capability_versions`: capability-to-version map for feature negotiation.
 - `native_version`, `api_version_min`, and `api_version_max`: native package and API compatibility information.
 - `identity`: opaque engine instance, process id where portable, wall/monotonic start timestamps, hashed project identity, and hashed build-configuration identity.
@@ -472,40 +471,44 @@ Completed receipts include capture frame/sequence, dimensions, and SHA-256. The
 PNG is first written to a temporary path and atomically renamed before `complete`
 is visible.
 
-## Native video recording (macOS and Windows)
+## Engine-native video recording (Defold 1.14.1+)
 
-The extension selects its own largest on-screen window, resolves the matching
-`NSWindow` content frame, and records only that undecorated game area with
-ScreenCaptureKit's native H.264 MP4 recorder on macOS 15 or newer. The explicit
-source rectangle excludes the title bar and rounded window corners. It does not
-launch FFmpeg or any other helper process. Screen Recording permission is
-granted to the running game process; the first request may cause the system
-permission prompt.
+Defold owns video capture, encoding, finalization, and temporary recording files.
+The extension no longer registers recording routes or advertises
+`recording.video` / `recording.application_audio` in bridge health.
+Use `game.video_recording` from the Python wrapper, or the engine service's
+root routes, described by its `/openapi.json`:
 
-On Windows 10 version 1903 or newer, the extension selects the largest visible
-top-level window owned by the current Defold process, captures it with Windows
-Graphics Capture, and crops frames to its Win32 client area. Windows 11 corner
-rounding is disabled for the recording session and restored afterward. Frames
-are resized as requested and encoded to H.264 MP4 with Media Foundation. The
-Windows backend is currently video-only; `audio=true` returns
-`recording_audio_unsupported` instead of recording another audio source.
-
-- `GET /recording/capabilities` reports runtime availability, output format,
-  codec, resizing, frame-rate, and application-audio support.
-- `GET /recording/status` reports the active or most recently finalized capture.
-- `POST /recording/start` accepts `path`, optional paired `width` and `height`,
-  integer `fps` from 1 through 60 (default 30), and boolean `audio` (default
-  true on macOS and false on Windows). It automatically selects a window owned
-  by the current process.
-- `POST /recording/stop` stops capture and waits until the MP4 is finalized.
-
-```sh
-curl -fsS -X POST -H 'Content-Type: application/json' \
-  --data '{"path":"/tmp/game.mp4","width":960,"height":540,"fps":30,"audio":true}' \
-  "$BASE/recording/start"
-
-curl -fsS -X POST "$BASE/recording/stop"
+```text
+http://127.0.0.1:<engine_service_port>/recording/capabilities
+http://127.0.0.1:<engine_service_port>/recording/status
+http://127.0.0.1:<engine_service_port>/recording/start
+http://127.0.0.1:<engine_service_port>/recording/stop
+http://127.0.0.1:<engine_service_port>/recording/files/{id}
 ```
+
+These routes are independent of `/automation-bridge/v2` and do not use its
+`ok`/`data` envelope, query parameters, or status-code compatibility mapping.
+Read capabilities and check `version == 1`, `supported`, `audio`, and
+`instance_id`. Send the retained identity as `X-Recording-Instance` on start,
+status, stop, download, and deletion to protect against engine replacement.
+
+Start accepts only `fps` (1–60, default 30) and optional `audio`. It captures
+native content dimensions with no size override; changing window size stops
+capture. The service chooses its own temporary output path. Start/stop return
+HTTP 202; poll status for completion. Stop requires the accepted `operation_id`.
+Download only after `pending == false`, `finalized == true`, and
+`file.state == "complete"`; verify the receipt's size and SHA-256 before saving,
+then DELETE the file to release engine storage.
+
+The recorder is included in desktop debug engines unless excluded by the app
+manifest. Supported platforms are macOS 15+, Windows 10 version 1903+, and Linux.
+Windows application audio requires build 20348+; Linux is video only. Omitted
+`audio` follows native support. Platform availability does not guarantee capture
+permission.
+
+See the [recording contract](../docs/recording-platform-contract.md) and
+[upstream recorder documentation](https://github.com/defold/defold/blob/c571fef566079dd309d009b62198e4cc5782cdf6/engine/record/README.md).
 
 ## Application synchronization
 

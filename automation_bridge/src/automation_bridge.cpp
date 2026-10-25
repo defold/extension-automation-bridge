@@ -18,7 +18,6 @@
 
 #include "automation_bridge_private.h"
 #include "automation_bridge_defold_private_api.h"
-#include "automation_bridge_recording.h"
 
 namespace dmAutomationBridge
 {
@@ -154,7 +153,6 @@ namespace dmAutomationBridge
         // The engine service outlives engine instances during a reboot. Keep the
         // handler registered so it retains precedence over the profiler's "/"
         // catch-all handler. The web server removes it when the process exits.
-        FinalizeNativeRecording();
         FreeAutomationBridgeContext(&g_AutomationBridge);
         InitAutomationBridgeContext(&g_AutomationBridge);
         return dmExtension::RESULT_OK;

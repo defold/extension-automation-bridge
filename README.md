@@ -2,9 +2,11 @@
 
 Debug-only native extension for inspecting and controlling a running Defold game
 from local automation clients such as Codex. It provides scene and element queries,
-FIFO input with receipts, screenshots, optional native desktop video recording,
-and an opt-in Lua channel for application events, state, commands, semantic
-annotations, and input acknowledgements.
+FIFO input with receipts, screenshots, and an opt-in Lua channel for application
+events, state, commands, semantic annotations, and input acknowledgements.
+
+The Python wrapper also controls Defold's built-in H.264 MP4 recorder on desktop
+debug engines from Defold 1.14.1. The extension does not bundle a recorder.
 
 ## Installation
 
@@ -37,7 +39,8 @@ the project-root Python wrapper. Pass a version to pin a specific release. Run
 it as a standalone maintenance step and restart Python afterward.
 
 The HTTP bridge is available only in debug builds. Scene inspection, input,
-screenshots, recording, and timeline markers require no Lua setup. Enable the
+screenshots, and timeline markers require no Lua setup. Native video recording
+also works without Lua setup when the engine includes it. Enable the
 application-defined Lua channel separately in `game.project` when a script needs
 events, published state, commands, annotations, or acknowledgements:
 

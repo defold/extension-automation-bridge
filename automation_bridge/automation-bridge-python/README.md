@@ -727,25 +727,48 @@ game.drag_path(**gesture)
 
 ## Recording and traces
 
-Video recording is native and namespaced. It records the running Defold
-process's largest on-screen window to H.264 MP4 using ScreenCaptureKit on
-macOS 15+ or Windows Graphics Capture and Media Foundation on Windows 10
-version 1903+:
+Video recording uses Defold's built-in recorder, available from **Defold 1.14.1**
+in desktop debug engines with recording enabled. The extension contains no video
+capture backend. Probe the independent recorder service instead of bridge health:
 
 ```python
 capabilities = game.video_recording.capabilities()
-
-with game.video_recording.start("capture.mp4", size=(960, 540), fps=30):
-    game.click(button)
+if capabilities.available:
+    with game.video_recording.start("capture.mp4", fps=30, audio=False) as recording:
+        game.click(button)
+    print(recording.metadata.path, recording.metadata.duration_seconds)
 ```
 
-The recorder runs in the game process, automatically selects that process's
-window, crops it to the undecorated game content area, and finalizes the file
-when the context exits. Omitted `audio` uses the platform default: enabled on
-macOS and disabled on Windows. The current Windows backend is video-only and
-rejects `audio=True`. The first macOS capture may trigger Screen Recording
-permission. Check `capabilities().available` before treating recording as an
-optional feature. No FFmpeg installation or external recorder process is used.
+`start()` waits for capture to become active. `stop()` or context exit waits for
+native finalization and file preparation, streams the MP4 to the Python client's
+filesystem, verifies its size and SHA-256, atomically replaces the destination,
+and deletes the engine's copy. `metadata.path` is set only after a successful
+download. A failed download keeps the destination unchanged and the engine file
+available for retry with the same session's `stop()`. Context cleanup preserves
+the workflow's original exception and attaches a cleanup failure as `cleanup_error`.
+
+Capture uses the game's native content resolution, cropping at most one row or
+column for even dimensions. There is no `size` option. Resizing the window
+finalizes capture automatically; call `stop()` to retrieve that file. `start()`
+and `stop()` accept `timeout=30.0` for each polling phase; HTTP requests use the
+engine client's transport timeout. The engine must keep updating while capture
+starts, stops, and prepares its receipt. Inspect `status().pending`, `.state`, and
+`.file` for native progress; `finalized` alone does not mean the file is ready.
+
+macOS 15+ uses ScreenCaptureKit, Windows 10 version 1903+ uses Windows Graphics
+Capture and Media Foundation, and Linux uses framebuffer capture with built-in
+H.264 encoding. Omitted `audio` enables application audio where the backend
+supports it, including Windows build 20348+; Linux records video only. Explicit
+`audio=True` fails when unsupported. The first macOS capture may request Screen
+Recording permission. No FFmpeg installation or helper process is required.
+
+Missing recording routes return `capabilities().available == False`, with a
+reason naming the engine requirement. Connection errors and incompatible recorder
+protocols raise `engine.VideoRecordingError`. Recording uses its own instance and
+operation IDs; an old session cannot stop or download a replacement engine's
+recording. Retained engine files disappear on shutdown/reboot, so finish the
+recording context before closing the game. See [MIGRATION.md](MIGRATION.md) for
+changes from the extension-provided recorder.
 
 Diagnostic traces remain a client-bound context because they intercept client
 operations:

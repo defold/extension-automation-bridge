@@ -8,13 +8,10 @@ platforms:
   osx:
     context:
       defines: ["FPNG_NO_SSE=1", "FPNG_NO_STDIO=1"]
-      frameworks: ["AVFoundation", "AppKit", "CoreMedia", "CoreVideo", "Foundation", "ScreenCaptureKit"]
 
   win32:
     context:
       defines: ["FPNG_NO_SSE=1", "FPNG_NO_STDIO=1"]
-      flags: ["-std=c++17"]
-      libs: ["d3d11", "dxgi", "dwmapi", "mf", "mfplat", "mfreadwrite", "mfuuid", "ole32", "runtimeobject", "windowsapp"]
 
   linux:
     context:
